@@ -96,6 +96,7 @@ npm run start        # プロダクション起動
 npm run lint         # ESLint
 npm run typecheck    # 型チェック（tsc --noEmit）
 npm run test         # テスト実行
+npm run test:e2e     # E2E テスト（Playwright）
 ```
 
 ## デプロイ
