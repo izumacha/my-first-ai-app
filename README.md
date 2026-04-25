@@ -106,6 +106,18 @@ Vercel にデプロイ可能です:
 2. 環境変数 `ANTHROPIC_API_KEY` を設定
 3. デプロイ
 
+### Docker（ローカル/サーバー向け）
+
+```bash
+# ビルド
+docker build -t my-first-ai-app:latest .
+
+# 起動（Anthropic の API キーを渡す）
+docker run --rm -p 3000:3000 \
+  -e ANTHROPIC_API_KEY="your-key" \
+  my-first-ai-app:latest
+```
+
 ## ライセンス
 
 MIT
