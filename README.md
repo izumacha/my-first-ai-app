@@ -126,6 +126,10 @@ docker run --rm -p 3000:3000 \
 - GitHub: **Settings → Branches → Default branch** で `main` を選択
 - 可能なら branch protection（CI必須）も有効化
 
+## セキュリティ
+
+- `docs/SECURITY.md`
+
 ## ライセンス
 
 MIT
