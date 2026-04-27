@@ -58,3 +58,33 @@ test("send message and receive mocked response via SSE", async ({ page }) => {
   await expect(page.getByText("AI アシスタント")).toBeVisible();
   await expect(page.getByText("こんにちは。モック応答です。")).toBeVisible();
 });
+
+test("can switch category (smoke)", async ({ page }) => {
+  await page.goto("/");
+
+  // 初期は general
+  const cooking = page.getByTestId("category-cooking");
+  await cooking.click();
+
+  // 選択状態の見た目はクラス依存なので、クリックが成功することだけ確認
+  await expect(cooking).toBeVisible();
+});
+
+test("shows error on 429 from /api/chat", async ({ page }) => {
+  await page.route("**/api/chat", async (route) => {
+    await route.fulfill({
+      status: 429,
+      contentType: "application/json",
+      body: JSON.stringify({ error: "リクエスト数が上限を超えました。" }),
+    });
+  });
+
+  await page.goto("/");
+
+  const input = page.getByPlaceholder("メッセージを入力...");
+  await input.fill("テスト");
+
+  await page.getByRole("button", { name: "送信" }).click();
+
+  await expect(page.getByText("リクエスト数が上限を超えました。")).toBeVisible();
+});

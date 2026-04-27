@@ -32,6 +32,7 @@ export default function CategoryChips({
           key={category.id}
           onClick={() => onSelect(category.id)}
           title={category.description}
+          data-testid={`category-${category.id}`}
           className={`whitespace-nowrap rounded-full px-4 py-2 text-sm font-medium transition-colors ${
             // 選択中のカテゴリは青色、それ以外は灰色で表示する
             selected === category.id
