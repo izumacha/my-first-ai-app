@@ -9,7 +9,13 @@ export default defineConfig({
     trace: "on-first-retry",
   },
   webServer: {
-    command: "npm run build && node .next/standalone/github/my-first-ai-app/server.js --port 3000",
+    // standalone server needs static assets colocated; ensure .next/static exists under the standalone dir
+    command:
+      'bash -lc "npm run build && ' +
+      'rm -rf .next/standalone/github/my-first-ai-app/.next/static .next/standalone/github/my-first-ai-app/public && ' +
+      'cp -R .next/static .next/standalone/github/my-first-ai-app/.next/static && ' +
+      'cp -R public .next/standalone/github/my-first-ai-app/public && ' +
+      'node .next/standalone/github/my-first-ai-app/server.js --port 3000"',
     url: "http://127.0.0.1:3000",
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,
