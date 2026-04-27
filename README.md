@@ -119,6 +119,13 @@ docker run --rm -p 3000:3000 \
   my-first-ai-app:latest
 ```
 
+## ブランチ運用（推奨）
+
+`main` を default branch にする運用を推奨します。
+
+- GitHub: **Settings → Branches → Default branch** で `main` を選択
+- 可能なら branch protection（CI必須）も有効化
+
 ## ライセンス
 
 MIT
