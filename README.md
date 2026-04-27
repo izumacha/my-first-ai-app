@@ -96,6 +96,7 @@ npm run start        # プロダクション起動
 npm run lint         # ESLint
 npm run typecheck    # 型チェック（tsc --noEmit）
 npm run test         # テスト実行
+npm run test:e2e     # E2E テスト（Playwright）
 ```
 
 ## デプロイ
@@ -105,6 +106,25 @@ Vercel にデプロイ可能です:
 1. [vercel.com](https://vercel.com) でリポジトリを接続
 2. 環境変数 `ANTHROPIC_API_KEY` を設定
 3. デプロイ
+
+### Docker（ローカル/サーバー向け）
+
+```bash
+# ビルド
+docker build -t my-first-ai-app:latest .
+
+# 起動（Anthropic の API キーを渡す）
+docker run --rm -p 3000:3000 \
+  -e ANTHROPIC_API_KEY="your-key" \
+  my-first-ai-app:latest
+```
+
+## ブランチ運用（推奨）
+
+`main` を default branch にする運用を推奨します。
+
+- GitHub: **Settings → Branches → Default branch** で `main` を選択
+- 可能なら branch protection（CI必須）も有効化
 
 ## ライセンス
 
