@@ -24,7 +24,7 @@ npm run test         # Vitest
 
 ## 3. アーキテクチャ
 
-**スタック:** Next.js 15 (App Router), TypeScript, Anthropic Claude API (claude-sonnet-4-6), Vercel AI SDK, Tailwind CSS v4, Vitest。
+**スタック:** Next.js 16 (App Router), TypeScript, Anthropic Claude API (claude-sonnet-4-6), Vercel AI SDK, Tailwind CSS v4, Vitest。
 
 ### レイヤ構成
 
@@ -90,7 +90,7 @@ npm run test         # Vitest
 
 ## 7. アクセシビリティ（a11y）
 
-- **対象は Web フロントエンド（HTML/CSS/JS を伴う UI）。** CLI・ライブラリ・バッチや、HTML を持たないネイティブ GUI（tkinter 等）には適用しない（§0 の「§4 以降は全リポジトリ適用」の数少ない例外）。ネイティブ GUI の a11y は各リポジトリの固有ルールで扱う。
+- **対象は Web フロントエンド（HTML/CSS/JS を伴う UI）。** CLI・ライブラリ・バッチや、HTML を持たないネイティブ GUI（tkinter 等）には適用しない（共通規約の中で数少ない、適用範囲が限定される項目）。ネイティブ GUI の a11y は各リポジトリの固有ルールで扱う。
 - **セマンティック HTML を使う。** 見出しは階層（`h1`→`h2`→…）を飛ばさず、操作要素は `<button>` / `<a>` を使う。`div` / `span` に `onClick` を乗せて疑似ボタン化しない。
 - **キーボードだけで全機能を操作できるようにする。** フォーカス可能要素は可視のフォーカスリングを残す（`outline` を消す場合は代替の見た目を用意）。モーダルはフォーカストラップ＋`Esc` で閉じ、`tabindex` は `0` / `-1` のみ使う（正の値は使わない）。SPA でページ遷移したらフォーカスを新ページの先頭（`main` 等）へ移し、本文へ飛ぶスキップリンクも用意する。
 - **スクリーンリーダーに情報を伝える。** 画像に `alt`（装飾画像は `alt=""`）、アイコンだけのボタンに `aria-label`、フォーム入力に対応する `<label>`（または `aria-labelledby`）を付ける。`aria-live` は簡潔な状態通知・エラーなど「即時に読み上げてほしい変化」に限って使う（検索結果・タイマー・カルーセル・ストリーミング等、頻繁に変わる領域全体に付けると読み上げ過多でかえって使いづらくなる）。
@@ -140,10 +140,10 @@ npm run test         # Vitest
 
 ## 11. テスト
 
-- **テストは必ず通過させること。** 変更前後で lint / typecheck / test を通す。
-- テストファイルは専用ディレクトリ（`tests/`）に、対象モジュール単位（`test_<module>.py` / `*.test.ts`）で配置する。
+- **テストは必ず通過させること。** 変更の前後で、そのリポジトリの §2 と CI 設定（`.github/workflows/`）に記載された実際の検証コマンド（lint / 型チェック / テスト等、存在するものすべて）を通す。コマンド名や有無はスタックごとに異なるため、§2 と CI 設定を正本とし、ここに書かれた例（`lint && typecheck && test` 等）をそのまま当てはめない。
+- テストファイルはそのスタックの慣習に従った場所・命名で配置する（例: Python/JS は `tests/` に `test_<module>.py` / `*.test.ts`、Maven は `src/test/java` に `<Class>Test.java`、.NET は専用テストプロジェクトに `<Class>Tests.cs`）。
 - **純粋ロジックはユニットテスト、DB / 外部依存は E2E or 契約テストに寄せる。** ユニットテストに DB アクセスを持ち込まない。外部 API はモックして実際には呼ばない。
-- 境界値（0・最大・空文字列・非数値など）を重視する。OS 依存処理は `@patch` 等でモックし、特定 OS でしか通らないテストを作らない。
+- 境界値（0・最大・空文字列・非数値など）を重視する。OS 依存処理はモック（`@patch` 等）し、特定 OS でしか通らないテストを作らない。
 - DB を破壊的に扱う契約テストは、専用 DB を明示フラグで起動したときだけ走らせ、開発 DB を指さない。共有 DB を `TRUNCATE` するテストは直列実行する。
 
 ## 12. Git 規約
@@ -165,8 +165,8 @@ npm run test         # Vitest
 
 ## 14. CI
 
-- GitHub Actions（`.github/workflows/ci.yml`）で **lint → typecheck → test → E2E** を実行する。PR を出す前にローカルで `lint && typecheck && test` を通す。
-- DB / ブラウザ依存のジョブはサービスコンテナ（PostgreSQL 等）や chromium を使う。ローカルでは `docker compose up` で依存を起動してから実行する。
+- GitHub Actions（`.github/workflows/`）でそのリポジトリに必要な検証を実行する。実行するジョブはスタックに応じて異なる（例: Web/TS なら lint → typecheck → test → E2E、Maven なら `mvn -B verify`、.NET なら `dotnet build` ＋ `dotnet test`、シェル/Docker なら shellcheck / hadolint / `docker compose config` ＋ e2e）。**PR を出す前に、§2 と CI 設定に記載のローカル検証コマンド（そのリポジトリに実在するものすべて）を通す。** 存在しないコマンドを当てはめない。
+- DB / ブラウザ依存のジョブはサービスコンテナ（PostgreSQL 等）や chromium を使う。依存があるスタックでは、ローカルでも `docker compose up` などで依存を起動してから実行する。
 
 ---
 
@@ -196,7 +196,7 @@ npm run test         # Vitest
 - 今日のタスクは Treeview でなく `tk.Canvas` の「デイビュー」で描画し、位置・高さは分→px 換算（`HOUR_HEIGHT`）で Canvas 実サイズに依存させない。
 - クロスプラットフォーム: 音/通知は macOS(`afplay`)・Windows(`winsound`)・Linux(`notify-send`+`tk.bell()`)を `platform.system()` で分岐。`cairosvg` はオプション依存で `ImportError` 時 graceful degradation。
 
-### C. my-first-ai-app（Next.js 15 + Claude API）
+### C. my-first-ai-app（Next.js 16 + Claude API）
 
 - システムプロンプトは `src/lib/prompts.ts` に集約し、コンポーネントやルートハンドラに直接書かない。プロンプトは日本語で記述。
 - モデル名（`claude-sonnet-4-6` 等）は環境変数または定数で管理しハードコードしない。`max_tokens` 既定 1024、長文が必要なカテゴリは `prompts.ts` で個別設定。
