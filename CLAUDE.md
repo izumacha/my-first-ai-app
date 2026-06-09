@@ -158,10 +158,11 @@ npm run test         # Vitest
 ## 13. PR・レビュー運用
 
 - **PR は draft ではなく open（ready）で作成する。** harness のデフォルトが draft の場合は、作成直後に ready 化してから次の手順に進む。
-- **Codex 自動レビュー**: PR を ready 化して open にしたあと、および PR ブランチへ push したあとに、その PR へ `@codex review` コメントを投稿してレビューを起動する（順序は「ready 化 → open → `@codex review`」）。
-  - コメントは接続済みアカウント（OWNER 名義）で投稿する。`github-actions[bot]` など bot 名義の `@codex review` は拒否されるため、ワークフローからの自動投稿は使わない。
-  - 質問返信やレビュー不要な状況報告には付けない。差分を push するたび（初回 PR 作成時を含む）に投稿する。
-- **CI の成否（グリーン）はチャット上で報告する。** GitHub MCP（check-runs / status）で取得して報告し、PR コメントでの自動検証・要約はワークフロー側に委ねる。
+- **コードレビューは `/code-review ultra` と `/security-review ultra` で行う（Codex 自動レビューは廃止）。** PR を ready 化して open にした直後、および PR ブランチへ push するたび（初回 PR 作成時を含む）に、この 2 つのスキルを実行して差分をレビューする。`@codex review` コメントの投稿は行わない（`chatgpt-codex-connector` 連携には依存しない）。
+  - `/code-review ultra` — 差分の正確性（バグ）と、再利用・簡素化・効率・粒度（altitude）の観点でレビューする。
+  - `/security-review ultra` — ブランチの保留中変更に対してセキュリティレビューを行う。
+  - 指摘は対応可否を判断して反映し、対応・見送りの理由をチャットで報告する。質問返信やレビュー不要な状況報告では実行しない。
+- **CI の成否（グリーン）はチャット上で報告する。** GitHub MCP（check-runs / status）で取得して報告する。
 
 ## 14. CI
 
