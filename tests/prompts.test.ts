@@ -55,4 +55,16 @@ describe("prompts", () => {
     // general が見つかることを確認する
     expect(general).toBeDefined();
   });
+
+  // 未知のカテゴリ（型を偽装した任意文字列）でも general にフォールバックすることを確認する。
+  // これがないと system プロンプト無し（undefined）でリクエストが飛び、ペルソナや
+  // 医療免責が消えてしまう回帰を防ぐ。
+  it("未知のカテゴリは general のプロンプトにフォールバックすること", () => {
+    // API 経由では実行時に任意文字列が渡り得るため、型を欺いて未知の値を渡す
+    const prompt = getSystemPrompt("unknown-category" as CategoryId);
+    // general のプロンプトと一致することを確認する（undefined にならない）
+    expect(prompt).toBe(getSystemPrompt("general"));
+    // 返り値が空でない文字列であることも確認する
+    expect(prompt.length).toBeGreaterThan(10);
+  });
 });

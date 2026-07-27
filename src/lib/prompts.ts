@@ -67,10 +67,17 @@ const SYSTEM_PROMPTS: Record<CategoryId, string> = {
 
 /**
  * 指定されたカテゴリのシステムプロンプトを取得する
- * @param categoryId - カテゴリの識別子（省略時は "general"）
+ * @param categoryId - カテゴリの識別子（省略・未知の値なら "general"）
  * @returns システムプロンプト文字列
  */
 export function getSystemPrompt(categoryId?: CategoryId): string {
-  // カテゴリ ID が指定されていれば対応するプロンプトを、なければ汎用プロンプトを返す
-  return SYSTEM_PROMPTS[categoryId ?? "general"];
+  // 未知のカテゴリ（型を偽装した任意文字列など）だと SYSTEM_PROMPTS の参照が
+  // undefined になり、system プロンプト無しでリクエストが飛んでペルソナや
+  // 医療免責が消えてしまう。既知のカテゴリでなければ general にフォールバックする。
+  if (categoryId && Object.prototype.hasOwnProperty.call(SYSTEM_PROMPTS, categoryId)) {
+    // 既知のカテゴリなら対応するプロンプトを返す
+    return SYSTEM_PROMPTS[categoryId];
+  }
+  // 未指定または未知のカテゴリは汎用（general）プロンプトを返す
+  return SYSTEM_PROMPTS.general;
 }

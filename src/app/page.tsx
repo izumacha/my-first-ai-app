@@ -83,6 +83,11 @@ export default function Home() {
         const decoder = new TextDecoder();
         // ストリーミングで受信したテキストを蓄積する変数
         let accumulated = "";
+        // まだ行末（改行）が来ていない受信途中のデータを保持するバッファ。
+        // reader.read() のチャンク境界は SSE の行境界と一致しないため、
+        // これが無いと 1 行が途中で分断されたとき両断片とも JSON パースに失敗し、
+        // 応答テキストが黙って欠落してしまう。改行までバッファに貯めてから処理する。
+        let buffer = "";
 
         // ストリームからデータを順次読み取るループ
         while (true) {
@@ -92,11 +97,13 @@ export default function Home() {
           // ストリーム終了なら停止する
           if (done) break;
 
-          // バイナリデータを文字列にデコードする
-          const chunk = decoder.decode(value, { stream: true });
+          // バイナリデータを文字列にデコードしてバッファへ連結する
+          buffer += decoder.decode(value, { stream: true });
 
-          // SSE 形式の行を分割して処理する
-          const lines = chunk.split("\n");
+          // 改行で区切って「完全な行」だけを取り出す
+          const lines = buffer.split("\n");
+          // 最後の要素は改行未達の途中行なのでバッファへ残し、次チャンクと結合する
+          buffer = lines.pop() ?? "";
 
           for (const line of lines) {
             // "data: " で始まる行のみ処理する

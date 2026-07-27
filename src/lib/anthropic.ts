@@ -5,8 +5,11 @@
 import Anthropic from "@anthropic-ai/sdk";
 
 /** Claude API で使用するモデル名（環境変数で上書き可能） */
+// 既定値は CLAUDE.md §3 が指定する `claude-sonnet-4-6`。以前は存在しない日付付き ID
+// `claude-sonnet-4-6-20250514` を既定にしており、ANTHROPIC_MODEL 未設定（＝既定）だと
+// 全リクエストが 404 not_found_error になっていた。正しいエイリアス ID に修正する。
 export const MODEL_NAME =
-  process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6-20250514";
+  process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6";
 
 /** AI が生成するトークンの上限値 */
 export const DEFAULT_MAX_TOKENS = 1024;
