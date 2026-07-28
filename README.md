@@ -41,7 +41,6 @@
 | **TypeScript** | 型安全な開発 |
 | **Anthropic Claude API** | AI チャット応答（claude-sonnet-4-6） |
 | **Tailwind CSS v4** | スタイリング |
-| **Vercel AI SDK** | ストリーミングレスポンスの簡易実装 |
 
 ## セットアップ
 
