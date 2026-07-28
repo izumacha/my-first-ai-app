@@ -65,12 +65,53 @@ const SYSTEM_PROMPTS: Record<CategoryId, string> = {
 ※医療行為に該当する助言はできません。具体的な症状は医師にご相談ください。`,
 };
 
+/** カテゴリ別の max_tokens 上書き値（CLAUDE.md「長い回答が必要なカテゴリは prompts.ts で個別設定」）。
+ * ここに無いカテゴリは呼び出し側の既定値（DEFAULT_MAX_TOKENS = 1024）を使う。
+ * 料理（レシピの材料＋手順）と手続き（手順＋必要書類＋期限）は箇条書きが長くなりやすく、
+ * 既定の 1024 トークンでは回答が途中で切れるため広めに設定する。 */
+const MAX_TOKENS_OVERRIDES: Partial<Record<CategoryId, number>> = {
+  // 料理カテゴリ: レシピ全文（材料・分量・手順・時間）を収めるため 2048 に拡大する
+  cooking: 2048,
+  // 手続きカテゴリ: 手順・必要書類・期限の列挙を収めるため 2048 に拡大する
+  procedures: 2048,
+};
+
+/**
+ * 未検証の外部入力（リクエストボディの category）が既知のカテゴリ ID かを判定する型ガード。
+ * in 演算子や添字アクセスはプロトタイプチェーン（例: "constructor"）まで辿ってしまうため、
+ * 自身のプロパティだけを判定する Object.hasOwn を使う（§セキュリティ: 入力は信用しない）。
+ * @param value - 判定したい値（リクエスト由来の未知の値）
+ * @returns 既知のカテゴリ ID なら true
+ */
+export function isCategoryId(value: unknown): value is CategoryId {
+  // 文字列であり、かつ SYSTEM_PROMPTS 自身のキーである場合のみカテゴリ ID とみなす
+  return typeof value === "string" && Object.hasOwn(SYSTEM_PROMPTS, value);
+}
+
 /**
  * 指定されたカテゴリのシステムプロンプトを取得する
- * @param categoryId - カテゴリの識別子（省略時は "general"）
+ * @param categoryId - カテゴリの識別子（省略時・未知の値のときは "general" に切り詰める）
  * @returns システムプロンプト文字列
  */
 export function getSystemPrompt(categoryId?: CategoryId): string {
-  // カテゴリ ID が指定されていれば対応するプロンプトを、なければ汎用プロンプトを返す
-  return SYSTEM_PROMPTS[categoryId ?? "general"];
+  // 未知の値（型を偽ったリクエスト等）はプロンプト無しで送らず必ず汎用プロンプトへ倒す。
+  // ここで倒しておかないと health カテゴリの医療免責などの安全文言が欠落したまま送信されうる
+  return SYSTEM_PROMPTS[isCategoryId(categoryId) ? categoryId : "general"];
+}
+
+/**
+ * 指定されたカテゴリの max_tokens を取得する
+ * @param categoryId - カテゴリの識別子（省略時・未知の値のときは既定値になる）
+ * @param defaultMaxTokens - 上書き設定が無いカテゴリで使う既定値
+ * @returns そのカテゴリで使う max_tokens
+ */
+export function getMaxTokens(
+  categoryId: CategoryId | undefined,
+  defaultMaxTokens: number
+): number {
+  // 既知のカテゴリで上書き値があればそれを、なければ既定値を返す
+  return (
+    (isCategoryId(categoryId) ? MAX_TOKENS_OVERRIDES[categoryId] : undefined) ??
+    defaultMaxTokens
+  );
 }
