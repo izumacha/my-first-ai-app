@@ -24,7 +24,7 @@ npm run test         # Vitest
 
 ## 3. アーキテクチャ
 
-**スタック:** Next.js 16 (App Router), TypeScript, Anthropic Claude API (claude-sonnet-4-6), Vercel AI SDK, Tailwind CSS v4, Vitest。
+**スタック:** Next.js 16 (App Router), TypeScript, Anthropic Claude API (claude-sonnet-4-6), Tailwind CSS v4, Vitest。
 
 ### レイヤ構成
 
