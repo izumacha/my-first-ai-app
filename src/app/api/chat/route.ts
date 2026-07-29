@@ -34,6 +34,15 @@ const OVERFLOW_KEY = "__overflow__";
  * 偽装ヘッダ由来の巨大文字列をそのままキーに使ってメモリを消費しないための上限）。 */
 const MAX_CLIENT_KEY_LENGTH = 64;
 
+/** リクエストボディの最大バイト数（本文上限 4000 文字 × 50 件 ＋ JSON 構造の余裕分）。
+ * 検証前に request.json() が巨大ボディを全量パースしてメモリを消費しないよう、
+ * Content-Length ヘッダの段階で明らかに大きすぎるリクエストを弾くための上限。 */
+const MAX_BODY_BYTES = 1_000_000;
+
+/** 429 応答の Retry-After ヘッダに載せる待機秒数（レート制限ウィンドウと同じ長さ）。
+ * クライアントが正しくバックオフできるよう、いつ再試行してよいかを明示する。 */
+const RETRY_AFTER_SECONDS = String(RATE_LIMIT_WINDOW_MS / 1000);
+
 /** 1 リクエストで受け付ける会話履歴の最大メッセージ数（無制限の履歴送信による
  * トークン浪費・リソース枯渇を防ぐ。通常のチャット利用では到達しない値）。 */
 const MAX_MESSAGE_COUNT = 50;
@@ -47,23 +56,36 @@ const ALLOWED_ROLES: readonly Role[] = ["user", "assistant"];
 
 /**
  * リクエストヘッダから送信元を識別するキーを解決する。
- * X-Forwarded-For は信頼できるプロキシ（Vercel 等のホスティング基盤）が設定する前提で
- * 先頭のクライアント IP を採用する。直接公開する構成ではヘッダを偽装できるため、
- * 上のマップ上限（MAX_TRACKED_CLIENTS）と共有バケットで資源枯渇を防いでいる。
+ * X-Forwarded-For の先頭要素はクライアント自身が偽装できる（nginx 等の一般的な
+ * リバースプロキシは受信した値の「後ろ」に実 IP を追記する）ため、先頭ではなく
+ * 信頼できるプロキシが設定する X-Real-IP を優先し、無ければ末尾（最後のプロキシが
+ * 追記した実際の接続元）を採用する。それでも直接公開構成では偽装が残るため、
+ * マップ上限（MAX_TRACKED_CLIENTS）と共有バケットで資源枯渇を防いでいる。
  * @param request - 受信リクエスト
  * @returns レート制限のキーとして使う文字列
  */
 function resolveClientKey(request: NextRequest): string {
+  // 信頼できるプロキシ（nginx / ホスティング基盤）が設定する X-Real-IP を最優先で使う
+  const realIp = request.headers.get("x-real-ip")?.trim();
+  // X-Real-IP が妥当な長さで存在すればそれをキーとして返す
+  if (realIp && realIp.length <= MAX_CLIENT_KEY_LENGTH) {
+    return realIp;
+  }
   // X-Forwarded-For ヘッダを取得する（無ければ null）
   const forwarded = request.headers.get("x-forwarded-for");
-  // カンマ区切りの先頭要素（クライアント IP）を取り出し、前後の空白を除去する
-  const first = forwarded?.split(",")[0]?.trim();
+  // カンマ区切りの各要素を空白除去し、空要素を取り除いた配列にする
+  const hops = forwarded
+    ?.split(",")
+    .map((hop) => hop.trim())
+    .filter((hop) => hop.length > 0);
+  // 末尾の要素（最後のプロキシが追記した、偽装できない接続元 IP）を取り出す
+  const lastHop = hops?.[hops.length - 1];
   // 空・過剰な長さのキーは不正値とみなし共通の "unknown" に倒す（キー長でのメモリ消費も防ぐ）
-  if (!first || first.length > MAX_CLIENT_KEY_LENGTH) {
+  if (!lastHop || lastHop.length > MAX_CLIENT_KEY_LENGTH) {
     return "unknown";
   }
   // 妥当な長さのクライアント IP をキーとして返す
-  return first;
+  return lastHop;
 }
 
 /**
@@ -175,10 +197,20 @@ export async function POST(
 
     // レート制限チェックを行う
     if (isRateLimited(clientKey)) {
-      // 制限超過の場合は 429 を返す
+      // 制限超過の場合は 429 を返す（Retry-After で再試行までの待機秒数を伝える）
       return NextResponse.json(
         { error: "リクエスト数が上限を超えました。しばらくお待ちください。" },
-        { status: 429 }
+        { status: 429, headers: { "Retry-After": RETRY_AFTER_SECONDS } }
+      );
+    }
+
+    // Content-Length ヘッダを数値として取得する（無ければ 0 とみなす）
+    const contentLength = Number(request.headers.get("content-length") ?? 0);
+    // 明らかに大きすぎるボディはパース前に 413 で弾く（メモリ枯渇の防止）
+    if (contentLength > MAX_BODY_BYTES) {
+      return NextResponse.json(
+        { error: "リクエストが大きすぎます。" },
+        { status: 413 }
       );
     }
 
@@ -279,7 +311,15 @@ export async function POST(
       if (error.status === 429) {
         return NextResponse.json(
           { error: "リクエスト数が上限を超えました。しばらくお待ちください。" },
-          { status: 429 }
+          { status: 429, headers: { "Retry-After": RETRY_AFTER_SECONDS } }
+        );
+      }
+      // 上流の 400（リクエスト内容起因のエラー）はクライアントエラーとして 400 で返す。
+      // 500 に倒すとクライアント起因の問題がサーバ障害として誤って記録・表示されてしまう
+      if (error.status === 400) {
+        return NextResponse.json(
+          { error: "リクエストの内容が不正です。入力を確認してください。" },
+          { status: 400 }
         );
       }
     }
