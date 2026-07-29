@@ -404,6 +404,26 @@ describe("POST /api/chat の上流エラーマッピング", () => {
     }).rejects.toThrow("upstream connection lost");
   });
 
+  it("接続確立前のクライアント切断（abort）は 500 ではなく 499 で静かに終える", async () => {
+    // 接続前の切断を模して、SDK の中断エラーで reject する実装を 1 回だけ設定する
+    createMock.mockImplementationOnce(() =>
+      Promise.reject(new Anthropic.APIUserAbortError())
+    );
+    // サーバ障害ログ（console.error）が呼ばれないことを検証するためスパイを仕込む
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // 正常な形のリクエストを送る（接続前に切断された想定）
+      const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
+      // 通常の切断はサーバエラー（500）ではなく 499 で打ち切られることを確認する
+      expect(res.status).toBe(499);
+      // 異常系ではないのでサーバ障害ログが残らないことを確認する
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      // スパイを元に戻して他のテストへ影響させない
+      errorSpy.mockRestore();
+    }
+  });
+
   it("クライアント切断（ボディの cancel）で上流ストリームも中断される", async () => {
     // 中断呼び出しを検証するため、この試験専用のモックストリームを用意する
     const stream = makeMockStream();

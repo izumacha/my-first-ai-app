@@ -402,6 +402,13 @@ export async function POST(
       },
     });
   } catch (error: unknown) {
+    // 接続確立前にクライアントが切断した場合の中断（request.signal 経由の abort）は
+    // 異常系ではないため、サーバ障害としてログに残さず静かに応答を打ち切る
+    // （499 はクライアント切断を表す慣用ステータス。切断済みなので誰も受け取らない）
+    if (isAbortError(error)) {
+      return new Response(null, { status: 499 });
+    }
+
     // Anthropic SDK の型付きエラーはステータスコードで分類する。
     // 旧実装のメッセージ文字列への部分一致（"API"/"key"）は、上流の 429 を 500 に
     // 誤分類し、逆に 401 では英語の内部エラーメッセージをそのまま外部へ漏らしていた
