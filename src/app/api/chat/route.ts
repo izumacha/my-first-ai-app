@@ -10,8 +10,8 @@ import {
   MODEL_NAME,
   DEFAULT_MAX_TOKENS,
 } from "@/lib/anthropic";
-import { getSystemPrompt } from "@/lib/prompts";
-import type { ChatRequest, ChatErrorResponse, Message } from "@/lib/types";
+import { getSystemPrompt, getMaxTokens, isCategoryId } from "@/lib/prompts";
+import type { ChatErrorResponse, Message, Role } from "@/lib/types";
 
 /** レート制限用：IP ごとのリクエスト時刻を記録するマップ */
 const rateLimitMap = new Map<string, number[]>();
@@ -19,49 +19,106 @@ const rateLimitMap = new Map<string, number[]>();
 /** レート制限の設定値 */
 const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1分間のウィンドウ
 const RATE_LIMIT_MAX_REQUESTS = 20; // ウィンドウ内の最大リクエスト数
-// レート制限マップに保持する IP バケットの最大数。攻撃者が X-Forwarded-For を
-// 毎回変えて偽装すると、削除処理が無いと Map が無制限に肥大化してメモリ枯渇
-// （DoS）を招く。上限を設け、超えたら最も古いバケットから捨てて有界に保つ。
-const RATE_LIMIT_MAX_BUCKETS = 10_000;
 
-/** リクエストボディ検証の上限値（トークンコスト膨張・巨大ペイロードを防ぐ） */
-const MAX_MESSAGES = 50; // 1 リクエストに含められる会話メッセージ数の上限
-const MAX_CONTENT_LENGTH = 8_000; // 1 メッセージあたりの本文文字数の上限
+/** 追跡する送信元キーの上限数。X-Forwarded-For は送信元が偽装できるため、
+ * 毎回異なる値を送ってマップを際限なく成長させるメモリ枯渇攻撃が成立してしまう。
+ * 上限に達したら期限切れエントリを掃除し、それでも満杯なら新規送信元は
+ * 共有バケットへまとめて計上して全体流量を頭打ちにする（fail-safe）。 */
+const MAX_TRACKED_CLIENTS = 10_000;
+
+/** 追跡テーブル満杯時に未追跡の新規送信元をまとめて数える共有バケットのキー。
+ * IP アドレスに現れない文字で構成し、実クライアントのキーと衝突しないようにする。 */
+const OVERFLOW_KEY = "__overflow__";
+
+/** レート制限キーとして受け付ける最大文字数（IPv6 でも 45 文字以内。
+ * 偽装ヘッダ由来の巨大文字列をそのままキーに使ってメモリを消費しないための上限）。 */
+const MAX_CLIENT_KEY_LENGTH = 64;
+
+/** リクエストボディの最大バイト数（本文上限 4000 文字 × 50 件 ＋ JSON 構造の余裕分）。
+ * Content-Length ヘッダは自己申告に過ぎず、チャンク転送ではそもそも付かないため、
+ * ヘッダ検査（速い前段の目安）に加えて実際の読み取りバイト数でも同じ上限を強制する
+ * （readBodyWithinLimit）。これにより検証前の巨大ボディでメモリを消費させられない。 */
+const MAX_BODY_BYTES = 1_000_000;
+
+/** 429 応答の Retry-After ヘッダに載せる待機秒数（レート制限ウィンドウと同じ長さ）。
+ * クライアントが正しくバックオフできるよう、いつ再試行してよいかを明示する。 */
+const RETRY_AFTER_SECONDS = String(RATE_LIMIT_WINDOW_MS / 1000);
+
+/** 1 リクエストで受け付ける会話履歴の最大メッセージ数（無制限の履歴送信による
+ * トークン浪費・リソース枯渇を防ぐ。通常のチャット利用では到達しない値）。 */
+const MAX_MESSAGE_COUNT = 50;
+
+/** 1 メッセージ本文の最大文字数（巨大ボディをそのまま Claude へ転送して
+ * 課金・メモリを浪費させられないようにする入力上限）。 */
+const MAX_CONTENT_LENGTH = 4000;
+
+/** メッセージのロールとして受け付ける値の一覧（未知のロールを Claude へ転送しない） */
+const ALLOWED_ROLES: readonly Role[] = ["user", "assistant"];
 
 /**
- * リクエスト元のクライアント IP を推定する。
- * X-Forwarded-For は「client, proxy1, proxy2 …」のカンマ区切りで、最左が
- * 本来のクライアント。ここでは最左の 1 ホップだけを使う（末尾側は経路上の
- * プロキシで意味が薄いため）。なお XFF はクライアントが偽装可能なため、これは
- * あくまで簡易レート制限用のベストエフォートであり、確実な本人特定ではない
- * （厳密な制御は信頼できるプロキシ設定が前提になる）。
+ * リクエストヘッダから送信元を識別するキーを解決する。
+ * X-Forwarded-For の先頭要素はクライアント自身が偽装できる（nginx 等の一般的な
+ * リバースプロキシは受信した値の「後ろ」に実 IP を追記する）ため、先頭ではなく
+ * 信頼できるプロキシが設定する X-Real-IP を優先し、無ければ末尾（最後のプロキシが
+ * 追記した実際の接続元）を採用する。それでも直接公開構成では偽装が残るため、
+ * マップ上限（MAX_TRACKED_CLIENTS）と共有バケットで資源枯渇を防いでいる。
  * @param request - 受信リクエスト
- * @returns 推定したクライアント IP（取得できなければ "unknown"）
+ * @returns レート制限のキーとして使う文字列
  */
-function getClientIp(request: NextRequest): string {
-  // X-Forwarded-For ヘッダ（カンマ区切り）を取得する
+function resolveClientKey(request: NextRequest): string {
+  // 信頼できるプロキシ（nginx / ホスティング基盤）が設定する X-Real-IP を最優先で使う
+  const realIp = request.headers.get("x-real-ip")?.trim();
+  // X-Real-IP が妥当な長さで存在すればそれをキーとして返す
+  if (realIp && realIp.length <= MAX_CLIENT_KEY_LENGTH) {
+    return realIp;
+  }
+  // X-Forwarded-For ヘッダを取得する（無ければ null）
   const forwarded = request.headers.get("x-forwarded-for");
-  // ヘッダが無ければ IP 不明として扱う
-  if (!forwarded) {
+  // カンマ区切りの各要素を空白除去し、空要素を取り除いた配列にする
+  const hops = forwarded
+    ?.split(",")
+    .map((hop) => hop.trim())
+    .filter((hop) => hop.length > 0);
+  // 末尾の要素（最後のプロキシが追記した、偽装できない接続元 IP）を取り出す
+  const lastHop = hops?.[hops.length - 1];
+  // 空・過剰な長さのキーは不正値とみなし共通の "unknown" に倒す（キー長でのメモリ消費も防ぐ）
+  if (!lastHop || lastHop.length > MAX_CLIENT_KEY_LENGTH) {
     return "unknown";
   }
-  // 最左（本来のクライアント）の 1 ホップだけを取り出して前後の空白を除く
-  const first = forwarded.split(",")[0]?.trim();
-  // 空文字なら不明扱い、それ以外はその値を採用する
-  return first ? first : "unknown";
+  // 妥当な長さのクライアント IP をキーとして返す
+  return lastHop;
 }
 
 /**
  * IP ベースの簡易レート制限チェック
- * @param ip - リクエスト元の IP アドレス
+ * @param clientKey - リクエスト元を識別するキー
  * @returns true ならレート制限超過
  */
-function isRateLimited(ip: string): boolean {
+function isRateLimited(clientKey: string): boolean {
   // 現在時刻を取得する
   const now = Date.now();
 
-  // この IP の過去のリクエスト時刻一覧を取得する（なければ空配列）
-  const timestamps = rateLimitMap.get(ip) ?? [];
+  // 追跡テーブルが上限に達していたら、期限切れの送信元エントリをまとめて掃除する
+  if (rateLimitMap.size >= MAX_TRACKED_CLIENTS) {
+    // すべてのエントリを確認して、ウィンドウ外のものだけを削除する
+    for (const [key, timestamps] of rateLimitMap) {
+      // 最後のリクエストがウィンドウ外なら、この送信元の記録は不要なので削除する
+      if (timestamps.every((t) => now - t >= RATE_LIMIT_WINDOW_MS)) {
+        rateLimitMap.delete(key);
+      }
+    }
+  }
+
+  // 掃除後も満杯で、かつ未追跡の新規送信元なら共有バケットに振り替える。
+  // 素通しにすると偽装キーの使い捨てで制限を無効化できてしまうため、
+  // 満杯時の新規送信元はまとめて数えて全体流量を必ず頭打ちにする（fail-safe）
+  const effectiveKey =
+    rateLimitMap.size >= MAX_TRACKED_CLIENTS && !rateLimitMap.has(clientKey)
+      ? OVERFLOW_KEY
+      : clientKey;
+
+  // この送信元の過去のリクエスト時刻一覧を取得する（なければ空配列）
+  const timestamps = rateLimitMap.get(effectiveKey) ?? [];
 
   // ウィンドウ内のリクエストだけを残すようフィルタリングする
   const recentTimestamps = timestamps.filter(
@@ -70,8 +127,6 @@ function isRateLimited(ip: string): boolean {
 
   // リクエスト数が上限に達していたら制限超過と判定する
   if (recentTimestamps.length >= RATE_LIMIT_MAX_REQUESTS) {
-    // 最新の時刻一覧を書き戻してから制限超過を返す（古い記録を溜め込まない）
-    rateLimitMap.set(ip, recentTimestamps);
     return true;
   }
 
@@ -79,117 +134,126 @@ function isRateLimited(ip: string): boolean {
   recentTimestamps.push(now);
 
   // マップを更新する
-  rateLimitMap.set(ip, recentTimestamps);
-
-  // マップが肥大化しないよう、上限を超えたら古いバケットを刈り込む
-  pruneRateLimitMap(now);
+  rateLimitMap.set(effectiveKey, recentTimestamps);
 
   // 制限内なので false を返す
   return false;
 }
 
 /**
- * レート制限マップから不要なバケットを取り除き、メモリ使用量を有界に保つ。
- * (1) ウィンドウ外の記録しか残っていない空バケットを削除し、
- * (2) それでも上限を超える場合は挿入順（＝古い順）に捨てる。
- * @param now - 現在時刻（ミリ秒）
+ * 中断（abort）由来のエラーかどうかを判定する。
+ * クライアント切断でストリームを打ち切ったときに発生するエラーは異常系ではないため、
+ * エラーログやストリームのエラー通知に流さず静かに終了させる判定に使う。
+ * @param error - 捕捉したエラー
+ * @returns true なら中断由来のエラー
  */
-function pruneRateLimitMap(now: number): void {
-  // 上限未満なら刈り込み不要なので何もしない（毎回全走査するコストを避ける）
-  if (rateLimitMap.size <= RATE_LIMIT_MAX_BUCKETS) {
-    return;
+function isAbortError(error: unknown): boolean {
+  // Anthropic SDK が中断時に投げる型付きエラーなら中断と判定する
+  if (error instanceof Anthropic.APIUserAbortError) {
+    return true;
   }
-  // まずウィンドウ外の記録しか持たない空バケットを削除する
-  for (const [ip, timestamps] of rateLimitMap) {
-    // ウィンドウ内に 1 件でも残っているか判定する
-    const hasRecent = timestamps.some((t) => now - t < RATE_LIMIT_WINDOW_MS);
-    // ウィンドウ内の記録が無いバケットはもう不要なので削除する
-    if (!hasRecent) {
-      rateLimitMap.delete(ip);
-    }
+  // fetch / AbortController 由来の中断エラー（name が "AbortError"）も中断と判定する
+  return error instanceof Error && error.name === "AbortError";
+}
+
+/**
+ * リクエストボディを上限バイト数まで読み取って文字列として返す。
+ * Content-Length ヘッダの事前チェックは自己申告値しか見られず、チャンク転送
+ * （Content-Length 無し）では素通りしてしまうため、実際に読んだバイト数で
+ * 上限を強制する（§セキュリティ: 入力は信用しない・リクエストサイズ上限）。
+ * @param request - 受信リクエスト
+ * @param limitBytes - 許容する最大バイト数
+ * @returns ボディ文字列（上限を超えた場合は null）
+ */
+async function readBodyWithinLimit(
+  request: NextRequest,
+  limitBytes: number
+): Promise<string | null> {
+  // ボディストリームの読み取り口を取得する（ボディが無ければ空文字列を返す）
+  const reader = request.body?.getReader();
+  if (!reader) {
+    return "";
   }
-  // それでも上限を超えるなら、挿入順（Map は挿入順を保つ）で古いものから捨てる
-  while (rateLimitMap.size > RATE_LIMIT_MAX_BUCKETS) {
-    // 先頭（最も古い）キーを取り出す
-    const oldestKey = rateLimitMap.keys().next().value;
-    // 取り出せなければループを抜ける（安全のためのガード）
-    if (oldestKey === undefined) {
+  // 読み取ったチャンク（バイト列）を貯めておく配列
+  const chunks: Uint8Array[] = [];
+  // ここまでに読み取った合計バイト数
+  let total = 0;
+  // ボディを最後まで（または上限超過まで）順に読み取る
+  while (true) {
+    // 次のチャンクを 1 つ読み取る
+    const { done, value } = await reader.read();
+    // 読み終わったらループを抜ける
+    if (done) {
       break;
     }
-    // 最も古いバケットを削除する
-    rateLimitMap.delete(oldestKey);
+    // 合計バイト数を更新する
+    total += value.byteLength;
+    // 合計が上限を超えたら、それ以上読まずに打ち切って「超過」を知らせる
+    if (total > limitBytes) {
+      // 残りのボディの受信を中止する（読み続けてメモリを消費しない）
+      await reader.cancel();
+      return null;
+    }
+    // 上限内のチャンクを配列に追加する
+    chunks.push(value);
   }
+  // すべてのチャンクを 1 つのバイト列に結合する
+  const merged = new Uint8Array(total);
+  // 結合位置（オフセット）を先頭から進めながらコピーする
+  let offset = 0;
+  for (const chunk of chunks) {
+    // このチャンクを結合先の現在位置へコピーする
+    merged.set(chunk, offset);
+    // 次のコピー開始位置をチャンク分だけ進める
+    offset += chunk.byteLength;
+  }
+  // バイト列を UTF-8 文字列に変換して返す
+  return new TextDecoder().decode(merged);
 }
 
 /**
- * リクエストボディが正しい形式かを検証する。
- * 不正なら理由（日本語メッセージ）を返し、正常なら null を返す。
- * @param body - パース済みのリクエストボディ（型は未検証なので実行時に確認する）
- * @returns エラーメッセージ。問題なければ null
+ * リクエストボディの messages を検証し、問題があれば日本語のエラーメッセージを返す。
+ * 形だけの配列チェックでは巨大な本文・未知のロール・空配列がそのまま Claude へ
+ * 転送されてしまうため、境界（件数・文字数・型）まで検証する（§セキュリティ: 入力は信用しない）。
+ * @param messages - リクエスト由来の未検証の値
+ * @returns エラーメッセージ（問題なければ null）
  */
-function validateChatRequest(body: ChatRequest): string | null {
-  // messages が配列であることを確認する
-  if (!body.messages || !Array.isArray(body.messages)) {
+function validateMessages(messages: unknown): string | null {
+  // 配列でない場合は形式エラーとする
+  if (!Array.isArray(messages)) {
     return "messages フィールドが必要です。";
   }
-  // 空配列は上流 API がエラーにするため、ここで弾いて明確なメッセージを返す
-  if (body.messages.length === 0) {
-    return "messages を 1 件以上指定してください。";
+  // 空配列は Claude API 側でエラーになるため、ここで 400 として弾く
+  if (messages.length === 0) {
+    return "メッセージを 1 件以上指定してください。";
   }
-  // メッセージ数の上限を超えていないか確認する（トークンコスト膨張の防止）
-  if (body.messages.length > MAX_MESSAGES) {
-    return `メッセージ数が多すぎます（上限 ${MAX_MESSAGES} 件）。`;
+  // 件数上限を超える履歴は受け付けない（トークン浪費・リソース枯渇防止）
+  if (messages.length > MAX_MESSAGE_COUNT) {
+    return `メッセージ数が上限（${MAX_MESSAGE_COUNT} 件）を超えています。`;
   }
-  // 各メッセージの role と content を 1 件ずつ検証する
-  for (const message of body.messages) {
-    // role が "user" か "assistant" のいずれかであることを確認する
-    if (message.role !== "user" && message.role !== "assistant") {
-      return "各メッセージの role は user または assistant である必要があります。";
+  // 各メッセージの中身（ロール・本文）を検証する
+  for (const message of messages) {
+    // オブジェクトでない要素（null・文字列など）は形式エラーとする
+    if (typeof message !== "object" || message === null) {
+      return "メッセージの形式が正しくありません。";
     }
-    // content が文字列であることを確認する
-    if (typeof message.content !== "string") {
-      return "各メッセージの content は文字列である必要があります。";
+    // 検証のためにロールと本文を取り出す（この時点では未検証の unknown として扱う）
+    const { role, content } = message as { role?: unknown; content?: unknown };
+    // ロールが許可リストに無い場合は弾く（"system" 等を Claude へ転送させない）
+    if (!ALLOWED_ROLES.includes(role as Role)) {
+      return "メッセージのロールが正しくありません。";
     }
-    // content が長すぎないことを確認する（1 メッセージあたりの上限）
-    if (message.content.length > MAX_CONTENT_LENGTH) {
-      return `メッセージが長すぎます（上限 ${MAX_CONTENT_LENGTH} 文字）。`;
+    // 本文が文字列でない・空文字列の場合は弾く
+    if (typeof content !== "string" || content.trim() === "") {
+      return "メッセージ本文を入力してください。";
+    }
+    // 本文が上限文字数を超える場合は弾く（巨大ボディの転送防止）
+    if (content.length > MAX_CONTENT_LENGTH) {
+      return `メッセージ本文が上限（${MAX_CONTENT_LENGTH} 文字）を超えています。`;
     }
   }
-  // すべての検証を通過したので問題なし（null）を返す
+  // すべての検証を通過したら問題なし（null）を返す
   return null;
-}
-
-/**
- * 例外を適切な HTTP ステータスとユーザー向けメッセージへ対応付ける。
- * Anthropic SDK の APIError は status（401/429/…）を持つのでそれを使う。
- * 内部詳細（スタックトレース・生のエラー文）はクライアントへ返さない（§9）。
- * @param error - 捕捉した例外
- * @returns HTTP ステータスと日本語メッセージ
- */
-function toErrorResponse(error: unknown): { status: number; message: string } {
-  // API キー未設定は getAnthropicClient() が投げる通常の Error なので 401 にする
-  if (
-    error instanceof Error &&
-    error.message.includes("ANTHROPIC_API_KEY")
-  ) {
-    return { status: 401, message: "API キーが設定されていません。" };
-  }
-  // Anthropic API 由来のエラーは status コードで分類する
-  if (error instanceof Anthropic.APIError && typeof error.status === "number") {
-    // 認証エラー（無効なキーなど）は 401
-    if (error.status === 401) {
-      return { status: 401, message: "API キーが無効です。" };
-    }
-    // レート制限は 429
-    if (error.status === 429) {
-      return {
-        status: 429,
-        message: "リクエスト数が上限を超えました。しばらくお待ちください。",
-      };
-    }
-  }
-  // それ以外は内部詳細を隠して 500 を返す
-  return { status: 500, message: "サーバーエラーが発生しました。" };
 }
 
 /**
@@ -200,58 +264,102 @@ export async function POST(
   request: NextRequest
 ): Promise<NextResponse<ChatErrorResponse> | Response> {
   try {
-    // リクエスト元の IP アドレスを推定する（偽装可能なため簡易制限用）
-    const ip = getClientIp(request);
+    // リクエスト元を識別するキーを取得する
+    const clientKey = resolveClientKey(request);
 
     // レート制限チェックを行う
-    if (isRateLimited(ip)) {
-      // 制限超過の場合は 429 を返す
+    if (isRateLimited(clientKey)) {
+      // 制限超過の場合は 429 を返す（Retry-After で再試行までの待機秒数を伝える）
       return NextResponse.json(
         { error: "リクエスト数が上限を超えました。しばらくお待ちください。" },
-        { status: 429 }
+        { status: 429, headers: { "Retry-After": RETRY_AFTER_SECONDS } }
       );
     }
 
-    // リクエストボディを JSON としてパースする
-    const body = (await request.json()) as ChatRequest;
-
-    // リクエストボディの形式を検証する（不正なら 400 を返す）
-    const validationError = validateChatRequest(body);
-    if (validationError !== null) {
+    // Content-Length ヘッダを数値として取得する（無ければ 0 とみなす）
+    const contentLength = Number(request.headers.get("content-length") ?? 0);
+    // 申告値が明らかに大きすぎるボディは読み取り前に 413 で弾く（速い前段チェック）
+    if (contentLength > MAX_BODY_BYTES) {
       return NextResponse.json(
-        { error: validationError },
+        { error: "リクエストが大きすぎます。" },
+        { status: 413 }
+      );
+    }
+
+    // ボディを上限バイト数を強制しながら読み取る（ヘッダ申告に依存しない実測の上限。
+    // チャンク転送等で Content-Length が無いリクエストもここで必ず頭打ちになる）
+    const rawBody = await readBodyWithinLimit(request, MAX_BODY_BYTES);
+    // 実際の読み取りが上限を超えたボディは 413 で弾く（メモリ枯渇の防止）
+    if (rawBody === null) {
+      return NextResponse.json(
+        { error: "リクエストが大きすぎます。" },
+        { status: 413 }
+      );
+    }
+
+    // リクエストボディを JSON としてパースする（壊れた JSON は 400 として弾く）
+    let body: { messages?: unknown; category?: unknown };
+    try {
+      // JSON パースを試みる（unknown として受け取り、この後の検証で絞り込む）
+      body = JSON.parse(rawBody) as { messages?: unknown; category?: unknown };
+    } catch {
+      // JSON として不正なボディは 400（クライアント起因のエラー）を返す
+      return NextResponse.json(
+        { error: "リクエストボディが正しい JSON ではありません。" },
         { status: 400 }
       );
     }
 
+    // メッセージ配列を検証する（件数・ロール・本文の型と長さまで確認する）
+    const validationError = validateMessages(body.messages);
+    // 検証エラーがあれば 400 を返す
+    if (validationError) {
+      return NextResponse.json({ error: validationError }, { status: 400 });
+    }
+
+    // 検証を通過したメッセージ配列を型付きで取り出す
+    const messages = body.messages as Message[];
+
+    // カテゴリは既知の ID のみ採用する（未知の値は undefined として general に倒す）
+    const category = isCategoryId(body.category) ? body.category : undefined;
+
     // Anthropic クライアントを取得する（API キー未設定なら例外が飛ぶ）
     const client = getAnthropicClient();
 
-    // 選択カテゴリに応じたシステムプロンプトを取得する（不正カテゴリは general にフォールバック）
-    const systemPrompt = getSystemPrompt(body.category);
+    // 選択カテゴリに応じたシステムプロンプトを取得する
+    const systemPrompt = getSystemPrompt(category);
 
     // Claude API にストリーミングリクエストを送信する。
-    // messages.stream() ではなく create({ stream: true }) を await することで、
-    // 401/404/429 などの接続時エラーがここ（レスポンスヘッダ確定前）で throw され、
-    // 下の catch で正しい HTTP ステータスに対応付けられる（stream() は同期的に
-    // オブジェクトを返すためエラーが 200 送出後まで遅延し、ステータス分岐に届かない）。
-    const anthropicStream = await client.messages.create({
-      model: MODEL_NAME,
-      max_tokens: DEFAULT_MAX_TOKENS,
-      system: systemPrompt,
-      messages: body.messages.map((m: Message) => ({
-        role: m.role,
-        content: m.content,
-      })),
-      stream: true,
-    });
+    // 旧実装の messages.stream() は接続を待たずに MessageStream を同期的に返すため、
+    // await しても上流の 401/429/400 はここで捕捉できず（エラーは反復中に初めて
+    // 表面化する）、下の catch のステータスマッピングが本番経路では一度も効かない
+    // 到達不能コードになっていた。stream: true の messages.create() は上流の HTTP
+    // 応答を受け取ってから解決する Promise を返し、認証エラー等は Anthropic.APIError
+    // として reject されるため、200 を確定させる前に catch へ届く
+    // （CLAUDE.md のエラーステータス契約を実経路で機能させる）。
+    const stream = await client.messages.create(
+      {
+        model: MODEL_NAME,
+        // カテゴリ別の上書き設定があればそれを、なければ既定値を使う
+        max_tokens: getMaxTokens(category, DEFAULT_MAX_TOKENS),
+        system: systemPrompt,
+        messages: messages.map((m) => ({
+          role: m.role,
+          content: m.content,
+        })),
+        // イベント単位のストリーミング応答を要求する
+        stream: true,
+      },
+      // クライアント切断でリクエストが中断されたら、上流への問い合わせも中断する
+      { signal: request.signal }
+    );
 
     // ストリーミングレスポンスを ReadableStream に変換する
     const readableStream = new ReadableStream({
       async start(controller) {
         try {
           // テキストデルタイベントを順次読み出す
-          for await (const event of anthropicStream) {
+          for await (const event of stream) {
             // content_block_delta イベントからテキスト差分を取得する
             if (
               event.type === "content_block_delta" &&
@@ -269,14 +377,19 @@ export async function POST(
           // ストリームを閉じる
           controller.close();
         } catch (error) {
-          // ストリーム中のエラーをコントローラーに伝える
+          // クライアント切断による中断は異常系ではないため、静かに終了する
+          // （cancel() 後の controller はもう使えず、エラー通知の意味も無い）
+          if (isAbortError(error)) {
+            return;
+          }
+          // 中断以外のストリーム中のエラーはコントローラーに伝える
           controller.error(error);
         }
       },
       cancel() {
-        // クライアントが切断したら上流の Claude リクエストも中断し、
-        // 無駄なトークン消費を止める（リソースを確実に解放する。§8）。
-        anthropicStream.controller.abort();
+        // 受信側（クライアント）が切断したら上流の Claude ストリームも中断する。
+        // 放置すると切断後も上流の生成が続き、トークンが課金され続けてしまう
+        stream.controller.abort();
       },
     });
 
@@ -289,10 +402,56 @@ export async function POST(
       },
     });
   } catch (error: unknown) {
-    // 例外を HTTP ステータスと安全な日本語メッセージへ対応付ける（内部詳細は隠す）
-    const { status, message } = toErrorResponse(error);
+    // 接続確立前にクライアントが切断した場合の中断（request.signal 経由の abort）は
+    // 異常系ではないため、サーバ障害としてログに残さず静かに応答を打ち切る
+    // （499 はクライアント切断を表す慣用ステータス。切断済みなので誰も受け取らない）
+    if (isAbortError(error)) {
+      return new Response(null, { status: 499 });
+    }
 
-    // 分類したステータスとメッセージでエラーレスポンスを返す
-    return NextResponse.json({ error: message }, { status });
+    // Anthropic SDK の型付きエラーはステータスコードで分類する。
+    // 旧実装のメッセージ文字列への部分一致（"API"/"key"）は、上流の 429 を 500 に
+    // 誤分類し、逆に 401 では英語の内部エラーメッセージをそのまま外部へ漏らしていた
+    if (error instanceof Anthropic.APIError) {
+      // 認証エラー（API キー無効等）は 401 と日本語の安全な文言を返す
+      if (error.status === 401) {
+        return NextResponse.json(
+          { error: "API キーが無効です。設定を確認してください。" },
+          { status: 401 }
+        );
+      }
+      // 上流のレート制限（429）はそのまま 429 として返す（CLAUDE.md のステータス契約）
+      if (error.status === 429) {
+        return NextResponse.json(
+          { error: "リクエスト数が上限を超えました。しばらくお待ちください。" },
+          { status: 429, headers: { "Retry-After": RETRY_AFTER_SECONDS } }
+        );
+      }
+      // 上流の 400（リクエスト内容起因のエラー）はクライアントエラーとして 400 で返す。
+      // 500 に倒すとクライアント起因の問題がサーバ障害として誤って記録・表示されてしまう
+      if (error.status === 400) {
+        return NextResponse.json(
+          { error: "リクエストの内容が不正です。入力を確認してください。" },
+          { status: 400 }
+        );
+      }
+    }
+
+    // API キー未設定（getAnthropicClient が投げる日本語メッセージの例外）は 401 を返す
+    if (
+      error instanceof Error &&
+      error.message.includes("ANTHROPIC_API_KEY")
+    ) {
+      return NextResponse.json({ error: error.message }, { status: 401 });
+    }
+
+    // 想定外のエラーは詳細をサーバログにだけ残す（内部情報を外部へ返さない）
+    console.error("チャット API で想定外のエラーが発生しました:", error);
+
+    // その他のエラーは 500 と汎用の安全な文言を返す
+    return NextResponse.json(
+      { error: "サーバーエラーが発生しました。" },
+      { status: 500 }
+    );
   }
 }

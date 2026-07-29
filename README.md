@@ -37,7 +37,7 @@
 
 | 技術 | 用途 |
 |---|---|
-| **Next.js 15** (App Router) | フルスタックフレームワーク |
+| **Next.js 16** (App Router) | フルスタックフレームワーク |
 | **TypeScript** | 型安全な開発 |
 | **Anthropic Claude API** | AI チャット応答（claude-sonnet-4-6） |
 | **Tailwind CSS v4** | スタイリング |

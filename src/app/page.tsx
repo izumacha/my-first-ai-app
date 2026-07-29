@@ -61,11 +61,17 @@ export default function Home() {
 
         // レスポンスがエラーの場合はエラーメッセージを表示する
         if (!response.ok) {
-          const errorData = await response.json();
+          // エラーボディを JSON として読む（プロキシの HTML 応答など JSON でない場合は null に倒す）
+          const errorData = (await response.json().catch(() => null)) as {
+            error?: unknown;
+          } | null;
+          // サーバの日本語メッセージが文字列で得られればそれを、無ければ汎用文言を表示する
           setError(
-            errorData.error ?? "エラーが発生しました。もう一度お試しください。"
+            typeof errorData?.error === "string"
+              ? errorData.error
+              : "エラーが発生しました。もう一度お試しください。"
           );
-          setIsLoading(false);
+          // 早期リターンする（ローディング解除は finally が行う）
           return;
         }
 
@@ -75,7 +81,7 @@ export default function Home() {
         // リーダーが取得できない場合はエラー
         if (!reader) {
           setError("ストリーミングの開始に失敗しました。");
-          setIsLoading(false);
+          // 早期リターンする（ローディング解除は finally が行う）
           return;
         }
 
@@ -83,63 +89,68 @@ export default function Home() {
         const decoder = new TextDecoder();
         // ストリーミングで受信したテキストを蓄積する変数
         let accumulated = "";
-        // まだ行末（改行）が来ていない受信途中のデータを保持するバッファ。
-        // reader.read() のチャンク境界は SSE の行境界と一致しないため、
-        // これが無いと 1 行が途中で分断されたとき両断片とも JSON パースに失敗し、
-        // 応答テキストが黙って欠落してしまう。改行までバッファに貯めてから処理する。
-        let buffer = "";
+        // チャンクの切れ目で分断された「行の途中」を次のチャンクまで持ち越すバッファ。
+        // reader.read() は行境界と無関係な位置でデータを区切るため、バッファ無しだと
+        // 分断された JSON がパース失敗として捨てられ、回答の文字が欠落してしまう
+        let lineBuffer = "";
+        // 終了マーカー [DONE] を受信したかどうかのフラグ（外側の読み取りループも止めるため）
+        let sawDone = false;
 
-        // ストリームからデータを順次読み取るループ
-        while (true) {
-          // チャンクを読み取る
-          const { done, value } = await reader.read();
+        try {
+          // ストリームからデータを順次読み取るループ
+          while (!sawDone) {
+            // チャンクを読み取る
+            const { done, value } = await reader.read();
 
-          // ストリーム終了なら停止する
-          if (done) break;
+            // ストリーム終了なら停止する
+            if (done) break;
 
-          // バイナリデータを文字列にデコードしてバッファへ連結する
-          buffer += decoder.decode(value, { stream: true });
+            // バイナリデータを文字列にデコードし、持ち越し分と連結する
+            lineBuffer += decoder.decode(value, { stream: true });
 
-          // 改行で区切って「完全な行」だけを取り出す
-          const lines = buffer.split("\n");
-          // 最後の要素は改行未達の途中行なのでバッファへ残し、次チャンクと結合する
-          buffer = lines.pop() ?? "";
+            // SSE 形式の行を分割する（最後の要素は「行の途中」の可能性がある）
+            const lines = lineBuffer.split("\n");
+            // 最後の要素は未完の行として次のチャンクへ持ち越す（完結行だけを処理する）
+            lineBuffer = lines.pop() ?? "";
 
-          for (const line of lines) {
-            // "data: " で始まる行のみ処理する
-            if (line.startsWith("data: ")) {
-              // "data: " プレフィックスを除去してデータ部分を取得する
-              const data = line.slice(6);
+            for (const line of lines) {
+              // "data: " で始まる行のみ処理する
+              if (line.startsWith("data: ")) {
+                // "data: " プレフィックスを除去してデータ部分を取得する
+                const data = line.slice(6);
 
-              // ストリーム終了マーカーなら読み取りを完了する
-              if (data === "[DONE]") {
-                break;
-              }
+                // ストリーム終了マーカーなら読み取り全体を完了させる
+                if (data === "[DONE]") {
+                  sawDone = true;
+                  break;
+                }
 
-              try {
-                // JSON をパースしてテキスト差分を取得する
-                const parsed = JSON.parse(data) as { text: string };
-                // 蓄積テキストに差分を追加する
-                accumulated += parsed.text;
-                // ストリーミング表示を更新する
-                setStreamingText(accumulated);
-              } catch {
-                // JSON パースに失敗した行は無視する
+                try {
+                  // JSON をパースしてテキスト差分を取得する
+                  const parsed = JSON.parse(data) as { text: string };
+                  // 蓄積テキストに差分を追加する
+                  accumulated += parsed.text;
+                  // ストリーミング表示を更新する
+                  setStreamingText(accumulated);
+                } catch {
+                  // JSON パースに失敗した行は無視する
+                }
               }
             }
           }
+        } finally {
+          // 成功・途中失敗のどちらでも、受信済みのテキストがあれば会話履歴に残す。
+          // ここで確定させないと、途中でストリームが切れたときに受信済みの回答が
+          // 消えたうえ、宙に浮いた吹き出しが次の送信まで表示され続けてしまう
+          if (accumulated) {
+            setMessages((prev) => [
+              ...prev,
+              { role: "assistant", content: accumulated },
+            ]);
+          }
+          // ストリーミング表示を必ずクリアする（エラー時の吹き出し残留を防ぐ）
+          setStreamingText("");
         }
-
-        // ストリーミング完了後、AI メッセージを会話履歴に追加する
-        if (accumulated) {
-          setMessages((prev) => [
-            ...prev,
-            { role: "assistant", content: accumulated },
-          ]);
-        }
-
-        // ストリーミングテキストをクリアする
-        setStreamingText("");
       } catch {
         // ネットワークエラーなどの場合にメッセージを表示する
         setError("通信エラーが発生しました。接続を確認してください。");
@@ -162,9 +173,12 @@ export default function Home() {
       {/* カテゴリ選択チップを表示する */}
       <CategoryChips selected={category} onSelect={setCategory} />
 
-      {/* エラーメッセージがあれば表示する */}
+      {/* エラーメッセージがあれば表示する（role="alert" でスクリーンリーダーに即時読み上げさせる） */}
       {error && (
-        <div className="mx-4 mt-2 rounded-lg bg-red-50 dark:bg-red-900/30 p-3 text-sm text-red-700 dark:text-red-300">
+        <div
+          role="alert"
+          className="mx-4 mt-2 rounded-lg bg-red-50 dark:bg-red-900/30 p-3 text-sm text-red-700 dark:text-red-300"
+        >
           {error}
         </div>
       )}
