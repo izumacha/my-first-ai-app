@@ -8,20 +8,29 @@ import { NextRequest } from "next/server";
 // 上流エラーマッピングの試験で SDK の型付きエラーを生成するために読み込む
 import Anthropic from "@anthropic-ai/sdk";
 
-// ストリームのモック（テキストデルタを 1 件流して終了する非同期イテレータ）
-const mockStream = {
-  // for await で回せるように非同期イテレータを実装する
-  async *[Symbol.asyncIterator]() {
-    // content_block_delta イベントを 1 件返す
-    yield {
-      type: "content_block_delta",
-      delta: { type: "text_delta", text: "こんにちは" },
-    };
-  },
-};
+// ストリームのモックを生成する（テキストデルタを 1 件流して終了する非同期イテレータ）。
+// 実 SDK の Stream と同じく、中断用の AbortController 互換オブジェクト（controller）を持つ
+function makeMockStream() {
+  return {
+    // クライアント切断時に route が呼ぶ中断用コントローラ（呼び出しを記録する）
+    controller: { abort: vi.fn() },
+    // for await で回せるように非同期イテレータを実装する
+    async *[Symbol.asyncIterator]() {
+      // content_block_delta イベントを 1 件返す
+      yield {
+        type: "content_block_delta",
+        delta: { type: "text_delta", text: "こんにちは" },
+      };
+    },
+  };
+}
 
-// messages.stream の呼び出しを記録するモック関数（既定では正常なストリームを返す）
-const streamMock = vi.fn().mockReturnValue(mockStream);
+// messages.create の呼び出しを記録するモック関数（既定では正常なストリームで解決する）。
+// 実 SDK の create({stream:true}) は「上流の HTTP 応答を受けてから」解決する Promise を
+// 返すため、モックも同期 return ではなく Promise で解決／拒否させて実挙動に合わせる
+const createMock = vi.fn().mockImplementation(() =>
+  Promise.resolve(makeMockStream())
+);
 
 // Anthropic クライアント側モジュールをモックする（実 API を呼ばないため）
 vi.mock("@/lib/anthropic", () => ({
@@ -29,9 +38,9 @@ vi.mock("@/lib/anthropic", () => ({
   MODEL_NAME: "test-model",
   // 既定の max_tokens もテスト用の固定値にする
   DEFAULT_MAX_TOKENS: 1024,
-  // クライアント取得はストリームモックを持つ偽クライアントを返す
+  // クライアント取得はストリーミング作成モックを持つ偽クライアントを返す
   getAnthropicClient: () => ({
-    messages: { stream: streamMock },
+    messages: { create: createMock },
   }),
 }));
 
@@ -74,7 +83,7 @@ const validMessages = [{ role: "user", content: "こんにちは" }];
 describe("POST /api/chat の入力検証", () => {
   // 各テストの前にモックの記録をリセットする
   beforeEach(() => {
-    streamMock.mockClear();
+    createMock.mockClear();
   });
 
   it("正しい JSON でないボディは 400 を返す", async () => {
@@ -161,7 +170,7 @@ describe("POST /api/chat の入力検証", () => {
     // リクエスト自体は受理されることを確認する
     expect(res.status).toBe(200);
     // Claude へ渡された system がプロンプト文字列であることを確認する
-    const call = streamMock.mock.calls[0][0];
+    const call = createMock.mock.calls[0][0];
     expect(typeof call.system).toBe("string");
     expect(call.system).toContain("暮らしアシスタント");
   });
@@ -172,7 +181,7 @@ describe("POST /api/chat の入力検証", () => {
       makeRequest({ messages: validMessages, category: "cooking" }, uniqueIp())
     );
     // 上書き値（2048）が Claude へ渡されたことを確認する
-    const call = streamMock.mock.calls[0][0];
+    const call = createMock.mock.calls[0][0];
     expect(call.max_tokens).toBe(2048);
   });
 });
@@ -272,26 +281,61 @@ describe("POST /api/chat のボディサイズ上限", () => {
     const res = await POST(req);
     expect(res.status).toBe(413);
   });
+
+  it("Content-Length の申告が無い巨大ボディも実測で 413 を返す", async () => {
+    // チャンク転送を模した「Content-Length 無し」の巨大ボディ（上限 1,000,000 バイト超）を作る
+    const hugeBody = JSON.stringify({
+      messages: [{ role: "user", content: "a".repeat(1_100_000) }],
+    });
+    // fetch 互換の Request 構築ではヘッダに content-length が自動付与されないため、
+    // ヘッダ検査だけの実装ではこのリクエストが素通りしてしまう（実測チェックの回帰防止）
+    const req = new NextRequest("http://localhost/api/chat", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-forwarded-for": uniqueIp(),
+      },
+      body: hugeBody,
+    });
+    // ヘッダ申告に依存せず、実際の読み取りバイト数で 413 になることを確認する
+    const res = await POST(req);
+    expect(res.status).toBe(413);
+  });
 });
 
 describe("POST /api/chat の上流エラーマッピング", () => {
   // 各テストの前にモックの記録と実装をリセットする
   beforeEach(() => {
-    streamMock.mockClear();
-    streamMock.mockReturnValue(mockStream);
+    createMock.mockClear();
+    createMock.mockImplementation(() => Promise.resolve(makeMockStream()));
   });
 
+  /**
+   * 指定ステータスの Anthropic SDK 型付きエラーで reject するモックを 1 回だけ仕込む。
+   * 実 SDK の create({stream:true}) はエラーを「throw」ではなく Promise の reject として
+   * 返すため、モックも同じ非同期経路で失敗させる（同期 throw のモックでは、実経路で
+   * 到達不能なコードをテストが通してしまう回帰があった）。
+   * @param status - 上流の HTTP ステータスコード
+   * @param type - Anthropic エラー種別文字列
+   */
+  function rejectOnceWithApiError(status: number, type: string): void {
+    // 指定ステータスの具象エラークラスで reject する実装を 1 回だけ設定する
+    createMock.mockImplementationOnce(() =>
+      Promise.reject(
+        // APIError.generate はステータスに応じた具象エラークラスを生成する
+        Anthropic.APIError.generate(
+          status,
+          { error: { type, message: "upstream error" } },
+          "upstream error",
+          new Headers()
+        )
+      )
+    );
+  }
+
   it("上流 Anthropic の 400 はクライアントエラー（400）として返す", async () => {
-    // Anthropic SDK の型付き 400 エラーを投げるモックを 1 回だけ仕込む
-    streamMock.mockImplementationOnce(() => {
-      // APIError.generate はステータスに応じた具象エラークラスを生成する
-      throw Anthropic.APIError.generate(
-        400,
-        { error: { type: "invalid_request_error", message: "bad request" } },
-        "bad request",
-        new Headers()
-      );
-    });
+    // 上流でだけ 400 になるモックを仕込む
+    rejectOnceWithApiError(400, "invalid_request_error");
     // 正常な形のリクエストを送る（上流でだけ 400 になる想定）
     const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
     // 500 ではなく 400 が返ることを確認する
@@ -299,5 +343,79 @@ describe("POST /api/chat の上流エラーマッピング", () => {
     // 内部メッセージ（英語）ではなく安全な日本語文言が返ることを確認する
     const body = (await res.json()) as { error: string };
     expect(body.error).toContain("リクエストの内容が不正です");
+  });
+
+  it("上流 Anthropic の 401（API キー無効）は 401 と安全な文言を返す", async () => {
+    // 上流でだけ 401 になるモックを仕込む
+    rejectOnceWithApiError(401, "authentication_error");
+    // 正常な形のリクエストを送る（API キーが無効な想定）
+    const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
+    // 200 のストリームではなく 401 が返ることを確認する（旧実装はここが 200 になっていた）
+    expect(res.status).toBe(401);
+    // 内部メッセージではなく安全な日本語文言が返ることを確認する
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toContain("API キーが無効です");
+  });
+
+  it("上流 Anthropic の 429 は Retry-After 付きの 429 を返す", async () => {
+    // 上流でだけ 429 になるモックを仕込む
+    rejectOnceWithApiError(429, "rate_limit_error");
+    // 正常な形のリクエストを送る（上流のレート制限に当たった想定）
+    const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
+    // 429 が返ることを確認する
+    expect(res.status).toBe(429);
+    // 再試行の待機秒数を伝える Retry-After が付いていることを確認する
+    expect(res.headers.get("Retry-After")).toBe("60");
+  });
+
+  it("ストリーム反復中のエラーはレスポンスボディのエラーとして伝わる", async () => {
+    // 最初のデルタを流した後、反復の途中で失敗するストリームを仕込む
+    createMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        // 中断用コントローラ（この試験では使われない）
+        controller: { abort: vi.fn() },
+        // 1 件流してから失敗する非同期イテレータを実装する
+        async *[Symbol.asyncIterator]() {
+          // 正常なデルタを 1 件返す
+          yield {
+            type: "content_block_delta",
+            delta: { type: "text_delta", text: "こん" },
+          };
+          // 反復の途中で上流の切断などを模したエラーを投げる
+          throw new Error("upstream connection lost");
+        },
+      })
+    );
+    // 正常な形のリクエストを送る（接続確立後にだけ失敗する想定）
+    const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
+    // 接続確立後の失敗なので 200（SSE 開始済み）であることを確認する
+    expect(res.status).toBe(200);
+    // ボディを読み進めると、途中エラーが reader へ伝播（reject）することを確認する
+    const reader = (res.body as ReadableStream<Uint8Array>).getReader();
+    // 1 チャンク目（正常デルタ）は読めることを確認する
+    const first = await reader.read();
+    expect(first.done).toBe(false);
+    // 以降の読み取りはエラーで reject されることを確認する（エラーの握り潰し防止）
+    await expect(async () => {
+      // ストリームの終端（またはエラー）まで読み続ける
+      while (!(await reader.read()).done) {
+        // 読み取り継続（エラー到達待ち）
+      }
+    }).rejects.toThrow("upstream connection lost");
+  });
+
+  it("クライアント切断（ボディの cancel）で上流ストリームも中断される", async () => {
+    // 中断呼び出しを検証するため、この試験専用のモックストリームを用意する
+    const stream = makeMockStream();
+    // このモックストリームで解決する実装を 1 回だけ設定する
+    createMock.mockImplementationOnce(() => Promise.resolve(stream));
+    // 正常な形のリクエストを送る
+    const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
+    // SSE ストリームが開始されることを確認する
+    expect(res.status).toBe(200);
+    // クライアント切断を模してレスポンスボディをキャンセルする
+    await (res.body as ReadableStream<Uint8Array>).cancel();
+    // 上流ストリームの中断（トークン浪費の防止）が呼ばれたことを確認する
+    expect(stream.controller.abort).toHaveBeenCalled();
   });
 });

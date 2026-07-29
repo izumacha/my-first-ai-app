@@ -35,8 +35,9 @@ const OVERFLOW_KEY = "__overflow__";
 const MAX_CLIENT_KEY_LENGTH = 64;
 
 /** リクエストボディの最大バイト数（本文上限 4000 文字 × 50 件 ＋ JSON 構造の余裕分）。
- * 検証前に request.json() が巨大ボディを全量パースしてメモリを消費しないよう、
- * Content-Length ヘッダの段階で明らかに大きすぎるリクエストを弾くための上限。 */
+ * Content-Length ヘッダは自己申告に過ぎず、チャンク転送ではそもそも付かないため、
+ * ヘッダ検査（速い前段の目安）に加えて実際の読み取りバイト数でも同じ上限を強制する
+ * （readBodyWithinLimit）。これにより検証前の巨大ボディでメモリを消費させられない。 */
 const MAX_BODY_BYTES = 1_000_000;
 
 /** 429 応答の Retry-After ヘッダに載せる待機秒数（レート制限ウィンドウと同じ長さ）。
@@ -140,6 +141,77 @@ function isRateLimited(clientKey: string): boolean {
 }
 
 /**
+ * 中断（abort）由来のエラーかどうかを判定する。
+ * クライアント切断でストリームを打ち切ったときに発生するエラーは異常系ではないため、
+ * エラーログやストリームのエラー通知に流さず静かに終了させる判定に使う。
+ * @param error - 捕捉したエラー
+ * @returns true なら中断由来のエラー
+ */
+function isAbortError(error: unknown): boolean {
+  // Anthropic SDK が中断時に投げる型付きエラーなら中断と判定する
+  if (error instanceof Anthropic.APIUserAbortError) {
+    return true;
+  }
+  // fetch / AbortController 由来の中断エラー（name が "AbortError"）も中断と判定する
+  return error instanceof Error && error.name === "AbortError";
+}
+
+/**
+ * リクエストボディを上限バイト数まで読み取って文字列として返す。
+ * Content-Length ヘッダの事前チェックは自己申告値しか見られず、チャンク転送
+ * （Content-Length 無し）では素通りしてしまうため、実際に読んだバイト数で
+ * 上限を強制する（§セキュリティ: 入力は信用しない・リクエストサイズ上限）。
+ * @param request - 受信リクエスト
+ * @param limitBytes - 許容する最大バイト数
+ * @returns ボディ文字列（上限を超えた場合は null）
+ */
+async function readBodyWithinLimit(
+  request: NextRequest,
+  limitBytes: number
+): Promise<string | null> {
+  // ボディストリームの読み取り口を取得する（ボディが無ければ空文字列を返す）
+  const reader = request.body?.getReader();
+  if (!reader) {
+    return "";
+  }
+  // 読み取ったチャンク（バイト列）を貯めておく配列
+  const chunks: Uint8Array[] = [];
+  // ここまでに読み取った合計バイト数
+  let total = 0;
+  // ボディを最後まで（または上限超過まで）順に読み取る
+  while (true) {
+    // 次のチャンクを 1 つ読み取る
+    const { done, value } = await reader.read();
+    // 読み終わったらループを抜ける
+    if (done) {
+      break;
+    }
+    // 合計バイト数を更新する
+    total += value.byteLength;
+    // 合計が上限を超えたら、それ以上読まずに打ち切って「超過」を知らせる
+    if (total > limitBytes) {
+      // 残りのボディの受信を中止する（読み続けてメモリを消費しない）
+      await reader.cancel();
+      return null;
+    }
+    // 上限内のチャンクを配列に追加する
+    chunks.push(value);
+  }
+  // すべてのチャンクを 1 つのバイト列に結合する
+  const merged = new Uint8Array(total);
+  // 結合位置（オフセット）を先頭から進めながらコピーする
+  let offset = 0;
+  for (const chunk of chunks) {
+    // このチャンクを結合先の現在位置へコピーする
+    merged.set(chunk, offset);
+    // 次のコピー開始位置をチャンク分だけ進める
+    offset += chunk.byteLength;
+  }
+  // バイト列を UTF-8 文字列に変換して返す
+  return new TextDecoder().decode(merged);
+}
+
+/**
  * リクエストボディの messages を検証し、問題があれば日本語のエラーメッセージを返す。
  * 形だけの配列チェックでは巨大な本文・未知のロール・空配列がそのまま Claude へ
  * 転送されてしまうため、境界（件数・文字数・型）まで検証する（§セキュリティ: 入力は信用しない）。
@@ -206,8 +278,19 @@ export async function POST(
 
     // Content-Length ヘッダを数値として取得する（無ければ 0 とみなす）
     const contentLength = Number(request.headers.get("content-length") ?? 0);
-    // 明らかに大きすぎるボディはパース前に 413 で弾く（メモリ枯渇の防止）
+    // 申告値が明らかに大きすぎるボディは読み取り前に 413 で弾く（速い前段チェック）
     if (contentLength > MAX_BODY_BYTES) {
+      return NextResponse.json(
+        { error: "リクエストが大きすぎます。" },
+        { status: 413 }
+      );
+    }
+
+    // ボディを上限バイト数を強制しながら読み取る（ヘッダ申告に依存しない実測の上限。
+    // チャンク転送等で Content-Length が無いリクエストもここで必ず頭打ちになる）
+    const rawBody = await readBodyWithinLimit(request, MAX_BODY_BYTES);
+    // 実際の読み取りが上限を超えたボディは 413 で弾く（メモリ枯渇の防止）
+    if (rawBody === null) {
       return NextResponse.json(
         { error: "リクエストが大きすぎます。" },
         { status: 413 }
@@ -218,7 +301,7 @@ export async function POST(
     let body: { messages?: unknown; category?: unknown };
     try {
       // JSON パースを試みる（unknown として受け取り、この後の検証で絞り込む）
-      body = (await request.json()) as { messages?: unknown; category?: unknown };
+      body = JSON.parse(rawBody) as { messages?: unknown; category?: unknown };
     } catch {
       // JSON として不正なボディは 400（クライアント起因のエラー）を返す
       return NextResponse.json(
@@ -246,17 +329,30 @@ export async function POST(
     // 選択カテゴリに応じたシステムプロンプトを取得する
     const systemPrompt = getSystemPrompt(category);
 
-    // Claude API にストリーミングリクエストを送信する
-    const stream = await client.messages.stream({
-      model: MODEL_NAME,
-      // カテゴリ別の上書き設定があればそれを、なければ既定値を使う
-      max_tokens: getMaxTokens(category, DEFAULT_MAX_TOKENS),
-      system: systemPrompt,
-      messages: messages.map((m) => ({
-        role: m.role,
-        content: m.content,
-      })),
-    });
+    // Claude API にストリーミングリクエストを送信する。
+    // 旧実装の messages.stream() は接続を待たずに MessageStream を同期的に返すため、
+    // await しても上流の 401/429/400 はここで捕捉できず（エラーは反復中に初めて
+    // 表面化する）、下の catch のステータスマッピングが本番経路では一度も効かない
+    // 到達不能コードになっていた。stream: true の messages.create() は上流の HTTP
+    // 応答を受け取ってから解決する Promise を返し、認証エラー等は Anthropic.APIError
+    // として reject されるため、200 を確定させる前に catch へ届く
+    // （CLAUDE.md のエラーステータス契約を実経路で機能させる）。
+    const stream = await client.messages.create(
+      {
+        model: MODEL_NAME,
+        // カテゴリ別の上書き設定があればそれを、なければ既定値を使う
+        max_tokens: getMaxTokens(category, DEFAULT_MAX_TOKENS),
+        system: systemPrompt,
+        messages: messages.map((m) => ({
+          role: m.role,
+          content: m.content,
+        })),
+        // イベント単位のストリーミング応答を要求する
+        stream: true,
+      },
+      // クライアント切断でリクエストが中断されたら、上流への問い合わせも中断する
+      { signal: request.signal }
+    );
 
     // ストリーミングレスポンスを ReadableStream に変換する
     const readableStream = new ReadableStream({
@@ -281,9 +377,19 @@ export async function POST(
           // ストリームを閉じる
           controller.close();
         } catch (error) {
-          // ストリーム中のエラーをコントローラーに伝える
+          // クライアント切断による中断は異常系ではないため、静かに終了する
+          // （cancel() 後の controller はもう使えず、エラー通知の意味も無い）
+          if (isAbortError(error)) {
+            return;
+          }
+          // 中断以外のストリーム中のエラーはコントローラーに伝える
           controller.error(error);
         }
+      },
+      cancel() {
+        // 受信側（クライアント）が切断したら上流の Claude ストリームも中断する。
+        // 放置すると切断後も上流の生成が続き、トークンが課金され続けてしまう
+        stream.controller.abort();
       },
     });
 
