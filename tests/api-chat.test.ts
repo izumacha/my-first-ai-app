@@ -5,6 +5,8 @@
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { NextRequest } from "next/server";
+// 上流エラーマッピングの試験で SDK の型付きエラーを生成するために読み込む
+import Anthropic from "@anthropic-ai/sdk";
 
 // ストリームのモック（テキストデルタを 1 件流して終了する非同期イテレータ）
 const mockStream = {
@@ -190,17 +192,112 @@ describe("POST /api/chat のレート制限", () => {
     expect(res.status).toBe(429);
   });
 
-  it("X-Forwarded-For の先頭要素だけがキーとして使われる", async () => {
-    // 同じ先頭 IP でプロキシ経路（後続要素）だけ変えたリクエストを送る
+  it("X-Forwarded-For は末尾要素（信頼できる直近プロキシの追記分）がキーとして使われる", async () => {
+    // 末尾（実際の接続元）を固定し、先頭（クライアントが偽装できる部分）だけ変えたリクエストを送る
     const base = uniqueIp();
-    // まず先頭 IP 単独で上限まで消費する
+    // まず末尾 IP 単独で上限まで消費する
     for (let i = 0; i < 20; i++) {
       await POST(makeRequest({ messages: validMessages }, base));
     }
-    // 後続に別のプロキシ IP を連ねても同じキーとして 429 になることを確認する
+    // 先頭に偽装 IP を連ねても末尾が同じなら同一キーとして 429 になることを確認する
     const res = await POST(
-      makeRequest({ messages: validMessages }, `${base}, 203.0.113.7`)
+      makeRequest({ messages: validMessages }, `203.0.113.7, ${base}`)
     );
     expect(res.status).toBe(429);
+  });
+
+  it("X-Real-IP があれば X-Forwarded-For より優先してキーに使われる", async () => {
+    // この試験専用の実 IP（X-Real-IP）を用意する
+    const realIp = uniqueIp();
+    // X-Real-IP を固定しつつ X-Forwarded-For を毎回変えて上限まで消費する
+    for (let i = 0; i < 20; i++) {
+      // ヘッダを個別に組み立てる（XFF は毎回異なる偽装値）
+      const req = new NextRequest("http://localhost/api/chat", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-real-ip": realIp,
+          "x-forwarded-for": `198.51.100.${i + 1}`,
+        },
+        body: JSON.stringify({ messages: validMessages }),
+      });
+      // 上限までは 200 が返ることを確認する
+      const res = await POST(req);
+      expect(res.status).toBe(200);
+    }
+    // XFF を変えても X-Real-IP が同じなら 21 回目は 429 になることを確認する
+    const req = new NextRequest("http://localhost/api/chat", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-real-ip": realIp,
+        "x-forwarded-for": "198.51.100.250",
+      },
+      body: JSON.stringify({ messages: validMessages }),
+    });
+    const res = await POST(req);
+    expect(res.status).toBe(429);
+  });
+
+  it("429 応答には Retry-After ヘッダが付く", async () => {
+    // この試験専用の送信元を用意する
+    const ip = uniqueIp();
+    // 上限まで消費する
+    for (let i = 0; i < 20; i++) {
+      await POST(makeRequest({ messages: validMessages }, ip));
+    }
+    // 21 回目の 429 応答を取得する
+    const res = await POST(makeRequest({ messages: validMessages }, ip));
+    // 429 であることを確認する
+    expect(res.status).toBe(429);
+    // Retry-After がウィンドウ秒数（60）で付いていることを確認する
+    expect(res.headers.get("Retry-After")).toBe("60");
+  });
+});
+
+describe("POST /api/chat のボディサイズ上限", () => {
+  it("Content-Length が上限を超えるリクエストは 413 を返す", async () => {
+    // 小さいボディに巨大な Content-Length を申告したリクエストを組み立てる
+    const req = new NextRequest("http://localhost/api/chat", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-forwarded-for": uniqueIp(),
+        // 上限（1,000,000 バイト）を超える値を申告する
+        "content-length": "2000000",
+      },
+      body: JSON.stringify({ messages: validMessages }),
+    });
+    // パース前に 413 で弾かれることを確認する
+    const res = await POST(req);
+    expect(res.status).toBe(413);
+  });
+});
+
+describe("POST /api/chat の上流エラーマッピング", () => {
+  // 各テストの前にモックの記録と実装をリセットする
+  beforeEach(() => {
+    streamMock.mockClear();
+    streamMock.mockReturnValue(mockStream);
+  });
+
+  it("上流 Anthropic の 400 はクライアントエラー（400）として返す", async () => {
+    // Anthropic SDK の型付き 400 エラーを投げるモックを 1 回だけ仕込む
+    streamMock.mockImplementationOnce(() => {
+      // APIError.generate はステータスに応じた具象エラークラスを生成する
+      throw Anthropic.APIError.generate(
+        400,
+        { error: { type: "invalid_request_error", message: "bad request" } },
+        "bad request",
+        new Headers()
+      );
+    });
+    // 正常な形のリクエストを送る（上流でだけ 400 になる想定）
+    const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
+    // 500 ではなく 400 が返ることを確認する
+    expect(res.status).toBe(400);
+    // 内部メッセージ（英語）ではなく安全な日本語文言が返ることを確認する
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toContain("リクエストの内容が不正です");
   });
 });

@@ -61,11 +61,17 @@ export default function Home() {
 
         // レスポンスがエラーの場合はエラーメッセージを表示する
         if (!response.ok) {
-          const errorData = await response.json();
+          // エラーボディを JSON として読む（プロキシの HTML 応答など JSON でない場合は null に倒す）
+          const errorData = (await response.json().catch(() => null)) as {
+            error?: unknown;
+          } | null;
+          // サーバの日本語メッセージが文字列で得られればそれを、無ければ汎用文言を表示する
           setError(
-            errorData.error ?? "エラーが発生しました。もう一度お試しください。"
+            typeof errorData?.error === "string"
+              ? errorData.error
+              : "エラーが発生しました。もう一度お試しください。"
           );
-          setIsLoading(false);
+          // 早期リターンする（ローディング解除は finally が行う）
           return;
         }
 
@@ -75,7 +81,7 @@ export default function Home() {
         // リーダーが取得できない場合はエラー
         if (!reader) {
           setError("ストリーミングの開始に失敗しました。");
-          setIsLoading(false);
+          // 早期リターンする（ローディング解除は finally が行う）
           return;
         }
 
@@ -167,9 +173,12 @@ export default function Home() {
       {/* カテゴリ選択チップを表示する */}
       <CategoryChips selected={category} onSelect={setCategory} />
 
-      {/* エラーメッセージがあれば表示する */}
+      {/* エラーメッセージがあれば表示する（role="alert" でスクリーンリーダーに即時読み上げさせる） */}
       {error && (
-        <div className="mx-4 mt-2 rounded-lg bg-red-50 dark:bg-red-900/30 p-3 text-sm text-red-700 dark:text-red-300">
+        <div
+          role="alert"
+          className="mx-4 mt-2 rounded-lg bg-red-50 dark:bg-red-900/30 p-3 text-sm text-red-700 dark:text-red-300"
+        >
           {error}
         </div>
       )}

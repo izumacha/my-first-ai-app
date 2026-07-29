@@ -18,7 +18,7 @@ npm run test         # Vitest
 
 ## Architecture
 
-**Stack:** Next.js 15 (App Router), TypeScript, Anthropic Claude API (claude-sonnet-4-6), Vercel AI SDK, Tailwind CSS v4, Vitest
+**Stack:** Next.js 16 (App Router), TypeScript, Anthropic Claude API (claude-sonnet-4-6), Tailwind CSS v4, Vitest
 
 ### Layer layout
 
@@ -73,8 +73,10 @@ npm run test         # Vitest
 ### エラーハンドリング
 
 - API ルートでは `try-catch` で Claude API エラーをキャッチし、適切な HTTP ステータスコードを返す。
+  - 400: リクエスト不正（JSON 破損・入力検証エラー・上流 Claude API の 400）
   - 401: API キー未設定 / 無効
-  - 429: レート制限超過
+  - 413: リクエストボディが大きすぎる（Content-Length 上限超過）
+  - 429: レート制限超過（`Retry-After` ヘッダ付き）
   - 500: その他のサーバーエラー
 - フロントエンドではエラー時にユーザーフレンドリーな日本語メッセージを表示する。
 
