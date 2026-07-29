@@ -18,7 +18,7 @@ npm run test         # Vitest
 
 ## Architecture
 
-**Stack:** Next.js 15 (App Router), TypeScript, Anthropic Claude API (claude-sonnet-4-6), Vercel AI SDK, Tailwind CSS v4, Vitest
+**Stack:** Next.js 16 (App Router), TypeScript, Anthropic Claude API (claude-sonnet-4-6), Tailwind CSS v4, Vitest
 
 ### Layer layout
 
