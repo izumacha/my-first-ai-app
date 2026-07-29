@@ -2,6 +2,18 @@
 
 日常生活のちょっとした疑問や悩みを AI がサポートするチャットアプリです。
 
+## デモ
+
+主要画面のスクリーンショットです（開発環境でダミーの質問を使って撮影）。
+
+| 初期画面（カテゴリ選択） | 質問入力（「料理」カテゴリ選択中） |
+|---|---|
+| ![カテゴリチップとウェルカムメッセージが表示されたチャット初期画面](docs/screenshots/chat-initial-categories.png) | ![「料理」カテゴリを選択し、入力欄に質問を入力した画面](docs/screenshots/chat-category-selected.png) |
+
+| エラー表示（レート制限超過時） | モバイル表示 |
+|---|---|
+| ![レート制限（1 分 20 リクエスト）超過時に日本語のエラーメッセージを表示した画面](docs/screenshots/chat-error-message.png) | <img src="docs/screenshots/chat-mobile.png" alt="スマートフォン幅で表示したチャット初期画面" width="300"> |
+
 ## どんなアプリ？
 
 「冷蔵庫の残り物で何作れる？」「引っ越しの手続き、何からやればいい？」「このシミの落とし方は？」——
@@ -117,6 +129,17 @@ docker run --rm -p 3000:3000 \
   -e ANTHROPIC_API_KEY="your-key" \
   my-first-ai-app:latest
 ```
+
+## ブランチ運用（推奨）
+
+`main` を default branch にする運用を推奨します。
+
+- GitHub: **Settings → Branches → Default branch** で `main` を選択
+- 可能なら branch protection（CI必須）も有効化
+
+## セキュリティ
+
+- `docs/SECURITY.md`
 
 ## ライセンス
 
