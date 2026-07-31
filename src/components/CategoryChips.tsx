@@ -24,8 +24,14 @@ export default function CategoryChips({
   onSelect,
 }: CategoryChipsProps) {
   return (
-    // チップを横並びにするコンテナ（横スクロール可能）
-    <div className="flex gap-2 overflow-x-auto px-4 py-3 border-b border-gray-200 dark:border-gray-700">
+    // チップを横並びにするコンテナ（横スクロール可能）。
+    // 個々のチップは aria-pressed を持つトグルボタンなので、まとまりに role="group" と
+    // 名前を与えて「これは何の選択肢か」がスクリーンリーダーに伝わるようにする（§7）
+    <div
+      role="group"
+      aria-label="質問カテゴリ"
+      className="flex gap-2 overflow-x-auto px-4 py-3 border-b border-gray-200 dark:border-gray-700"
+    >
       {/* カテゴリ一覧をループしてチップを表示する */}
       {CATEGORIES.map((category) => (
         <button

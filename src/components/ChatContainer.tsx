@@ -29,13 +29,24 @@ export default function ChatContainer({
 
   // メッセージまたはストリーミングテキストが変わったら最下部にスクロールする
   useEffect(() => {
-    // ダミー要素が画面内に入るようスムーズにスクロールする
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    // OS 側で「視差効果を減らす」が有効かを調べる（未対応環境では false 扱い）。
+    // ストリーミング中は差分ごとに自動スクロールが走るため、動きに敏感なユーザーには
+    // 負担が大きい。§7「prefers-reduced-motion を尊重する」に従って挙動を切り替える
+    const prefersReducedMotion =
+      typeof window !== "undefined" &&
+      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
+
+    // 動きを減らす設定なら瞬間移動（auto）、そうでなければスムーズにスクロールする
+    bottomRef.current?.scrollIntoView({
+      behavior: prefersReducedMotion ? "auto" : "smooth",
+    });
   }, [messages, streamingText]);
 
   return (
-    // メッセージ一覧のスクロール可能なコンテナ
-    <div className="flex-1 overflow-y-auto p-4">
+    // メッセージ一覧のスクロール可能なコンテナ。
+    // 画面の主コンテンツなので <main> ランドマークにし、スクリーンリーダーの
+    // ランドマーク移動で会話本文へ直接ジャンプできるようにする（§7 セマンティック HTML）
+    <main aria-label="会話" className="flex-1 overflow-y-auto p-4">
       {/* メッセージが空の場合はウェルカムメッセージを表示する */}
       {messages.length === 0 && !streamingText && (
         <div className="flex h-full items-center justify-center">
@@ -64,6 +75,6 @@ export default function ChatContainer({
 
       {/* 自動スクロール用のダミー要素 */}
       <div ref={bottomRef} />
-    </div>
+    </main>
   );
 }
