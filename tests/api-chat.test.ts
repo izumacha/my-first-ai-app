@@ -51,11 +51,20 @@ import { POST } from "@/app/api/chat/route";
  * テスト用の POST リクエストを組み立てるヘルパー
  * @param body - JSON ボディ（文字列を渡した場合はそのまま送る）
  * @param ip - X-Forwarded-For ヘッダに設定する送信元（省略可）
+ * @param contentType - Content-Type ヘッダの値（省略時は JSON、null なら付けない）
  * @returns NextRequest インスタンス
  */
-function makeRequest(body: unknown, ip?: string): NextRequest {
-  // ヘッダを組み立てる（Content-Type は JSON 固定）
-  const headers: Record<string, string> = { "content-type": "application/json" };
+function makeRequest(
+  body: unknown,
+  ip?: string,
+  contentType: string | null = "application/json"
+): NextRequest {
+  // ヘッダを組み立てる（既定では Content-Type に JSON を指定する）
+  const headers: Record<string, string> = {};
+  // Content-Type の指定があればヘッダに載せる（null のときは意図的に省略する）
+  if (contentType !== null) {
+    headers["content-type"] = contentType;
+  }
   // 送信元が指定されていれば X-Forwarded-For を付ける
   if (ip) {
     headers["x-forwarded-for"] = ip;
@@ -300,6 +309,75 @@ describe("POST /api/chat のボディサイズ上限", () => {
     // ヘッダ申告に依存せず、実際の読み取りバイト数で 413 になることを確認する
     const res = await POST(req);
     expect(res.status).toBe(413);
+  });
+});
+
+describe("POST /api/chat の Content-Type 検証", () => {
+  // 各テストの前にモックの記録をリセットする
+  beforeEach(() => {
+    createMock.mockClear();
+  });
+
+  it("Content-Type が無いリクエストは 415 を返す", async () => {
+    // Content-Type を付けずに正しい JSON を送る（simple request を模す）
+    const res = await POST(
+      makeRequest({ messages: validMessages }, uniqueIp(), null)
+    );
+    // JSON 以外は受け付けないので 415 が返ることを確認する
+    expect(res.status).toBe(415);
+    // 上流 Claude API が一度も呼ばれていない（課金が発生しない）ことを確認する
+    expect(createMock).not.toHaveBeenCalled();
+  });
+
+  it("text/plain のリクエストは 415 を返す", async () => {
+    // HTML フォームから送れる text/plain で、中身は正しい JSON のリクエストを作る。
+    // これを通すと第三者サイトから preflight 無しで課金リクエストを誘発できてしまう
+    const res = await POST(
+      makeRequest({ messages: validMessages }, uniqueIp(), "text/plain")
+    );
+    // 415 で弾かれることを確認する
+    expect(res.status).toBe(415);
+    // 上流 Claude API が一度も呼ばれていないことを確認する
+    expect(createMock).not.toHaveBeenCalled();
+  });
+
+  it("charset パラメータ付きの application/json は受け付ける", async () => {
+    // ブラウザや HTTP クライアントが付けがちな charset 付きの Content-Type を送る
+    const res = await POST(
+      makeRequest(
+        { messages: validMessages },
+        uniqueIp(),
+        "application/json; charset=utf-8"
+      )
+    );
+    // パラメータ部を無視して MIME タイプ本体で判定するため 200 になることを確認する
+    expect(res.status).toBe(200);
+  });
+});
+
+describe("POST /api/chat のストリーミング応答", () => {
+  // 各テストの前にモックの記録と実装をリセットする
+  beforeEach(() => {
+    createMock.mockClear();
+    createMock.mockImplementation(() => Promise.resolve(makeMockStream()));
+  });
+
+  it("上流呼び出しにタイムアウトが指定される", async () => {
+    // 正常な形のリクエストを送る
+    await POST(makeRequest({ messages: validMessages }, uniqueIp()));
+    // create の第 2 引数（リクエストオプション）を取り出す
+    const options = createMock.mock.calls[0][1] as { timeout?: number };
+    // 応答しない上流に接続を占有され続けないよう上限が設定されていることを確認する
+    expect(options.timeout).toBeGreaterThan(0);
+  });
+
+  it("逆プロキシのバッファリングを無効化するヘッダが付く", async () => {
+    // 正常な形のリクエストを送る
+    const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
+    // SSE として返っていることを確認する
+    expect(res.headers.get("Content-Type")).toBe("text/event-stream");
+    // nginx 等がバッファリングして逐次表示にならない問題を防ぐヘッダを確認する
+    expect(res.headers.get("X-Accel-Buffering")).toBe("no");
   });
 });
 

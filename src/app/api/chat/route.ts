@@ -55,6 +55,89 @@ const MAX_CONTENT_LENGTH = 4000;
 /** メッセージのロールとして受け付ける値の一覧（未知のロールを Claude へ転送しない） */
 const ALLOWED_ROLES: readonly Role[] = ["user", "assistant"];
 
+/** リクエストボディとして受け付ける MIME タイプ（パラメータ部を除いた本体）。
+ * これを必須にすると、HTML フォームや simple request では送れない Content-Type に
+ * なるためブラウザが CORS preflight を挟み、第三者サイトからの POST が同一オリジン
+ * ポリシーで遮断される。認証は無いが上流 Claude API は従量課金なので、他サイトに
+ * 課金リクエストを誘発させない多層防御になる（§9 状態変更リクエストを保護する）。 */
+const REQUIRED_CONTENT_TYPE = "application/json";
+
+/** 上流 Claude API 呼び出しのタイムアウト（ミリ秒）。
+ * SDK 既定は 10 分と長く、応答しない上流に接続とメモリを占有され続けてしまう。
+ * 最長カテゴリの max_tokens（2048）を生成しきる時間には十分な余裕を持たせつつ、
+ * 公開エンドポイントとして必ず頭打ちにする（§9 タイムアウトを設ける）。 */
+const UPSTREAM_TIMEOUT_MS = 120_000;
+
+/** クライアントへ返すエラー文言の一元管理（§6 定数・ラベルは一元管理／DRY）。
+ * 同じ文言を複数箇所に直書きすると片方だけ直して食い違うため、ここを唯一の参照元にする。
+ * いずれも内部情報（スタックトレース・上流の英語メッセージ）を含まない安全な文言（§9）。 */
+const ERROR_MESSAGES = {
+  /** レート制限（自前・上流いずれも）に当たったときの文言 */
+  rateLimited: "リクエスト数が上限を超えました。しばらくお待ちください。",
+  /** Content-Type が JSON でないときの文言 */
+  unsupportedMediaType: "Content-Type は application/json を指定してください。",
+  /** ボディサイズが上限を超えたときの文言 */
+  bodyTooLarge: "リクエストが大きすぎます。",
+  /** ボディが JSON として壊れているときの文言 */
+  invalidJson: "リクエストボディが正しい JSON ではありません。",
+  /** 上流が 400 を返した（リクエスト内容起因）ときの文言 */
+  invalidRequest: "リクエストの内容が不正です。入力を確認してください。",
+  /** API キーが無効なときの文言 */
+  invalidApiKey: "API キーが無効です。設定を確認してください。",
+  /** 想定外のエラーで返す汎用文言 */
+  internal: "サーバーエラーが発生しました。",
+} as const;
+
+/** SSE のチャンクを組み立てる際に使い回すエンコーダ。
+ * イベントごとに new TextEncoder() すると生成コストが無駄に積み上がるため 1 つを共有する
+ * （TextEncoder は状態を持たず、使い回しても安全）。 */
+const sseEncoder = new TextEncoder();
+
+/**
+ * エラー応答（JSON）を組み立てる共通ヘルパー。
+ * ステータスと文言の組み合わせが各所に散らばると抜け漏れが生じるため 1 か所にまとめる。
+ * @param message - クライアントへ返す安全な日本語メッセージ
+ * @param status - HTTP ステータスコード
+ * @param headers - 追加で付与するヘッダ（Retry-After など。省略可）
+ * @returns エラー内容を表す JSON レスポンス
+ */
+function jsonError(
+  message: string,
+  status: number,
+  headers?: HeadersInit
+): NextResponse<ChatErrorResponse> {
+  // 共通形式 { error: string } の JSON を指定ステータスで返す
+  return NextResponse.json({ error: message }, { status, headers });
+}
+
+/**
+ * レート制限超過を表す 429 応答を組み立てる。
+ * 自前のレート制限と上流 429 の両方で同じ応答を返すため共通化する（§6 DRY）。
+ * @returns Retry-After ヘッダ付きの 429 レスポンス
+ */
+function rateLimitedResponse(): NextResponse<ChatErrorResponse> {
+  // 再試行までの待機秒数を Retry-After で明示して 429 を返す
+  return jsonError(ERROR_MESSAGES.rateLimited, 429, {
+    "Retry-After": RETRY_AFTER_SECONDS,
+  });
+}
+
+/**
+ * Content-Type ヘッダが JSON を示しているかを判定する。
+ * `application/json; charset=utf-8` のようにパラメータが付く形も正当なので、
+ * セミコロンより前の MIME タイプ本体だけを比較する（大文字小文字は区別しない）。
+ * @param request - 受信リクエスト
+ * @returns JSON として受け付けてよい Content-Type なら true
+ */
+function hasJsonContentType(request: NextRequest): boolean {
+  // Content-Type ヘッダを取得する（未指定なら空文字列として扱う）
+  const contentType = request.headers.get("content-type") ?? "";
+  // パラメータ（charset 等）を切り落とし、前後の空白を除いて小文字化する
+  const mimeType = contentType.split(";")[0].trim().toLowerCase();
+  // 必須の MIME タイプと一致するかを返す
+  return mimeType === REQUIRED_CONTENT_TYPE;
+}
+
 /**
  * リクエストヘッダから送信元を識別するキーを解決する。
  * X-Forwarded-For の先頭要素はクライアント自身が偽装できる（nginx 等の一般的な
@@ -256,6 +339,104 @@ function validateMessages(messages: unknown): string | null {
   return null;
 }
 
+/** Claude API から受け取るストリーム（SSE 変換に必要な最小限の形）。
+ * SDK の Stream 型に依存せず「非同期反復できて中断できる」ことだけを要求することで、
+ * テストのモックとも実装を共有できるようにする。 */
+type UpstreamStream = AsyncIterable<Anthropic.RawMessageStreamEvent> & {
+  /** クライアント切断時に上流の生成を打ち切るためのコントローラ */
+  controller: { abort: () => void };
+};
+
+/**
+ * 上流の Claude ストリームを、ブラウザへ返す SSE 形式の ReadableStream に変換する。
+ * POST ハンドラーから切り出して「SSE への変換」という単一の責務に閉じ込める（§6 単一責務）。
+ * @param stream - 上流 Claude API のイベントストリーム
+ * @returns SSE のバイト列を流す ReadableStream
+ */
+function createSseStream(stream: UpstreamStream): ReadableStream<Uint8Array> {
+  // SSE のチャンクを順次書き出す ReadableStream を組み立てて返す
+  return new ReadableStream({
+    async start(controller) {
+      try {
+        // テキストデルタイベントを順次読み出す
+        for await (const event of stream) {
+          // content_block_delta イベントからテキスト差分を取得する
+          if (
+            event.type === "content_block_delta" &&
+            event.delta.type === "text_delta"
+          ) {
+            // テキスト差分を SSE 形式でエンコードして送信する
+            const data = JSON.stringify({ text: event.delta.text });
+            controller.enqueue(sseEncoder.encode(`data: ${data}\n\n`));
+          }
+        }
+        // ストリーム終了を通知する
+        controller.enqueue(sseEncoder.encode("data: [DONE]\n\n"));
+        // ストリームを閉じる
+        controller.close();
+      } catch (error) {
+        // クライアント切断による中断は異常系ではないため、静かに終了する
+        // （cancel() 後の controller はもう使えず、エラー通知の意味も無い）
+        if (isAbortError(error)) {
+          return;
+        }
+        // 中断以外のストリーム中のエラーはコントローラーに伝える
+        controller.error(error);
+      }
+    },
+    cancel() {
+      // 受信側（クライアント）が切断したら上流の Claude ストリームも中断する。
+      // 放置すると切断後も上流の生成が続き、トークンが課金され続けてしまう
+      stream.controller.abort();
+    },
+  });
+}
+
+/**
+ * 捕捉した例外を、クライアントへ返す HTTP レスポンスへ対応付ける。
+ * POST ハンドラーから切り出して「エラー→ステータス変換」の責務に閉じ込める（§6 単一責務）。
+ * @param error - 捕捉した未知の例外
+ * @returns クライアントへ返すレスポンス
+ */
+function mapErrorToResponse(error: unknown): NextResponse<ChatErrorResponse> | Response {
+  // 接続確立前にクライアントが切断した場合の中断（request.signal 経由の abort）は
+  // 異常系ではないため、サーバ障害としてログに残さず静かに応答を打ち切る
+  // （499 はクライアント切断を表す慣用ステータス。切断済みなので誰も受け取らない）
+  if (isAbortError(error)) {
+    return new Response(null, { status: 499 });
+  }
+
+  // Anthropic SDK の型付きエラーはステータスコードで分類する。
+  // 旧実装のメッセージ文字列への部分一致（"API"/"key"）は、上流の 429 を 500 に
+  // 誤分類し、逆に 401 では英語の内部エラーメッセージをそのまま外部へ漏らしていた
+  if (error instanceof Anthropic.APIError) {
+    // 認証エラー（API キー無効等）は 401 と日本語の安全な文言を返す
+    if (error.status === 401) {
+      return jsonError(ERROR_MESSAGES.invalidApiKey, 401);
+    }
+    // 上流のレート制限（429）はそのまま 429 として返す（CLAUDE.md のステータス契約）
+    if (error.status === 429) {
+      return rateLimitedResponse();
+    }
+    // 上流の 400（リクエスト内容起因のエラー）はクライアントエラーとして 400 で返す。
+    // 500 に倒すとクライアント起因の問題がサーバ障害として誤って記録・表示されてしまう
+    if (error.status === 400) {
+      return jsonError(ERROR_MESSAGES.invalidRequest, 400);
+    }
+  }
+
+  // API キー未設定（getAnthropicClient が投げる日本語メッセージの例外）は 401 を返す
+  if (error instanceof Error && error.message.includes("ANTHROPIC_API_KEY")) {
+    return jsonError(error.message, 401);
+  }
+
+  // 想定外のエラーは詳細をサーバログにだけ残す（内部情報を外部へ返さない）
+  console.error("チャット API で想定外のエラーが発生しました:", error);
+
+  // その他のエラーは 500 と汎用の安全な文言を返す
+  return jsonError(ERROR_MESSAGES.internal, 500);
+}
+
 /**
  * POST ハンドラー
  * ユーザーのチャットメッセージを受け取り、Claude API にストリーミングで転送する。
@@ -270,20 +451,20 @@ export async function POST(
     // レート制限チェックを行う
     if (isRateLimited(clientKey)) {
       // 制限超過の場合は 429 を返す（Retry-After で再試行までの待機秒数を伝える）
-      return NextResponse.json(
-        { error: "リクエスト数が上限を超えました。しばらくお待ちください。" },
-        { status: 429, headers: { "Retry-After": RETRY_AFTER_SECONDS } }
-      );
+      return rateLimitedResponse();
+    }
+
+    // Content-Type が application/json でないリクエストは 415 で弾く。
+    // ボディを読む前に判定して、他サイトからの simple request を素通りさせない
+    if (!hasJsonContentType(request)) {
+      return jsonError(ERROR_MESSAGES.unsupportedMediaType, 415);
     }
 
     // Content-Length ヘッダを数値として取得する（無ければ 0 とみなす）
     const contentLength = Number(request.headers.get("content-length") ?? 0);
     // 申告値が明らかに大きすぎるボディは読み取り前に 413 で弾く（速い前段チェック）
     if (contentLength > MAX_BODY_BYTES) {
-      return NextResponse.json(
-        { error: "リクエストが大きすぎます。" },
-        { status: 413 }
-      );
+      return jsonError(ERROR_MESSAGES.bodyTooLarge, 413);
     }
 
     // ボディを上限バイト数を強制しながら読み取る（ヘッダ申告に依存しない実測の上限。
@@ -291,10 +472,7 @@ export async function POST(
     const rawBody = await readBodyWithinLimit(request, MAX_BODY_BYTES);
     // 実際の読み取りが上限を超えたボディは 413 で弾く（メモリ枯渇の防止）
     if (rawBody === null) {
-      return NextResponse.json(
-        { error: "リクエストが大きすぎます。" },
-        { status: 413 }
-      );
+      return jsonError(ERROR_MESSAGES.bodyTooLarge, 413);
     }
 
     // リクエストボディを JSON としてパースする（壊れた JSON は 400 として弾く）
@@ -304,17 +482,14 @@ export async function POST(
       body = JSON.parse(rawBody) as { messages?: unknown; category?: unknown };
     } catch {
       // JSON として不正なボディは 400（クライアント起因のエラー）を返す
-      return NextResponse.json(
-        { error: "リクエストボディが正しい JSON ではありません。" },
-        { status: 400 }
-      );
+      return jsonError(ERROR_MESSAGES.invalidJson, 400);
     }
 
     // メッセージ配列を検証する（件数・ロール・本文の型と長さまで確認する）
     const validationError = validateMessages(body.messages);
     // 検証エラーがあれば 400 を返す
     if (validationError) {
-      return NextResponse.json({ error: validationError }, { status: 400 });
+      return jsonError(validationError, 400);
     }
 
     // 検証を通過したメッセージ配列を型付きで取り出す
@@ -350,108 +525,30 @@ export async function POST(
         // イベント単位のストリーミング応答を要求する
         stream: true,
       },
-      // クライアント切断でリクエストが中断されたら、上流への問い合わせも中断する
-      { signal: request.signal }
+      {
+        // クライアント切断でリクエストが中断されたら、上流への問い合わせも中断する
+        signal: request.signal,
+        // 応答しない上流に接続を占有され続けないよう明示的な上限を設ける（§9）
+        timeout: UPSTREAM_TIMEOUT_MS,
+      }
     );
 
-    // ストリーミングレスポンスを ReadableStream に変換する
-    const readableStream = new ReadableStream({
-      async start(controller) {
-        try {
-          // テキストデルタイベントを順次読み出す
-          for await (const event of stream) {
-            // content_block_delta イベントからテキスト差分を取得する
-            if (
-              event.type === "content_block_delta" &&
-              event.delta.type === "text_delta"
-            ) {
-              // テキスト差分を SSE 形式でエンコードして送信する
-              const data = JSON.stringify({ text: event.delta.text });
-              controller.enqueue(
-                new TextEncoder().encode(`data: ${data}\n\n`)
-              );
-            }
-          }
-          // ストリーム終了を通知する
-          controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
-          // ストリームを閉じる
-          controller.close();
-        } catch (error) {
-          // クライアント切断による中断は異常系ではないため、静かに終了する
-          // （cancel() 後の controller はもう使えず、エラー通知の意味も無い）
-          if (isAbortError(error)) {
-            return;
-          }
-          // 中断以外のストリーム中のエラーはコントローラーに伝える
-          controller.error(error);
-        }
-      },
-      cancel() {
-        // 受信側（クライアント）が切断したら上流の Claude ストリームも中断する。
-        // 放置すると切断後も上流の生成が続き、トークンが課金され続けてしまう
-        stream.controller.abort();
-      },
-    });
+    // 上流ストリームを SSE 形式の ReadableStream に変換する
+    const readableStream = createSseStream(stream);
 
     // SSE レスポンスを返す
     return new Response(readableStream, {
       headers: {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
-        Connection: "keep-alive",
+        // nginx 等の逆プロキシがレスポンスをバッファリングすると、生成が終わるまで
+        // 1 文字も届かず「ストリーミング」にならないため、明示的に無効化する。
+        // （Connection ヘッダはホップバイホップで Response に付けても無視されるため外した）
+        "X-Accel-Buffering": "no",
       },
     });
   } catch (error: unknown) {
-    // 接続確立前にクライアントが切断した場合の中断（request.signal 経由の abort）は
-    // 異常系ではないため、サーバ障害としてログに残さず静かに応答を打ち切る
-    // （499 はクライアント切断を表す慣用ステータス。切断済みなので誰も受け取らない）
-    if (isAbortError(error)) {
-      return new Response(null, { status: 499 });
-    }
-
-    // Anthropic SDK の型付きエラーはステータスコードで分類する。
-    // 旧実装のメッセージ文字列への部分一致（"API"/"key"）は、上流の 429 を 500 に
-    // 誤分類し、逆に 401 では英語の内部エラーメッセージをそのまま外部へ漏らしていた
-    if (error instanceof Anthropic.APIError) {
-      // 認証エラー（API キー無効等）は 401 と日本語の安全な文言を返す
-      if (error.status === 401) {
-        return NextResponse.json(
-          { error: "API キーが無効です。設定を確認してください。" },
-          { status: 401 }
-        );
-      }
-      // 上流のレート制限（429）はそのまま 429 として返す（CLAUDE.md のステータス契約）
-      if (error.status === 429) {
-        return NextResponse.json(
-          { error: "リクエスト数が上限を超えました。しばらくお待ちください。" },
-          { status: 429, headers: { "Retry-After": RETRY_AFTER_SECONDS } }
-        );
-      }
-      // 上流の 400（リクエスト内容起因のエラー）はクライアントエラーとして 400 で返す。
-      // 500 に倒すとクライアント起因の問題がサーバ障害として誤って記録・表示されてしまう
-      if (error.status === 400) {
-        return NextResponse.json(
-          { error: "リクエストの内容が不正です。入力を確認してください。" },
-          { status: 400 }
-        );
-      }
-    }
-
-    // API キー未設定（getAnthropicClient が投げる日本語メッセージの例外）は 401 を返す
-    if (
-      error instanceof Error &&
-      error.message.includes("ANTHROPIC_API_KEY")
-    ) {
-      return NextResponse.json({ error: error.message }, { status: 401 });
-    }
-
-    // 想定外のエラーは詳細をサーバログにだけ残す（内部情報を外部へ返さない）
-    console.error("チャット API で想定外のエラーが発生しました:", error);
-
-    // その他のエラーは 500 と汎用の安全な文言を返す
-    return NextResponse.json(
-      { error: "サーバーエラーが発生しました。" },
-      { status: 500 }
-    );
+    // 例外の種類に応じた応答（499 / 401 / 429 / 400 / 500）へ変換して返す
+    return mapErrorToResponse(error);
   }
 }
