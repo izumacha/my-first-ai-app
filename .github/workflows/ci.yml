@@ -1,8 +1,8 @@
 name: CI
 
-# このリポジトリのデフォルトブランチは docs/initial-project-setup（main は存在しない）。
-# 旧設定は main のみを対象にしていたため、push でも PR でも CI が一度も起動しなかった。
-# デフォルトブランチへの push と、すべての PR で検証が走るようにする。
+# デフォルトブランチ（main）への push と、すべての PR で検証を走らせる。
+# docs/initial-project-setup は main を作る前に使っていた旧デフォルトブランチで、
+# 当時のコミットを直接押した場合にも検証が動くよう対象に残している。
 on:
   push:
     branches: [main, docs/initial-project-setup]

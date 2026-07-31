@@ -353,6 +353,27 @@ describe("POST /api/chat の Content-Type 検証", () => {
     // パラメータ部を無視して MIME タイプ本体で判定するため 200 になることを確認する
     expect(res.status).toBe(200);
   });
+
+  it("415 で弾かれたリクエストはレート制限の枠を消費しない", async () => {
+    // この試験専用の送信元を用意する
+    const ip = uniqueIp();
+
+    // 第三者サイトから被害者のブラウザ経由で simple request を浴びせる状況を模して、
+    // 上限（20 回）を超える回数だけ Content-Type 不正のリクエストを送る
+    for (let i = 0; i < 25; i++) {
+      // 中身は正しい JSON だが Content-Type が text/plain のリクエストを送る
+      const res = await POST(
+        makeRequest({ messages: validMessages }, ip, "text/plain")
+      );
+      // すべて 415 で弾かれる（レート制限の 429 にはならない）ことを確認する
+      expect(res.status).toBe(415);
+    }
+
+    // 同じ送信元から正規のリクエストを送る
+    const res = await POST(makeRequest({ messages: validMessages }, ip));
+    // 枠が消費されていないため、本人は通常どおり利用できる（429 にならない）ことを確認する
+    expect(res.status).toBe(200);
+  });
 });
 
 describe("POST /api/chat のストリーミング応答", () => {

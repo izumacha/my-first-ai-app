@@ -42,7 +42,7 @@ npm run test         # Vitest
 - リクエスト: `{ messages: Message[], category?: string }`、レスポンス: Server-Sent Events（ストリーミング）。
 - カテゴリに応じたシステムプロンプトを `src/lib/prompts.ts` から取得して Claude API に転送する。コンポーネントやルートハンドラにプロンプトを直接書かない。プロンプトは日本語で記述する。
 - API キーはサーバー側の環境変数 `ANTHROPIC_API_KEY` から取得し、フロントエンドに露出させない（§9）。モデル名は環境変数または定数で管理しハードコードしない。`max_tokens` 既定 1024、長文が必要なカテゴリは `prompts.ts` で個別設定。
-- API ルートに簡易レート制限（IP ベース、1 分あたり 20 リクエスト目安）。エラーは HTTP ステータスを使い分ける: 400（JSON 破損・入力検証エラー・上流 Claude API の 400）/ 401（キー未設定/無効）/ 413（本文サイズ上限超過。Content-Length の申告値と実際の読み取りバイト数の両方で強制）/ 415（`Content-Type` が `application/json` でない。simple request を弾いて第三者サイトからの課金誘発を防ぐ）/ 429（レート制限超過、`Retry-After` ヘッダ付き）/ 499（接続確立前のクライアント切断）/ 500（その他）。クライアントへ返す文言は `route.ts` の `ERROR_MESSAGES` に一元管理し、直書きしない。フロントはユーザーフレンドリーな日本語メッセージを表示する。
+- API ルートに簡易レート制限（IP ベース、1 分あたり 20 リクエスト目安）。エラーは HTTP ステータスを使い分ける: 400（JSON 破損・入力検証エラー・上流 Claude API の 400）/ 401（キー未設定/無効）/ 413（本文サイズ上限超過。Content-Length の申告値と実際の読み取りバイト数の両方で強制）/ 415（`Content-Type` が `application/json` でない。simple request を弾いて第三者サイトからの課金誘発を防ぐ。**この検証はレート制限より前に行う** — 後ろに置くと第三者サイトからの simple request で被害者 IP のレート枠を枯渇させられる）/ 429（レート制限超過、`Retry-After` ヘッダ付き）/ 499（接続確立前のクライアント切断）/ 500（その他）。クライアントへ返す文言は `route.ts` の `ERROR_MESSAGES` に一元管理し、直書きしない。フロントはユーザーフレンドリーな日本語メッセージを表示する。
 - 上流 Claude API 呼び出しには必ずタイムアウト（`UPSTREAM_TIMEOUT_MS`）を渡す。SSE 応答には逆プロキシのバッファリングを無効化する `X-Accel-Buffering: no` を付ける（ホップバイホップの `Connection` ヘッダは付けない）。
 
 ### テスト

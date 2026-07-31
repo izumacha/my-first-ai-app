@@ -445,6 +445,18 @@ export async function POST(
   request: NextRequest
 ): Promise<NextResponse<ChatErrorResponse> | Response> {
   try {
+    // Content-Type が application/json でないリクエストは、他のどの処理よりも先に
+    // 415 で弾く。ボディを読む前に判定するので上流呼び出しも発生しない。
+    // レート制限より前に置くのが重要: 第三者サイトが被害者のブラウザから simple request
+    // （text/plain 等）を大量に送ると、レート制限が先だとその分だけ被害者 IP の枠が減り、
+    // 本人が正規に使おうとしたときに 429 になってしまう（枠の枯渇による嫌がらせ）。
+    // ここで先に弾けば「この API が受け付ける形ですらないリクエスト」は枠を消費しない。
+    // 逆に無制限に 415 を叩かれる懸念はあるが、ヘッダ 1 本を見るだけの安価な拒否であり、
+    // 正しい Content-Type で叩けば結局レート制限に当たるため攻撃者の得は増えない
+    if (!hasJsonContentType(request)) {
+      return jsonError(ERROR_MESSAGES.unsupportedMediaType, 415);
+    }
+
     // リクエスト元を識別するキーを取得する
     const clientKey = resolveClientKey(request);
 
@@ -452,12 +464,6 @@ export async function POST(
     if (isRateLimited(clientKey)) {
       // 制限超過の場合は 429 を返す（Retry-After で再試行までの待機秒数を伝える）
       return rateLimitedResponse();
-    }
-
-    // Content-Type が application/json でないリクエストは 415 で弾く。
-    // ボディを読む前に判定して、他サイトからの simple request を素通りさせない
-    if (!hasJsonContentType(request)) {
-      return jsonError(ERROR_MESSAGES.unsupportedMediaType, 415);
     }
 
     // Content-Length ヘッダを数値として取得する（無ければ 0 とみなす）
