@@ -50,7 +50,10 @@ export default function ChatContainer({
       {/* メッセージが空の場合はウェルカムメッセージを表示する */}
       {messages.length === 0 && !streamingText && (
         <div className="flex h-full items-center justify-center">
-          <div className="text-center text-gray-400 dark:text-gray-500">
+          {/* ウェルカム文の色は WCAG AA（通常文 4.5:1）を満たす組み合わせにする（§7）。
+              薄いグレーは背景との差が足りず、旧実装は light 2.60:1 / dark 3.67:1 だった。
+              light: gray-600 on white = 7.56:1 / dark: gray-400 on gray-900 = 6.82:1 */}
+          <div className="text-center text-gray-600 dark:text-gray-400">
             <p className="text-lg font-medium mb-2">
               AI 暮らしアシスタント
             </p>
