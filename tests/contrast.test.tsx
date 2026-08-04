@@ -163,6 +163,32 @@ function extractColor(
 }
 
 /**
+ * 吹き出しの送信者ラベルが、その吹き出し背景に対して AA を満たすことを検証する。
+ * ユーザー／AI の 2 ケースは「描画 → ラベル取得 → 親要素から背景色を取得 → 比率検証」
+ * という同じ手順なので、role とラベル文言だけを差し替えられるようここへ集約する（§6 DRY）。
+ * @param role - 検証するメッセージの送信者（"user" か "assistant"）
+ * @param labelText - 画面に出る送信者ラベルの文言
+ */
+function expectBubbleLabelReadable(
+  role: "user" | "assistant",
+  labelText: string
+): void {
+  // 対象の吹き出しを描画する（本文は検証に使わないのでダミーで良い）
+  render(<ChatMessage message={{ role, content: "テスト" }} />);
+  // 送信者ラベルの要素を取得する
+  const label = screen.getByText(labelText);
+  // 吹き出し（ラベルの親要素）から背景色クラスを取り出す
+  const bubble = extractColor((label.parentElement as HTMLElement).className, "bg");
+  // 背景色クラスが取れていることを確かめる（取れないと比較対象が無く検証が空振りする）
+  expect(bubble.light, `${labelText} の吹き出し背景クラス`).toBeDefined();
+  // ダーク用の背景が未指定ならライト用がそのまま使われるので、それを検査対象にする
+  expectReadable(label, {
+    light: bubble.light as string,
+    dark: bubble.dark ?? (bubble.light as string),
+  });
+}
+
+/**
  * ある要素の文字色が、ライト／ダーク双方の背景に対して AA を満たすことを検証する。
  * @param element - 検査対象の要素（文字色クラスを持つ）
  * @param backgrounds - ライト／ダークそれぞれの背景色名
@@ -201,6 +227,19 @@ describe("文字色コントラスト（WCAG AA）", () => {
     delete (Element.prototype as Partial<Element>).scrollIntoView;
   });
 
+  // パレットの読み込み経路が生きていることを最初に確かめる。
+  // Tailwind の theme.css は将来フォーマットやパスが変わりうるため、読み込みに
+  // 失敗したまま「色クラスが 1 つも抽出できない」状態で他のテストが落ちると、
+  // 原因が色の問題なのか読み込みの問題なのか切り分けられなくなる
+  it("Tailwind パレットを theme.css から読み込めること", () => {
+    // 既定パレットは数百色あるので、極端に少なければ抽出の正規表現が合っていない
+    expect(PALETTE.size).toBeGreaterThan(100);
+    // 本テストが実際に参照する代表色が引けることを確かめる
+    for (const name of ["white", "black", "blue-600", "gray-100", "gray-900"]) {
+      expect(PALETTE.has(name), `パレットに ${name} が必要`).toBe(true);
+    }
+  });
+
   // 変換ロジック自体が壊れていないことを、既知の極端な組み合わせで先に確かめる
   it("コントラスト計算が WCAG の既知値と一致すること", () => {
     // 白と黒は理論上の最大値 21:1 になる（小数第 1 位まで一致すれば十分）
@@ -211,30 +250,12 @@ describe("文字色コントラスト（WCAG AA）", () => {
 
   // ユーザー吹き出しの送信者ラベルが、青い吹き出し背景に対して読めることを確かめる
   it("ユーザー吹き出しの送信者ラベルが AA を満たすこと", () => {
-    render(<ChatMessage message={{ role: "user", content: "テスト" }} />);
-    // 送信者ラベルの要素を取得する
-    const label = screen.getByText("あなた");
-    // 吹き出し（親要素）の背景色クラスを取得する
-    const bubble = extractColor(label.parentElement!.className, "bg");
-    // ユーザー吹き出しはライト／ダーク共通の背景色なので、両テーマとも同じ色で検査する
-    expectReadable(label, {
-      light: bubble.light as string,
-      dark: bubble.dark ?? (bubble.light as string),
-    });
+    expectBubbleLabelReadable("user", "あなた");
   });
 
   // AI 吹き出しの送信者ラベルが、灰色の吹き出し背景に対して読めることを確かめる
   it("AI 吹き出しの送信者ラベルが AA を満たすこと", () => {
-    render(<ChatMessage message={{ role: "assistant", content: "テスト" }} />);
-    // 送信者ラベルの要素を取得する
-    const label = screen.getByText("AI アシスタント");
-    // 吹き出し（親要素）の背景色クラスを取得する
-    const bubble = extractColor(label.parentElement!.className, "bg");
-    // AI 吹き出しはライト／ダークで背景色が異なるため、それぞれの背景で検査する
-    expectReadable(label, {
-      light: bubble.light as string,
-      dark: bubble.dark as string,
-    });
+    expectBubbleLabelReadable("assistant", "AI アシスタント");
   });
 
   // 会話が空のときに出るウェルカム文が、ページ背景に対して読めることを確かめる
