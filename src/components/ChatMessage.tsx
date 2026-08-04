@@ -32,12 +32,17 @@ export default function ChatMessage({ message }: ChatMessageProps) {
               "bg-gray-100 text-gray-900 dark:bg-gray-800 dark:text-gray-100"
         }`}
       >
-        {/* 送信者ラベルを表示する */}
+        {/* 送信者ラベルを表示する。
+            文字色は WCAG AA（通常文 4.5:1）を満たす組み合わせだけを使う（§7）。
+            text-xs は「大きな文字」(18pt/14pt太字) に当たらないため 3:1 では不足する。
+            - あなた: blue-50 on blue-600 = 4.82:1（旧 blue-100 は 4.31:1 で不足）
+            - AI light: gray-600 on gray-100 = 6.87:1（旧 gray-500 は 4.39:1 で不足）
+            - AI dark : gray-400 on gray-800 = 5.64:1（据え置き） */}
         <p
           className={`text-xs font-semibold mb-1 ${
             isUser
-              ? "text-blue-100"
-              : "text-gray-500 dark:text-gray-400"
+              ? "text-blue-50"
+              : "text-gray-600 dark:text-gray-400"
           }`}
         >
           {isUser ? "あなた" : "AI アシスタント"}

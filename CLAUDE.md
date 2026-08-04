@@ -49,6 +49,7 @@ npm run test         # Vitest
 
 - テストファイル: `tests/**/*.test.ts`（ユニット）, `tests/**/*.test.tsx`（コンポーネント）。
 - API ルートのテストでは Anthropic API をモックする（実際には呼ばない）。各カテゴリのシステムプロンプトが空でないことを検証する。
+- `tests/contrast.test.tsx` は §7 の WCAG AA（通常文 4.5:1）を CI で機械検証する。描画した DOM から `text-*` / `bg-*` クラスを抜き出し、Tailwind の `theme.css` の OKLCH 定義を sRGB へ変換してコントラスト比を計算する（期待値のハードコードなし）。文字色クラスを変えると自動で測り直されるので、UI の色を変更したら `npm run test` を必ず通す。
 
 ### 見せ方（§15 の具体化）
 
