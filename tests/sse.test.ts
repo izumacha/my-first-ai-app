@@ -1,0 +1,156 @@
+/**
+ * SSE フレーム書式（`src/lib/sse.ts`）のテスト
+ *
+ * 単体の整形・解析に加えて、**サーバーが実際に流したバイト列をクライアントと同じ手順で
+ * 読み直す**契約テストを置く。送信側と受信側は別ファイルにあり、片方だけ書式を変えても
+ * 型チェックは通ってしまうため、両者が同じ約束事に従っていることをここで機械的に守る。
+ */
+import { describe, it, expect, vi } from "vitest";
+import { NextRequest } from "next/server";
+import {
+  formatSseFrame,
+  parseSseDataLine,
+  SSE_DATA_PREFIX,
+  SSE_DONE_MARKER,
+} from "@/lib/sse";
+
+/** 契約テストで上流 Claude が返したことにするテキスト差分の並び */
+const UPSTREAM_DELTAS = ["こんにちは", "。今日は", "いい天気ですね"];
+
+// 上流ストリームのモックを作る（実 SDK の Stream と同じく中断用 controller を持たせる）
+function makeMockStream() {
+  return {
+    // クライアント切断時に route が呼ぶ中断用コントローラ
+    controller: { abort: vi.fn() },
+    // テキスト差分イベントを順に流す非同期イテレータ
+    async *[Symbol.asyncIterator]() {
+      // 差分を 1 件ずつ content_block_delta イベントとして返す
+      for (const text of UPSTREAM_DELTAS) {
+        yield { type: "content_block_delta", delta: { type: "text_delta", text } };
+      }
+    },
+  };
+}
+
+// Anthropic クライアントをモックする（実 API を呼ばない）
+vi.mock("@/lib/anthropic", async (importOriginal) => {
+  // 実モジュールからエラークラスなどを引き継ぐ
+  const actual = await importOriginal<typeof import("@/lib/anthropic")>();
+  return {
+    ...actual,
+    // モデル名はテスト用の固定値にする
+    MODEL_NAME: "test-model",
+    // 既定の max_tokens もテスト用の固定値にする
+    DEFAULT_MAX_TOKENS: 1024,
+    // クライアント取得はモックストリームで解決する偽クライアントを返す
+    getAnthropicClient: () => ({
+      messages: { create: () => Promise.resolve(makeMockStream()) },
+    }),
+  };
+});
+
+// テスト対象の POST ハンドラーをモック定義の後で読み込む
+import { POST } from "@/app/api/chat/route";
+
+describe("formatSseFrame", () => {
+  it("プレフィックスを付け、イベント終端の空行で閉じる", () => {
+    // 本文を渡してフレームへ整形する
+    expect(formatSseFrame("abc")).toBe(`${SSE_DATA_PREFIX}abc\n\n`);
+  });
+
+  it("空の本文でもフレームの形は崩れない", () => {
+    // 境界値として空文字列を渡す
+    expect(formatSseFrame("")).toBe(`${SSE_DATA_PREFIX}\n\n`);
+  });
+});
+
+describe("parseSseDataLine", () => {
+  it("データ行から本文だけを取り出す", () => {
+    // プレフィックス付きの行から本文が取り出せることを確認する
+    expect(parseSseDataLine(`${SSE_DATA_PREFIX}abc`)).toBe("abc");
+  });
+
+  it("フレーム区切りの空行は本文なし（null）として扱う", () => {
+    // 空行はデータ行ではないので null になることを確認する
+    expect(parseSseDataLine("")).toBeNull();
+  });
+
+  it("データ行でない行は本文なし（null）として扱う", () => {
+    // event 行のような別種の行が誤って本文として扱われないことを確認する
+    expect(parseSseDataLine("event: ping")).toBeNull();
+  });
+
+  it("本文に区切り文字と同じ並びが含まれても切り詰めない", () => {
+    // 本文側に "data: " が現れても、先頭の 1 回だけを取り除くことを確認する
+    expect(parseSseDataLine(`${SSE_DATA_PREFIX}${SSE_DATA_PREFIX}x`)).toBe(
+      `${SSE_DATA_PREFIX}x`
+    );
+  });
+
+  it("整形した結果の 1 行目は必ず解析できる（整形と解析が対になっている）", () => {
+    // 整形 → 改行で分割 → 解析、と往復させて元の本文に戻ることを確認する
+    const [firstLine] = formatSseFrame("往復").split("\n");
+    expect(parseSseDataLine(firstLine)).toBe("往復");
+  });
+});
+
+describe("SSE のサーバー↔クライアント契約", () => {
+  it("API が実際に流したバイト列を、画面と同じ手順で読み直すと元のテキストに戻る", async () => {
+    // 正常なリクエストを送って SSE レスポンスを受け取る
+    const request = new NextRequest("http://localhost/api/chat", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-forwarded-for": "192.0.2.10",
+      },
+      body: JSON.stringify({ messages: [{ role: "user", content: "やあ" }] }),
+    });
+    const response = await POST(request);
+    // SSE として返っていることを確認する
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toBe("text/event-stream");
+
+    // レスポンスボディを最後まで読み取って 1 本の文字列にする
+    const reader = response.body!.getReader();
+    // バイト列を文字列へ復号するデコーダーを用意する
+    const decoder = new TextDecoder();
+    // 受信した本文を貯める変数
+    let wire = "";
+    // ストリームの終わりまで読み続ける
+    for (;;) {
+      // 次のかたまりを読み取る
+      const { done, value } = await reader.read();
+      // 読み終わったらループを抜ける
+      if (done) break;
+      // かたまりを復号して連結する
+      wire += decoder.decode(value, { stream: true });
+    }
+
+    // ここから先は src/app/page.tsx の読み取りループと同じ手順で解析する
+    // 受信テキストを行に分割する
+    const lines = wire.split("\n");
+    // 復元したテキストを貯める変数
+    let restored = "";
+    // 終了マーカーを受け取ったかどうか
+    let sawDone = false;
+    // 各行をデータ行として解析する
+    for (const line of lines) {
+      // データ行なら本文を取り出す（データ行でなければ null）
+      const data = parseSseDataLine(line);
+      // データ行でない行は読み飛ばす
+      if (data === null) continue;
+      // 終了マーカーなら解析を終える
+      if (data === SSE_DONE_MARKER) {
+        sawDone = true;
+        break;
+      }
+      // 本文を JSON として解析してテキスト差分を取り出す
+      restored += (JSON.parse(data) as { text: string }).text;
+    }
+
+    // 上流が流した差分が欠けも重複もなく復元できることを確認する
+    expect(restored).toBe(UPSTREAM_DELTAS.join(""));
+    // 終了マーカーが最後に流れていることを確認する（受信側はこれで読み取りを終える）
+    expect(sawDone).toBe(true);
+  });
+});

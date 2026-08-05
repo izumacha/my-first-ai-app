@@ -33,6 +33,7 @@ npm run test         # Vitest
 - `src/components/` — UI コンポーネント（ChatMessage, ChatInput, ChatContainer, CategoryChips）。
 - `src/lib/anthropic.ts` — Anthropic クライアントの初期化（シングルトン）。
 - `src/lib/prompts.ts` — カテゴリ別システムプロンプト定義。プロンプト変更はここのみで行う。
+- `src/lib/sse.ts` — SSE のフレーム書式（`data: ` プレフィックス・`[DONE]` 番兵）と、その整形／解析ヘルパー。**送信側（`route.ts`）と読み取り側（`page.tsx`）の唯一の参照元**で、書式の直書きはどちらにも置かない。片側だけ変えると型チェックを通ったまま解析が壊れるため、`tests/sse.test.ts` の契約テストが両者の一致を機械的に守る。
 - `src/lib/types.ts` — 共通型定義（Message, Category, ChatRequest 等）。
 
 ### API ルート設計
@@ -54,12 +55,15 @@ npm run test         # Vitest
 ### 見せ方（§15 の具体化）
 
 - スタック形態は「serverless で完結する Web」: Vercel 無料枠での**公開デモ URL 必須**。ただし Claude API は従量課金のため、公開前に既存の IP レート制限（1 分 20 リクエスト）に加えて **Anthropic 側の月次利用上限（spend limit）を必ず設定**する。`ANTHROPIC_API_KEY` は Vercel の環境変数で管理し、デモ用と開発用でキーを分ける。
-- 撮影対象スクリーンショット（`docs/screenshots/` 配下、ダミーの質問のみ使用・個人情報や API キーを写さない）:
+- 撮影対象スクリーンショット（`docs/screenshots/` 配下、ダミーの質問のみ使用・個人情報や API キーを写さない）。**以下は実在するファイルと一致させること**（README のデモブロックから参照している）:
   1. `chat-initial-categories.png` — 初期画面（カテゴリチップ表示）
-  2. `chat-streaming-answer.png` — 質問への回答ストリーミング中の会話
+  2. `chat-category-selected.png` — カテゴリ選択後、入力欄に質問を入力した画面
   3. `chat-error-message.png` — エラー時の日本語メッセージ表示
-  - 任意の追加候補: `chat-mobile.png` — モバイル表示
-- デモ GIF: 「カテゴリ選択 → 質問入力 → ストリーミング回答」フロー 1 本（10MB 以下）。撮影は Playwright 等での自動化を推奨（例: `scripts/capture-screenshots.ts`、実行コマンドは §2 に記載）。
+  4. `chat-mobile.png` — モバイル幅での表示
+- **未対応（意図的に残している宿題。満たしたらこの節から削除する）**:
+  - 公開デモ URL — 未公開。公開時は Anthropic 側の月次利用上限（spend limit）設定が前提条件。
+  - デモ GIF（「カテゴリ選択 → 質問入力 → ストリーミング回答」1 本・10MB 以下）— 未作成。回答のストリーミングを含む撮影は実 API キーでの課金呼び出しを伴うため、上流をスタブした撮影経路を用意してから着手する。
+  - 撮影の自動化スクリプト — 未作成。現状のスクショは手動撮影。作成したら実行コマンドを §2 に追記する。
 
 ---
 

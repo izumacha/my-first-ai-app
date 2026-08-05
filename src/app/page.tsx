@@ -8,6 +8,7 @@ import { useState, useCallback } from "react";
 import ChatContainer from "@/components/ChatContainer";
 import ChatInput from "@/components/ChatInput";
 import CategoryChips from "@/components/CategoryChips";
+import { parseSseDataLine, SSE_DONE_MARKER } from "@/lib/sse";
 import type { Message, CategoryId } from "@/lib/types";
 
 /**
@@ -114,27 +115,29 @@ export default function Home() {
             lineBuffer = lines.pop() ?? "";
 
             for (const line of lines) {
-              // "data: " で始まる行のみ処理する
-              if (line.startsWith("data: ")) {
-                // "data: " プレフィックスを除去してデータ部分を取得する
-                const data = line.slice(6);
+              // データ行なら本文を取り出す（データ行でなければ null が返る。書式は @/lib/sse に集約）
+              const data = parseSseDataLine(line);
 
-                // ストリーム終了マーカーなら読み取り全体を完了させる
-                if (data === "[DONE]") {
-                  sawDone = true;
-                  break;
-                }
+              // データ行でない行（フレーム区切りの空行など）は読み飛ばす
+              if (data === null) {
+                continue;
+              }
 
-                try {
-                  // JSON をパースしてテキスト差分を取得する
-                  const parsed = JSON.parse(data) as { text: string };
-                  // 蓄積テキストに差分を追加する
-                  accumulated += parsed.text;
-                  // ストリーミング表示を更新する
-                  setStreamingText(accumulated);
-                } catch {
-                  // JSON パースに失敗した行は無視する
-                }
+              // ストリーム終了マーカーなら読み取り全体を完了させる
+              if (data === SSE_DONE_MARKER) {
+                sawDone = true;
+                break;
+              }
+
+              try {
+                // JSON をパースしてテキスト差分を取得する
+                const parsed = JSON.parse(data) as { text: string };
+                // 蓄積テキストに差分を追加する
+                accumulated += parsed.text;
+                // ストリーミング表示を更新する
+                setStreamingText(accumulated);
+              } catch {
+                // JSON パースに失敗した行は無視する
               }
             }
           }
