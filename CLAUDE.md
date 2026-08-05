@@ -33,6 +33,7 @@ npm run test         # Vitest
 - `src/components/` — UI コンポーネント（ChatMessage, ChatInput, ChatContainer, CategoryChips）。
 - `src/lib/anthropic.ts` — Anthropic クライアントの初期化（シングルトン）。
 - `src/lib/prompts.ts` — カテゴリ別システムプロンプト定義。プロンプト変更はここのみで行う。
+- `src/lib/sse.ts` — SSE のフレーム書式（`data: ` プレフィックス・`[DONE]` 番兵）と、その整形／解析ヘルパー。**送信側（`route.ts`）と読み取り側（`page.tsx`）の唯一の参照元**で、書式の直書きはどちらにも置かない。片側だけ変えると型チェックを通ったまま解析が壊れるため、`tests/sse.test.ts` の契約テストが両者の一致を機械的に守る。
 - `src/lib/types.ts` — 共通型定義（Message, Category, ChatRequest 等）。
 
 ### API ルート設計

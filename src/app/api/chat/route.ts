@@ -12,6 +12,7 @@ import {
   DEFAULT_MAX_TOKENS,
 } from "@/lib/anthropic";
 import { getSystemPrompt, getMaxTokens, isCategoryId } from "@/lib/prompts";
+import { formatSseFrame, SSE_DONE_MARKER } from "@/lib/sse";
 import type { ChatErrorResponse, Message, Role } from "@/lib/types";
 
 /** レート制限用：IP ごとのリクエスト時刻を記録するマップ */
@@ -369,13 +370,13 @@ function createSseStream(stream: UpstreamStream): ReadableStream<Uint8Array> {
             event.type === "content_block_delta" &&
             event.delta.type === "text_delta"
           ) {
-            // テキスト差分を SSE 形式でエンコードして送信する
+            // テキスト差分を SSE 形式でエンコードして送信する（書式は @/lib/sse に集約）
             const data = JSON.stringify({ text: event.delta.text });
-            controller.enqueue(sseEncoder.encode(`data: ${data}\n\n`));
+            controller.enqueue(sseEncoder.encode(formatSseFrame(data)));
           }
         }
-        // ストリーム終了を通知する
-        controller.enqueue(sseEncoder.encode("data: [DONE]\n\n"));
+        // ストリーム終了を通知する（番兵の値は読み取り側と共有の定数を使う）
+        controller.enqueue(sseEncoder.encode(formatSseFrame(SSE_DONE_MARKER)));
         // ストリームを閉じる
         controller.close();
       } catch (error) {
