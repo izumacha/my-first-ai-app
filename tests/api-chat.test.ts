@@ -32,17 +32,32 @@ const createMock = vi.fn().mockImplementation(() =>
   Promise.resolve(makeMockStream())
 );
 
+// getAnthropicClient の振る舞いを差し替えるためのフック。null なら既定の偽クライアントを返す。
+// API キー未設定など「クライアント取得そのものが失敗する」経路を試験するために使う
+let getClientOverride: (() => unknown) | null = null;
+
 // Anthropic クライアント側モジュールをモックする（実 API を呼ばないため）
-vi.mock("@/lib/anthropic", () => ({
-  // モデル名はテスト用の固定値にする
-  MODEL_NAME: "test-model",
-  // 既定の max_tokens もテスト用の固定値にする
-  DEFAULT_MAX_TOKENS: 1024,
-  // クライアント取得はストリーミング作成モックを持つ偽クライアントを返す
-  getAnthropicClient: () => ({
-    messages: { create: createMock },
-  }),
-}));
+vi.mock("@/lib/anthropic", async (importOriginal) => {
+  // MissingApiKeyError は route 側が instanceof で判定する型なので、
+  // 偽物を作らず実物を読み込んで共有する（型が食い違うと判定が通らずテストが無意味になる）
+  const actual = await importOriginal<typeof import("@/lib/anthropic")>();
+  return {
+    // API キー未設定エラーの実クラスをそのまま再エクスポートする
+    MissingApiKeyError: actual.MissingApiKeyError,
+    // モデル名はテスト用の固定値にする
+    MODEL_NAME: "test-model",
+    // 既定の max_tokens もテスト用の固定値にする
+    DEFAULT_MAX_TOKENS: 1024,
+    // クライアント取得は、差し替えがあればそれを、無ければストリーミング作成モックを持つ偽クライアントを返す
+    getAnthropicClient: () =>
+      getClientOverride
+        ? getClientOverride()
+        : { messages: { create: createMock } },
+  };
+});
+
+// テストから実クラスを参照するために、モック定義の後で実モジュールを読み込む
+import { MissingApiKeyError } from "@/lib/anthropic";
 
 // テスト対象の POST ハンドラーをモック定義の後で読み込む
 import { POST } from "@/app/api/chat/route";
@@ -454,6 +469,35 @@ describe("POST /api/chat の上流エラーマッピング", () => {
     // 内部メッセージではなく安全な日本語文言が返ることを確認する
     const body = (await res.json()) as { error: string };
     expect(body.error).toContain("API キーが無効です");
+  });
+
+  it("API キー未設定（MissingApiKeyError）は 401 を返し、環境変数名を応答に漏らさない", async () => {
+    // クライアント取得そのものが API キー未設定で失敗する状況を作る
+    getClientOverride = () => {
+      throw new MissingApiKeyError();
+    };
+    // console.error でのサーバログ出力を握って、テスト出力を汚さず呼び出しも検証できるようにする
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // 正常な形のリクエストを送る（サーバ側の設定漏れだけが原因の想定）
+      const res = await POST(
+        makeRequest({ messages: validMessages }, uniqueIp())
+      );
+      // 500 ではなく 401 が返ることを確認する（CLAUDE.md のステータス契約）
+      expect(res.status).toBe(401);
+      // 応答ボディを読み取る
+      const body = (await res.json()) as { error: string };
+      // 一元管理された安全な日本語文言が返ることを確認する
+      expect(body.error).toBe("API キーが無効です。設定を確認してください。");
+      // サーバ側の環境変数名が応答に混ざっていないことを確認する（内部構成情報の漏洩防止）
+      expect(body.error).not.toContain("ANTHROPIC_API_KEY");
+      // 設定漏れが運用者に届くよう、サーバログには残っていることを確認する
+      expect(errorSpy).toHaveBeenCalled();
+    } finally {
+      // 後続テストに影響しないよう差し替えとスパイを必ず戻す
+      getClientOverride = null;
+      errorSpy.mockRestore();
+    }
   });
 
   it("上流 Anthropic の 429 は Retry-After 付きの 429 を返す", async () => {

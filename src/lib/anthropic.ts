@@ -17,10 +17,28 @@ export const DEFAULT_MAX_TOKENS = 1024;
 let client: Anthropic | null = null;
 
 /**
+ * 環境変数 `ANTHROPIC_API_KEY` が未設定のときに投げる専用のエラー型。
+ *
+ * 設計判断: 呼び出し側（API ルート）はこの失敗を 401 に対応付ける必要があるが、
+ * 以前はエラーメッセージへの部分一致（`message.includes("ANTHROPIC_API_KEY")`）で
+ * 判別していた。文字列に依存すると、この throw の文言を少し直しただけで判定が
+ * 静かに外れて 500 に化けてしまう（型では守られない暗黙の結合）。型で分類できる
+ * ようにして、判定と表示文言を切り離す。
+ */
+export class MissingApiKeyError extends Error {
+  constructor() {
+    // 内部（サーバログ）向けの詳細メッセージ。クライアントへはそのまま返さない
+    super("ANTHROPIC_API_KEY が設定されていません。");
+    // エラー名を明示して、ログやデバッガ上で種別が分かるようにする
+    this.name = "MissingApiKeyError";
+  }
+}
+
+/**
  * Anthropic クライアントを取得する（シングルトン）
  * 初回呼び出し時にインスタンスを生成し、以降は同じインスタンスを返す。
  * @returns Anthropic クライアントインスタンス
- * @throws API キーが未設定の場合にエラーをスローする
+ * @throws {MissingApiKeyError} API キーが未設定の場合
  */
 export function getAnthropicClient(): Anthropic {
   // クライアントが未生成なら新しく作成する
@@ -28,9 +46,9 @@ export function getAnthropicClient(): Anthropic {
     // 環境変数から API キーを取得する
     const apiKey = process.env.ANTHROPIC_API_KEY;
 
-    // API キーが設定されていない場合はエラーを投げる
+    // API キーが設定されていない場合は専用のエラー型を投げる（呼び出し側が型で分類できる）
     if (!apiKey) {
-      throw new Error("ANTHROPIC_API_KEY が設定されていません。");
+      throw new MissingApiKeyError();
     }
 
     // Anthropic クライアントを生成する
