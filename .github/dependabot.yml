@@ -1,0 +1,52 @@
+# Dependabot 設定: 依存関係の既知脆弱性・更新を毎週チェックして PR を作成する
+# (CLAUDE.md「セキュリティ」の依存管理方針に基づく)
+#
+# 【このファイルがこのブランチにある理由】
+# Dependabot は「リポジトリのデフォルトブランチ」にある dependabot.yml しか読まない。
+# 本リポジトリのデフォルトブランチは docs/initial-project-setup のままで、実開発は
+# main で行われているため、main 側の同名ファイル (PR #12) だけでは Dependabot が
+# 起動しない。そこでデフォルトブランチにも本ファイルを置き、`target-branch: main` で
+# 更新 PR を実開発ブランチ main に向ける。
+# デフォルトブランチを main に切り替えたら、この回避策 (target-branch 指定) は不要になり、
+# main 側の dependabot.yml がそのまま有効になる。
+# 注: `target-branch` を指定したエントリはバージョン更新専用となり、セキュリティ更新
+# (Dependabot alerts 起点の自動 PR) には適用されない（セキュリティ更新は常にデフォルト
+# ブランチを対象とする GitHub の仕様）。これもデフォルトブランチの main 化で解消する。
+version: 2
+updates:
+  # package.json / package-lock.json の npm 依存 (Next.js / Anthropic SDK 等)
+  - package-ecosystem: "npm"
+    directory: "/"
+    # 更新 PR は実開発ブランチ main の依存定義を対象にする
+    target-branch: "main"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      # コミット規約 type(scope) に合わせる
+      prefix: "chore(deps)"
+    groups:
+      # minor / patch 更新は 1 本の PR にまとめてレビュー負荷を下げる (major は個別 PR)
+      npm-minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  # Dockerfile のベースイメージ (node 等)
+  - package-ecosystem: "docker"
+    directory: "/"
+    # 更新 PR は実開発ブランチ main の Dockerfile を対象にする
+    target-branch: "main"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      # コミット規約 type(scope) に合わせる
+      prefix: "chore(docker)"
+
+  # .github/workflows/ で使う GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    # 更新 PR は実開発ブランチ main のワークフローを対象にする
+    target-branch: "main"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      # コミット規約 type(scope) に合わせる
+      prefix: "chore(ci)"
