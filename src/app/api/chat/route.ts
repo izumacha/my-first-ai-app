@@ -7,6 +7,7 @@ import { NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import {
   getAnthropicClient,
+  MissingApiKeyError,
   MODEL_NAME,
   DEFAULT_MAX_TOKENS,
 } from "@/lib/anthropic";
@@ -82,7 +83,10 @@ const ERROR_MESSAGES = {
   invalidJson: "リクエストボディが正しい JSON ではありません。",
   /** 上流が 400 を返した（リクエスト内容起因）ときの文言 */
   invalidRequest: "リクエストの内容が不正です。入力を確認してください。",
-  /** API キーが無効なときの文言 */
+  /** API キーが無効、または未設定（サーバ側の設定漏れ）のときの文言。
+   * どちらも「サーバ側の資格情報が使えない」という同じ状況なので、クライアントへは
+   * 区別せず同じ安全な文言を返す。どちらだったかは環境変数名を含まない形でサーバログにだけ残す
+   * （§9 機密情報・内部詳細をエラー応答に漏らさない）。 */
   invalidApiKey: "API キーが無効です。設定を確認してください。",
   /** 想定外のエラーで返す汎用文言 */
   internal: "サーバーエラーが発生しました。",
@@ -425,9 +429,20 @@ function mapErrorToResponse(error: unknown): NextResponse<ChatErrorResponse> | R
     }
   }
 
-  // API キー未設定（getAnthropicClient が投げる日本語メッセージの例外）は 401 を返す
-  if (error instanceof Error && error.message.includes("ANTHROPIC_API_KEY")) {
-    return jsonError(error.message, 401);
+  // API キー未設定（getAnthropicClient が投げる専用エラー）は 401 を返す。
+  // 旧実装は例外の message をそのままクライアントへ返しており、匿名の呼び出し元に
+  // サーバ側の環境変数名（ANTHROPIC_API_KEY）という内部構成情報を漏らしていた
+  // （§9 内部詳細をエラー応答に漏らさない／§6 クライアント文言は ERROR_MESSAGES に一元管理）。
+  // 判定も message の部分一致から instanceof へ変え、throw の文言変更で静かに 500 へ
+  // 化けない（型で守られる）ようにする。
+  if (error instanceof MissingApiKeyError) {
+    // 設定漏れは運用者が必ず気づくべき障害なので、詳細はサーバログにだけ残す（§6 握り潰さない）
+    console.error(
+      "チャット API の呼び出しに必要な API キーが未設定です:",
+      error.name
+    );
+    // クライアントへは一元管理された安全な文言だけを返す
+    return jsonError(ERROR_MESSAGES.invalidApiKey, 401);
   }
 
   // 想定外のエラーは詳細をサーバログにだけ残す（内部情報を外部へ返さない）
