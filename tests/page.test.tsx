@@ -75,14 +75,19 @@ describe("チャット画面のストリーミング処理", () => {
   beforeEach(() => {
     // cancel 呼び出しの記録用スパイを作り直す
     cancelSpy = vi.fn<() => void>();
-    // jsdom には scrollIntoView が無いため、自動スクロールの呼び出しを無害化する
+    // jsdom の Element には scrollIntoView が無いため、プロトタイプへ直接生やして
+    // 自動スクロールの呼び出しを無害化する（components.test.tsx と同じ手順に揃える）
     Element.prototype.scrollIntoView = vi.fn();
   });
 
-  // 各テストの後にモックを元に戻す
+  // 各テストの後に差し替えたものをすべて元に戻す
   afterEach(() => {
-    // グローバルの差し替え（fetch など）をすべて復元する
-    vi.restoreAllMocks();
+    // vi.stubGlobal で差し替えた fetch を復元する。
+    // 注意: vi.restoreAllMocks() は spy を戻すだけで stubGlobal は解除しないため、
+    // ここは必ず unstubAllGlobals を使う（components.test.tsx の matchMedia と同じ）
+    vi.unstubAllGlobals();
+    // プロトタイプへ生やした scrollIntoView を取り除く（他のテストへ漏らさない）
+    delete (Element.prototype as Partial<Element>).scrollIntoView;
   });
 
   it("行の途中で分割されたチャンクを結合して回答を組み立てること", async () => {
