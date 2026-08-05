@@ -6,7 +6,16 @@
  * 「境界値を重視する」観点で最も抜けやすい箇所）。fetch をモックして、
  * チャンク分割・[DONE]・エラー応答・リソース解放の各経路を検証する。
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import {
+  describe,
+  it,
+  expect,
+  vi,
+  beforeAll,
+  afterAll,
+  beforeEach,
+  afterEach,
+} from "vitest";
 import type { Mock } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import Home from "@/app/page";
@@ -70,24 +79,52 @@ function sendMessage(text: string): void {
   fireEvent.click(screen.getByRole("button", { name: "送信" }));
 }
 
+/**
+ * 送信処理が完全に終わる（isLoading が false に戻る）まで待つ。
+ *
+ * 表示の検証（例: 回答テキストの出現）だけでテストを終えると、その後も
+ * [DONE] の処理・reader の解放・履歴への確定・ローディング解除といった
+ * 非同期の状態更新が続き、テスト終了後（afterEach の後）に React の再描画が
+ * 走ってしまう。片付け済みのスタブを掴んで落ちる不安定なテストになるため、
+ * 各テストは必ずこれで「処理が完全に終わった」ことを待ってから終える。
+ *
+ * 送信中はボタンの文言が「送信中...」に変わるので、「送信」という名前の
+ * ボタンが再び現れたことをもって完了と判定する。
+ */
+async function waitForIdle(): Promise<void> {
+  // ボタンの文言が「送信」に戻る＝ isLoading が false になるまで待つ
+  await waitFor(() => {
+    expect(screen.getByRole("button", { name: "送信" })).toBeInTheDocument();
+  });
+}
+
 describe("チャット画面のストリーミング処理", () => {
-  // 各テストの前に fetch のモックとスパイを初期化する
-  beforeEach(() => {
-    // cancel 呼び出しの記録用スパイを作り直す
-    cancelSpy = vi.fn<() => void>();
-    // jsdom の Element には scrollIntoView が無いため、プロトタイプへ直接生やして
-    // 自動スクロールの呼び出しを無害化する（components.test.tsx と同じ手順に揃える）
+  // jsdom の Element には scrollIntoView が無いため、プロトタイプへ直接生やして
+  // 自動スクロールの呼び出しを無害化する。
+  // テストごと（beforeEach/afterEach）ではなくファイル単位で着脱するのが重要:
+  // テストの合間に一瞬でも取り外すと、直前のテストの積み残しの再描画がその隙間に
+  // 入り込んで「scrollIntoView is not a function」で落ちる不安定なテストになる
+  beforeAll(() => {
     Element.prototype.scrollIntoView = vi.fn();
   });
 
-  // 各テストの後に差し替えたものをすべて元に戻す
+  // ファイル内の全テストが終わってから取り除く（他のテストファイルへ漏らさない）
+  afterAll(() => {
+    delete (Element.prototype as Partial<Element>).scrollIntoView;
+  });
+
+  // 各テストの前にスパイを初期化する
+  beforeEach(() => {
+    // cancel 呼び出しの記録用スパイを作り直す
+    cancelSpy = vi.fn<() => void>();
+  });
+
+  // 各テストの後に差し替えたものを元に戻す
   afterEach(() => {
     // vi.stubGlobal で差し替えた fetch を復元する。
     // 注意: vi.restoreAllMocks() は spy を戻すだけで stubGlobal は解除しないため、
     // ここは必ず unstubAllGlobals を使う（components.test.tsx の matchMedia と同じ）
     vi.unstubAllGlobals();
-    // プロトタイプへ生やした scrollIntoView を取り除く（他のテストへ漏らさない）
-    delete (Element.prototype as Partial<Element>).scrollIntoView;
   });
 
   it("行の途中で分割されたチャンクを結合して回答を組み立てること", async () => {
@@ -115,6 +152,8 @@ describe("チャット画面のストリーミング処理", () => {
     await waitFor(() => {
       expect(screen.getByText("こんにちは、世界")).toBeInTheDocument();
     });
+    // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
+    await waitForIdle();
   });
 
   it("[DONE] 受信後にレスポンスボディを解放すること", async () => {
@@ -145,6 +184,8 @@ describe("チャット画面のストリーミング処理", () => {
     await waitFor(() => {
       expect(cancelSpy).toHaveBeenCalled();
     });
+    // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
+    await waitForIdle();
   });
 
   it("エラー応答ではサーバの日本語メッセージをそのまま表示すること", async () => {
@@ -172,6 +213,8 @@ describe("チャット画面のストリーミング処理", () => {
         "リクエスト数が上限を超えました。"
       );
     });
+    // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
+    await waitForIdle();
   });
 
   it("JSON でないエラー応答では汎用の日本語文言にフォールバックすること", async () => {
@@ -196,6 +239,8 @@ describe("チャット画面のストリーミング処理", () => {
         "エラーが発生しました。"
       );
     });
+    // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
+    await waitForIdle();
   });
 
   it("ストリームが途中で切れても受信済みの回答を会話履歴に残すこと", async () => {
@@ -238,5 +283,7 @@ describe("チャット画面のストリーミング処理", () => {
     await waitFor(() => {
       expect(screen.getByRole("alert")).toHaveTextContent("通信エラー");
     });
+    // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
+    await waitForIdle();
   });
 });
