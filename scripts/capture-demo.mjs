@@ -19,12 +19,19 @@
 import http from "node:http";
 // 子プロセス起動（next dev / ffmpeg 実行用）を読み込む
 import { spawn, spawnSync } from "node:child_process";
-// ファイル操作（GIF サイズ確認・一時ファイル削除用）を読み込む
+// ファイル操作（GIF サイズ確認・録画一時ディレクトリの削除用）を読み込む
 import fs from "node:fs";
+// OS 情報（一時ディレクトリの場所）を読み込む
+import os from "node:os";
 // パス結合ユーティリティを読み込む
 import path from "node:path";
+// file:// URL をファイルパスへ変換するユーティリティを読み込む
+import { fileURLToPath } from "node:url";
 // Playwright の chromium ランチャーを読み込む（録画機能つきブラウザ操作）
 import { chromium } from "@playwright/test";
+
+// このスクリプト自身の場所からリポジトリルートを求める（どこから実行しても生成物の場所を固定する）
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 // ---- 定数（マジックナンバーを避けるため一元管理） ----
 // モック上流サーバーの待受ポート
@@ -40,8 +47,8 @@ const VIEWPORT = { width: 1280, height: 800 };
 const DELTA_INTERVAL_MS = 45;
 // GIF の上限サイズ（CLAUDE.md §15: 10MB 以下）
 const GIF_MAX_BYTES = 10 * 1024 * 1024;
-// 生成物の出力先
-const GIF_PATH = path.join("docs", "screenshots", "chat-demo.gif");
+// 生成物の出力先（README が参照するパスに固定。実行時のカレントディレクトリに依存させない）
+const GIF_PATH = path.join(REPO_ROOT, "docs", "screenshots", "chat-demo.gif");
 
 // デモで入力する質問文（ダミー。個人情報を含めない）
 const DEMO_QUESTION =
@@ -141,7 +148,9 @@ function startMockUpstream() {
   });
 
   // 指定ポートで待受を開始し、開始完了を Promise で返す
-  return new Promise((resolve) => {
+  // （ポート使用中などの listen 失敗は 'error' イベントで拒否し、未捕捉例外にしない）
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
     server.listen(MOCK_UPSTREAM_PORT, "127.0.0.1", () => resolve(server));
   });
 }
@@ -151,8 +160,24 @@ function startMockUpstream() {
  * @returns {Promise<import("node:child_process").ChildProcess>} 起動したプロセス
  */
 async function startAppServer() {
-  // next dev をデモ用の環境変数つきで起動する
-  const child = spawn("npx", ["next", "dev", "--port", String(APP_PORT)], {
+  // ポートが既に使われている場合は起動前に中断する。
+  // 「200 が返るか」だけのヘルスチェックだと、別プロセスのサーバー（実 API キー向きの
+  // 可能性がある）を自分のサーバーと誤認して録画してしまうため、fail-closed にする。
+  const portInUse = await fetch(APP_URL).then(
+    () => true,
+    () => false,
+  );
+  if (portInUse) {
+    throw new Error(
+      `ポート ${APP_PORT} が既に使用されています。既存の next dev 等を停止してから再実行してください。`,
+    );
+  }
+  // next 本体を node で直接起動する。npx 経由だとラッパープロセスに SIGTERM を送っても
+  // 実サーバーが孤児化して生き残るため、detached でプロセスグループを作り、
+  // 終了時はグループごとシグナルを送れるようにする。
+  const nextBin = path.join(REPO_ROOT, "node_modules", "next", "dist", "bin", "next");
+  const child = spawn(process.execPath, [nextBin, "dev", "--port", String(APP_PORT)], {
+    cwd: REPO_ROOT,
     env: {
       ...process.env,
       // ダミーの API キー（モック上流しか呼ばないので実キーは不要）
@@ -161,10 +186,23 @@ async function startAppServer() {
       ANTHROPIC_BASE_URL: `http://127.0.0.1:${MOCK_UPSTREAM_PORT}`,
     },
     stdio: ["ignore", "inherit", "inherit"],
+    // 自分のプロセスグループを作らせる（後始末でグループごと kill するため）
+    detached: true,
+  });
+  // 子プロセスが先に死んだらポーリングを打ち切るためのフラグ
+  let exited = false;
+  let exitCode = null;
+  child.once("exit", (code) => {
+    exited = true;
+    exitCode = code;
   });
   // サーバーが応答するまで最大 120 秒ポーリングする
   const deadline = Date.now() + 120_000;
   while (Date.now() < deadline) {
+    // 子プロセスが即死した場合は 2 分待たずに原因つきで失敗させる
+    if (exited) {
+      throw new Error(`next dev が起動前に終了しました (exit code: ${exitCode})。上のログを確認してください。`);
+    }
     try {
       // トップページの応答が返れば起動完了とみなす
       const res = await fetch(APP_URL);
@@ -176,8 +214,21 @@ async function startAppServer() {
     await sleep(1000);
   }
   // 起動しなかった場合は失敗させる（fail-closed）
-  child.kill("SIGTERM");
+  stopAppServer(child);
   throw new Error(`アプリが ${APP_URL} で起動しませんでした`);
+}
+
+/**
+ * アプリのプロセスグループ全体を終了させる（next dev 本体の孤児化を防ぐ）。
+ * @param {import("node:child_process").ChildProcess} child - startAppServer が返したプロセス
+ */
+function stopAppServer(child) {
+  try {
+    // 負の PID を指定するとプロセスグループ全体へシグナルが送られる
+    process.kill(-child.pid, "SIGTERM");
+  } catch {
+    // 既に終了している場合はそのままでよい（後始末なので失敗を無視してよい唯一の箇所）
+  }
 }
 
 /**
@@ -185,8 +236,8 @@ async function startAppServer() {
  * @returns {Promise<string>} 録画された webm ファイルのパス
  */
 async function recordDemoVideo() {
-  // 録画の一時出力ディレクトリを作る
-  const videoDir = fs.mkdtempSync(path.join("/tmp", "chat-demo-video-"));
+  // 録画の一時出力ディレクトリを OS の一時領域に作る（移植性のため /tmp 直書きを避ける）
+  const videoDir = fs.mkdtempSync(path.join(os.tmpdir(), "chat-demo-video-"));
   // Chromium を起動する（環境変数があれば実行ファイルを差し替える。playwright.config.ts と同じ）
   const browser = await chromium.launch(
     process.env.PLAYWRIGHT_CHROMIUM_PATH
@@ -262,15 +313,18 @@ function convertToGif(videoPath) {
 const mockServer = await startMockUpstream();
 log(`モック上流を起動しました (port ${MOCK_UPSTREAM_PORT})`);
 let appProcess = null;
+let videoPath = null;
 try {
   appProcess = await startAppServer();
   log(`アプリを起動しました (${APP_URL})`);
-  const videoPath = await recordDemoVideo();
+  videoPath = await recordDemoVideo();
   log(`録画が完了しました: ${videoPath}`);
   convertToGif(videoPath);
 } finally {
-  // アプリのプロセスを終了する
-  if (appProcess) appProcess.kill("SIGTERM");
+  // アプリのプロセスグループを終了する（ラッパーだけでなく next dev 本体も止める）
+  if (appProcess) stopAppServer(appProcess);
+  // 録画の一時ディレクトリ（数 MB の webm）を削除する
+  if (videoPath) fs.rmSync(path.dirname(videoPath), { recursive: true, force: true });
   // モック上流を閉じる
   mockServer.close();
 }
