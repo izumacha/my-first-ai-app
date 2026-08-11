@@ -20,6 +20,7 @@ npm run build        # 本番ビルド
 npm run lint         # ESLint
 npm run typecheck    # tsc --noEmit
 npm run test         # Vitest
+node scripts/capture-demo.mjs  # デモ GIF を再生成（上流 Claude API はスタブ。要 ffmpeg。docs/screenshots/chat-demo.gif を出力）
 ```
 
 ## 3. アーキテクチャ
@@ -60,10 +61,10 @@ npm run test         # Vitest
   2. `chat-category-selected.png` — カテゴリ選択後、入力欄に質問を入力した画面
   3. `chat-error-message.png` — エラー時の日本語メッセージ表示
   4. `chat-mobile.png` — モバイル幅での表示
+- デモ GIF（`docs/screenshots/chat-demo.gif`、「カテゴリ選択 → 質問入力 → ストリーミング回答」）は `scripts/capture-demo.mjs` で自動撮影する。上流 Claude API を模倣するローカルモックを立てて `ANTHROPIC_BASE_URL` で差し替えるため、実 API キー・課金呼び出しなしで再生成できる（実行コマンドは §2）。
 - **未対応（意図的に残している宿題。満たしたらこの節から削除する）**:
   - 公開デモ URL — 未公開。公開時は Anthropic 側の月次利用上限（spend limit）設定が前提条件。
-  - デモ GIF（「カテゴリ選択 → 質問入力 → ストリーミング回答」1 本・10MB 以下）— 未作成。回答のストリーミングを含む撮影は実 API キーでの課金呼び出しを伴うため、上流をスタブした撮影経路を用意してから着手する。
-  - 撮影の自動化スクリプト — 未作成。現状のスクショは手動撮影。作成したら実行コマンドを §2 に追記する。
+  - 静止画スクショ 4 枚の撮影自動化 — 現状は手動撮影（自動化済みなのはデモ GIF のみ）。自動化したら実行コマンドを §2 に追記する。
 
 ---
 
@@ -295,3 +296,13 @@ npm run test         # Vitest
 - 層構成: `controller/` → `service/` → `repository/`（Spring Data JPA）→ `domain/`（JPA エンティティ）。`dto/request/` と `dto/response/` を分離し内部エンティティを API 契約から切り離す。`GlobalExceptionHandler` がカスタム例外を HTTP ステータスへマップ。
 - 横断的関心事は `web/`（エラー応答の共通整形・ページング入力の無害化・リクエスト本文サイズ上限）・`security/`（IP ベースのレート制限フィルタ）・`validation/`（コードポイント単位の文字数検証・カテゴリ名の NFC 正規化）に分ける。
 - CI は `.github/workflows/ci.yml` の `build-test` ジョブ 1 本で `./mvnw -B verify`（Temurin JDK 21）を実行する。`repository/` 配下のテストは Testcontainers で PostgreSQL を起動するため Docker デーモンが必要。
+
+<!-- BEGIN:nextjs-agent-rules -->
+
+# This is NOT the Next.js you know
+
+This version has breaking changes — APIs, conventions, and file structure may all differ from your training data. Read the relevant guide in `node_modules/next/dist/docs/` (resolved from this file's directory; in monorepos the `next` package may not be visible from the repo root) before writing any code. Heed deprecation notices.
+
+This block is written and re-added by `next dev` — verify at `node_modules/next/dist/server/lib/generate-agent-files.js`. Removing it from a diff only re-creates the uncommitted change; committing it with your work keeps the tree clean.
+
+<!-- END:nextjs-agent-rules -->
