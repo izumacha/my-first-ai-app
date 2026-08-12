@@ -21,6 +21,8 @@
 
 // Node 標準の HTTP サーバー（モック上流用）を読み込む
 import http from "node:http";
+// TCP サーバー（ポートが空いているかの確認用）を読み込む
+import net from "node:net";
 // 子プロセス起動（next dev / ffmpeg 実行用）を読み込む
 import { spawn, spawnSync } from "node:child_process";
 // ファイル操作（GIF サイズ確認・録画一時ディレクトリの削除用）を読み込む
@@ -66,6 +68,11 @@ const APP_SHUTDOWN_GRACE_MS = 10_000;
 const ANSWER_SETTLE_MS = 6000;
 // 生成物の出力先（README が参照するパスに固定。実行時のカレントディレクトリに依存させない）
 const GIF_PATH = path.join(REPO_ROOT, "docs", "screenshots", "chat-demo.gif");
+// ffmpeg の書き出し先（同じディレクトリの一時ファイル）。完成・サイズ検査を通ってから
+// GIF_PATH へ名前を変える。コミット対象へ直接書くと、変換が途中で失敗したときに
+// 壊れた GIF が「変更あり」として残り、そのままコミットされてしまう。
+// 拡張子を .gif のままにしないと ffmpeg が出力フォーマットを判定できない点に注意。
+const GIF_TMP_PATH = path.join(path.dirname(GIF_PATH), ".chat-demo.tmp.gif");
 
 // デモで入力する質問文（ダミー。個人情報を含めない）
 const DEMO_QUESTION =
@@ -92,6 +99,11 @@ const DEMO_ANSWER = [
 // 回答が最後まで描画されたことを確認するための目印（DEMO_ANSWER 末尾の一節）。
 // これが画面に出ていれば、ストリーミングが途中で切れていないと判断できる。
 const ANSWER_TAIL_MARKER = "ぜひ試してみてください";
+
+// 撮影で選択するカテゴリのラベル（README の説明文と一致させること）
+const DEMO_CATEGORY_LABEL = "料理";
+// hydration（React がサーバー描画済み HTML に操作を結び付ける処理）の完了を待つ上限（ミリ秒）
+const HYDRATION_TIMEOUT_MS = 15_000;
 
 // アプリ画面の見出し。エラーバナーを探す範囲をアプリ自身の DOM に絞り込む目印に使う。
 // Playwright のロケータは shadow DOM も貫通して探すため、範囲を絞らないと
@@ -226,6 +238,26 @@ function startMockUpstream() {
 }
 
 /**
+ * 指定ポートが誰かに使われているかを調べる。
+ * HTTP で叩いて判定すると、応答しない／HTTP ではない居座りプロセスを「空き」と誤判定し、
+ * 起動待ちの上限時間まで無駄に待ったうえで的外れなエラーになる。実際に bind できるかで判定する。
+ * @param {number} port - 調べる待受ポート
+ * @returns {Promise<boolean>} 使用中なら true（bind できない場合も安全側に倒して true）
+ */
+function isPortInUse(port) {
+  return new Promise((resolve) => {
+    // 実際に bind を試すための使い捨てサーバーを作る
+    const probe = net.createServer();
+    // bind できなければ使用中とみなす（EACCES 等も「使えない」ので安全側に倒す）
+    probe.once("error", () => resolve(true));
+    // bind できたら空きなので、すぐ閉じて false を返す
+    probe.once("listening", () => probe.close(() => resolve(false)));
+    // ループバックに対して bind を試す（アプリの待受と同じ範囲で判定する）
+    probe.listen(port, "127.0.0.1");
+  });
+}
+
+/**
  * Next.js 開発サーバーをモック上流に向けて起動し、応答可能になるまで待つ。
  * @returns {Promise<import("node:child_process").ChildProcess>} 起動したプロセス
  */
@@ -233,15 +265,7 @@ async function startAppServer() {
   // ポートが既に使われている場合は起動前に中断する。
   // 「200 が返るか」だけのヘルスチェックだと、別プロセスのサーバー（実 API キー向きの
   // 可能性がある）を自分のサーバーと誤認して録画してしまうため、fail-closed にする。
-  const portInUse = await fetch(APP_URL).then(
-    async (res) => {
-      // 応答本文を破棄してソケットを解放する
-      await discardBody(res);
-      return true;
-    },
-    () => false,
-  );
-  if (portInUse) {
+  if (await isPortInUse(APP_PORT)) {
     throw new Error(
       `ポート ${APP_PORT} が既に使用されています。既存の next dev 等を停止してから再実行してください。`,
     );
@@ -327,6 +351,43 @@ async function stopAppServer(child) {
 }
 
 /**
+ * 要素の aria-pressed が "true" になるまで待つ（hydration 完了とクリック反映の確認）。
+ * @param {import("@playwright/test").Locator} locator - トグルボタンのロケータ
+ */
+async function waitForAriaPressed(locator) {
+  // 一定時間ポーリングし、押下状態になったら抜ける
+  const deadline = Date.now() + HYDRATION_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    // 現在の aria-pressed 属性を読む
+    if ((await locator.getAttribute("aria-pressed")) === "true") return;
+    // まだなら少し待って再確認する
+    await sleep(200);
+  }
+  // 期限内に押下状態にならなければ hydration 未完了とみなして失敗させる（fail-closed）
+  throw new Error(
+    "カテゴリチップの選択が反映されませんでした（hydration 未完了の可能性）。撮影を中止します。",
+  );
+}
+
+/**
+ * 入力欄の値が期待どおりになるまで待つ（React の state に反映されたことの確認）。
+ * @param {import("@playwright/test").Locator} locator - 入力欄のロケータ
+ * @param {string} expected - 期待する入力値
+ */
+async function waitForInputValue(locator, expected) {
+  // 一定時間ポーリングし、値が一致したら抜ける
+  const deadline = Date.now() + HYDRATION_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    // 現在の入力値を読む
+    if ((await locator.inputValue()) === expected) return;
+    // まだなら少し待って再確認する
+    await sleep(200);
+  }
+  // 反映されないまま進むと送信ボタンが disabled のままでクリックが失敗するため中止する
+  throw new Error("入力内容が反映されませんでした（hydration 未完了の可能性）。撮影を中止します。");
+}
+
+/**
  * Playwright で「カテゴリ選択 → 質問入力 → ストリーミング回答」を録画する。
  * @returns {Promise<string>} 録画された webm ファイルのパス
  */
@@ -347,13 +408,23 @@ async function recordDemoVideo() {
       // アプリのトップページへ移動する
       await page.goto(APP_URL);
       // 初期画面（カテゴリチップ）が見えるまで待ち、少し静止させる
-      await page.getByRole("button", { name: "料理" }).waitFor();
+      const cookingChip = page.getByRole("button", { name: DEMO_CATEGORY_LABEL });
+      await cookingChip.waitFor();
       await sleep(1200);
       // 「料理」カテゴリのチップをクリックする
-      await page.getByRole("button", { name: "料理" }).click();
+      await cookingChip.click();
+      // クリックが React に届いたことを aria-pressed で確認する。
+      // hydration 前のクリックはリスナーが未装着で黙って捨てられるため、待たずに進むと
+      // カテゴリ未選択（なんでも）のまま撮影が続き、README の説明と食い違う GIF ができる。
+      // e2e/home.spec.ts も同じ理由で hydration 完了を待ってから操作している。
+      await cookingChip.waitFor({ state: "visible" });
+      await waitForAriaPressed(cookingChip);
       await sleep(800);
       // 入力欄に質問をタイプする（タイピングの様子を見せるため 1 文字ずつ入力する）
-      await page.getByLabel("メッセージを入力").pressSequentially(DEMO_QUESTION, { delay: 35 });
+      const input = page.getByLabel("メッセージを入力");
+      await input.pressSequentially(DEMO_QUESTION, { delay: 35 });
+      // 入力が React の state に反映されたことを確認する（未反映だと送信ボタンが disabled のまま）
+      await waitForInputValue(input, DEMO_QUESTION);
       await sleep(500);
       // 送信ボタンをクリックする
       await page.getByRole("button", { name: "送信" }).click();
@@ -369,6 +440,13 @@ async function recordDemoVideo() {
       const appRoot = page
         .locator("body > div")
         .filter({ has: page.getByRole("heading", { name: APP_HEADING }) });
+      // 目印が見つからないと以降の検査が「0 件だから合格」と素通りしてしまうため、
+      // まず範囲そのものを確認する（レイアウト変更で検査が無効化されるのを防ぐ fail-closed）
+      if ((await appRoot.count()) !== 1) {
+        throw new Error(
+          "アプリのルート要素を特定できませんでした（レイアウト変更の可能性）。検査できないため撮影を中止します。",
+        );
+      }
       // アプリのエラーバナー（role="alert"）が出ていないことを確認する
       const errorBanner = appRoot.getByRole("alert");
       if ((await errorBanner.count()) > 0) {
@@ -376,13 +454,21 @@ async function recordDemoVideo() {
         const alertText = await errorBanner.first().innerText();
         throw new Error(`撮影中にエラーが表示されました: ${alertText}`);
       }
-      // 回答の末尾が描画されている＝ストリーミングが最後まで届いたことを確認する
-      const answerRendered = await page
-        .getByText(ANSWER_TAIL_MARKER)
-        .isVisible()
-        .catch(() => false);
-      if (!answerRendered) {
+      // 回答の末尾が描画されている＝ストリーミングが最後まで届いたことを確認する。
+      // count() は複数一致でも例外にならないので、「出ていない」と「複数一致」を区別できる
+      // （isVisible() の失敗をまとめて握り潰すと、目印の重複を配信切れと誤診断してしまう）
+      const answerMarker = page.getByText(ANSWER_TAIL_MARKER);
+      const markerCount = await answerMarker.count();
+      if (markerCount === 0) {
         throw new Error("デモ回答が最後まで表示されませんでした（ストリーミングが途中で切れた可能性）");
+      }
+      if (markerCount > 1) {
+        throw new Error(
+          `回答末尾の目印「${ANSWER_TAIL_MARKER}」が ${markerCount} 件一致しました。目印が一意になるよう DEMO_ANSWER を見直してください。`,
+        );
+      }
+      if (!(await answerMarker.isVisible())) {
+        throw new Error("デモ回答の末尾が画面に表示されていません（描画位置の確認が必要）");
       }
       return await finishRecording(page, context, videoDir);
     } catch (err) {
@@ -426,42 +512,50 @@ async function finishRecording(page, context, videoDir) {
 function convertToGif(videoPath) {
   // 出力先ディレクトリを保証する
   fs.mkdirSync(path.dirname(GIF_PATH), { recursive: true });
-  // ffmpeg のパレット生成 + 適用を 1 コマンドで行う（10fps・幅 1000px に縮小して 10MB 以下を狙う）
-  const result = spawnSync(
-    "ffmpeg",
-    [
-      "-y",
-      "-i",
-      videoPath,
-      "-vf",
-      "fps=10,scale=1000:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
-      GIF_PATH,
-    ],
-    { stdio: ["ignore", "ignore", "inherit"] },
-  );
-  // ffmpeg 自体を起動できなかった場合（未インストール等）は原因を添えて失敗させる。
-  // このとき status は null なので、下の status 判定だけだと理由が失われる（§6）
-  if (result.error) {
-    throw new Error(
-      `ffmpeg を起動できませんでした（インストールされていない可能性があります）: ${result.error.message}`,
-      { cause: result.error },
+  try {
+    // ffmpeg のパレット生成 + 適用を 1 コマンドで行う（10fps・幅 1000px に縮小して 10MB 以下を狙う）。
+    // 書き出し先は一時ファイルにし、検査を通ってから本来のパスへ差し替える
+    const result = spawnSync(
+      "ffmpeg",
+      [
+        "-y",
+        "-i",
+        videoPath,
+        "-vf",
+        "fps=10,scale=1000:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
+        GIF_TMP_PATH,
+      ],
+      { stdio: ["ignore", "ignore", "inherit"] },
     );
+    // ffmpeg 自体を起動できなかった場合（未インストール等）は原因を添えて失敗させる。
+    // このとき status は null なので、下の status 判定だけだと理由が失われる（§6）
+    if (result.error) {
+      throw new Error(
+        `ffmpeg を起動できませんでした（インストールされていない可能性があります）: ${result.error.message}`,
+        { cause: result.error },
+      );
+    }
+    // 変換失敗は即座にエラーにする
+    if (result.status !== 0) {
+      throw new Error(`ffmpeg による GIF 変換に失敗しました (exit code: ${result.status})`);
+    }
+    // 生成された GIF のサイズを確認する
+    const size = fs.statSync(GIF_TMP_PATH).size;
+    // 10MB を超えていたら基準違反なので差し替えずに失敗させる（CLAUDE.md §15 / fail-closed）。
+    // 警告だけにすると、基準外の GIF がそのままコミットできる状態で残ってしまう
+    if (size > GIF_MAX_BYTES) {
+      throw new Error(
+        `GIF が上限 ${GIF_MAX_BYTES / 1024 / 1024}MB を超えました (${(size / 1024 / 1024).toFixed(2)} MB)。fps や幅を下げて再生成してください。`,
+      );
+    }
+    // すべての検査を通ったのでコミット対象のパスへ差し替える（同一ディレクトリなので原子的に入れ替わる）
+    fs.renameSync(GIF_TMP_PATH, GIF_PATH);
+    log(`GIF を生成しました: ${GIF_PATH} (${(size / 1024 / 1024).toFixed(2)} MB)`);
+  } finally {
+    // 失敗して残った一時ファイルを片付ける（成功時は rename 済みなので何も残らない）。
+    // これにより、失敗しても既存のコミット済み GIF は一切損なわれない
+    fs.rmSync(GIF_TMP_PATH, { force: true });
   }
-  // 変換失敗は即座にエラーにする
-  if (result.status !== 0) {
-    throw new Error(`ffmpeg による GIF 変換に失敗しました (exit code: ${result.status})`);
-  }
-  // 生成された GIF のサイズを確認する
-  const size = fs.statSync(GIF_PATH).size;
-  // 10MB を超えていたら基準違反なので、生成物を残さず失敗させる（CLAUDE.md §15 / fail-closed）。
-  // 警告だけにすると、基準外の GIF がそのままコミットできる状態で残ってしまう
-  if (size > GIF_MAX_BYTES) {
-    fs.rmSync(GIF_PATH, { force: true });
-    throw new Error(
-      `GIF が上限 ${GIF_MAX_BYTES / 1024 / 1024}MB を超えました (${(size / 1024 / 1024).toFixed(2)} MB)。fps や幅を下げて再生成してください。`,
-    );
-  }
-  log(`GIF を生成しました: ${GIF_PATH} (${(size / 1024 / 1024).toFixed(2)} MB)`);
 }
 
 // ---- メイン処理 ----
@@ -470,6 +564,30 @@ const { server: mockServer, stats: mockStats } = await startMockUpstream();
 log(`モック上流を起動しました (port ${MOCK_UPSTREAM_PORT})`);
 let appProcess = null;
 let videoPath = null;
+
+// Ctrl-C などで中断されたときの後始末。detached で起動した next dev は自分の
+// プロセスグループにいるため Ctrl-C が届かず、ハンドラを置かないとポートを掴んだまま
+// 孤児として残り、次回の実行が「ポート使用中」で失敗し続ける。
+// シグナルハンドラ内では await できないので、確実に止まる SIGKILL を同期的に送る。
+const cleanUpOnSignal = (signal) => {
+  log(`${signal} を受け取りました。後始末して終了します。`);
+  if (appProcess) {
+    try {
+      // プロセスグループごと強制終了する（孤児化を防ぐ）
+      process.kill(-appProcess.pid, "SIGKILL");
+    } catch {
+      // 既に終了していれば何もしなくてよい
+    }
+  }
+  // モック上流の接続を切って閉じる
+  mockServer.closeAllConnections();
+  mockServer.close();
+  // 中断による終了であることを終了コードで示す（128 + シグナル番号の慣例）
+  process.exit(signal === "SIGINT" ? 130 : 143);
+};
+process.once("SIGINT", () => cleanUpOnSignal("SIGINT"));
+process.once("SIGTERM", () => cleanUpOnSignal("SIGTERM"));
+
 try {
   appProcess = await startAppServer();
   log(`アプリを起動しました (${APP_URL})`);
