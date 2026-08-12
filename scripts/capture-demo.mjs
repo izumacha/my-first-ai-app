@@ -83,7 +83,10 @@ const DEMO_QUESTION =
 // モックが返すデモ回答（スタブであることが撮影上わからないよう、実際の回答らしい文面にする）。
 // ChatMessage は本文を Markdown ではなくプレーンテキストとして描画する（whitespace-pre-wrap）ため、
 // `**強調**` を書くと GIF にアスタリスクがそのまま写ってしまう。見出しは記号で表現する。
-const DEMO_ANSWER = [
+// 絵文字は使わない。撮影に使うヘッドレス Chromium には絵文字フォントが無く、
+// 豆腐（□）や別記号のフォールバック字形で焼き込まれてしまううえ、
+// フォントの有無で生成物が変わり再現性が失われるため。
+const DEMO_ANSWER_LINES = [
   "卵とキャベツがあれば「とん平焼き風オムレツ」がおすすめです！",
   "",
   "【材料（1人分）】",
@@ -95,12 +98,16 @@ const DEMO_ANSWER = [
   "2. フライパンで溶き卵を半熟に焼き、キャベツをのせて包む",
   "3. ソースとマヨネーズをかけて完成！",
   "",
-  "キャベツの甘みと半熟卵がよく合いますよ。ごはんにもパンにも合うので、ぜひ試してみてください🍳",
-].join("\n");
+  "キャベツの甘みと半熟卵がよく合いますよ。ごはんにもパンにも合うので、ぜひ試してみてください。",
+];
 
-// 回答が最後まで描画されたことを確認するための目印（DEMO_ANSWER 末尾の一節）。
-// これが画面に出ていれば、ストリーミングが途中で切れていないと判断できる。
-const ANSWER_TAIL_MARKER = "ぜひ試してみてください";
+// モックが返すデモ回答（各行を改行でつなぐ）
+const DEMO_ANSWER = DEMO_ANSWER_LINES.join("\n");
+
+// 回答が最後まで描画されたことを確認するための目印。DEMO_ANSWER の最終行から導出する。
+// 文字列を手で書き写すと、回答を書き換えたときに目印だけ古いまま残り、
+// 正常な録画を「ストリーミングが途中で切れた」と誤診断してしまう
+const ANSWER_TAIL_MARKER = DEMO_ANSWER_LINES[DEMO_ANSWER_LINES.length - 1];
 
 // 撮影で選択するカテゴリのラベル（README の説明文と一致させること）
 const DEMO_CATEGORY_LABEL = "料理";
@@ -356,6 +363,8 @@ async function startAppServer() {
     exited = true;
     exitCode = code;
   });
+  // ヘルスチェックで最後に観測したエラー（タイムアウト時の原因説明に使う）
+  let lastHealthCheckError = null;
   // サーバーが応答するまで既定の上限時間までポーリングする
   const deadline = Date.now() + APP_STARTUP_TIMEOUT_MS;
   while (Date.now() < deadline) {
@@ -373,15 +382,21 @@ async function startAppServer() {
       // 応答本文を破棄してソケットを解放する（読み捨てないと接続が滞留する）
       await discardBody(res);
       if (res.ok) return child;
-    } catch {
-      // まだ起動していないだけなので握り潰さず次のループで再試行する
+    } catch (err) {
+      // 起動途中の接続拒否は想定内だが、名前解決やプロキシ設定の誤りなど
+      // 再試行しても直らない失敗もここに来る。原因を捨てるとタイムアウト時に
+      // 「アプリが起動しなかった」としか分からなくなるので、最後のエラーを控えておく
+      lastHealthCheckError = err;
     }
     // 1 秒待って再試行する
     await sleep(1000);
   }
-  // 起動しなかった場合は失敗させる（fail-closed）
+  // 起動しなかった場合は失敗させる（fail-closed）。最後に観測したエラーを添えて原因を追えるようにする
   await stopAppServer(child);
-  throw new Error(`アプリが ${APP_URL} で起動しませんでした`);
+  const reason = lastHealthCheckError ? `（最後のエラー: ${lastHealthCheckError.message}）` : "";
+  throw new Error(`アプリが ${APP_URL} で起動しませんでした${reason}`, {
+    cause: lastHealthCheckError ?? undefined,
+  });
 }
 
 /**
@@ -393,6 +408,10 @@ async function startAppServer() {
 async function stopAppServer(child) {
   // 既に終了しているなら何もしない（終了済みプロセスの exit を待つと永久に待つため）
   if (child.exitCode !== null || child.signalCode !== null) return;
+  // spawn 自体に失敗していると PID が無い。この場合 'exit' は永遠に来ないので、
+  // 待ちに入る前に抜ける（Windows の taskkill は失敗しても例外を投げないため、
+  // 下の catch では取りこぼしてハングしてしまう）
+  if (!child.pid) return;
   // 終了イベントを待つ Promise を、シグナル送出より先に用意する（取りこぼし防止）
   const exited = new Promise((resolve) => child.once("exit", resolve));
   try {
@@ -463,25 +482,22 @@ async function recordDemoVideo() {
   // 録画の一時出力ディレクトリを OS の一時領域に作る（移植性のため /tmp 直書きを避ける）。
   // 中断時にも消せるようモジュール変数へ入れる
   videoDir = fs.mkdtempSync(path.join(os.tmpdir(), "chat-demo-video-"));
-  // Chromium の起動やコンテキスト生成が失敗しても一時ディレクトリを残さないよう、
-  // 起動処理そのものも try で包む（失敗して例外が出ると空ディレクトリが毎回積み上がる）
-  let browser;
+  // 後始末は下の finally 1 か所に集約する。ブラウザ起動・コンテキスト生成・操作の
+  // どこで失敗しても、同じ経路でブラウザを閉じ一時ディレクトリを消せるようにするため
+  // （散らばらせると、後から片付け処理を足したときに漏れが出る）
+  let browser = null;
+  let context = null;
+  // 録画ファイルを確定できたかどうか（成功時は一時ディレクトリを呼び出し側で使うため消さない）
+  let succeeded = false;
   try {
     // Chromium を起動する（実行ファイルの差し替え判定は E2E 設定と共有のヘルパーに任せる）
     browser = await chromium.launch(chromiumLaunchOptions());
-  } catch (err) {
-    // 録画が始まっていないので一時ディレクトリを消してから中断する
-    fs.rmSync(videoDir, { recursive: true, force: true });
-    videoDir = null;
-    throw err;
-  }
-  try {
     // 録画つきのブラウザコンテキストを作る
-    const context = await browser.newContext({
+    context = await browser.newContext({
       viewport: VIEWPORT,
       recordVideo: { dir: videoDir, size: VIEWPORT },
     });
-    try {
+    {
       // 新しいページを開く
       const page = await context.newPage();
       // アプリのトップページへ移動する
@@ -554,32 +570,33 @@ async function recordDemoVideo() {
       // 「表示されている」だけでなく、実際に録画範囲（ビューポート）へ収まっているかを見る。
       // 回答はスクロールする領域の中にあるため、isVisible() は画面外へスクロールしていても
       // true を返す。それだと途中までしか写っていない GIF を成功として通してしまう
+      // 判定するのは「末尾の下端が画面内に収まっているか」だけにする。
+      // getByText は回答全体を含む 1 つの <p> に解決されるため、上端まで条件に入れると、
+      // 回答が長くなって上へスクロールしただけの正常な録画まで失敗扱いになってしまう
       const markerBox = await answerMarker.boundingBox();
-      const markerInViewport =
-        markerBox !== null && markerBox.y >= 0 && markerBox.y + markerBox.height <= VIEWPORT.height;
+      const markerBottom = markerBox === null ? null : markerBox.y + markerBox.height;
+      const markerInViewport = markerBottom !== null && markerBottom > 0 && markerBottom <= VIEWPORT.height;
       if (!markerInViewport) {
         throw new Error(
           "デモ回答の末尾が録画範囲に収まっていません（スクロール位置の確認が必要）。撮影を中止します。",
         );
       }
-      return await finishRecording(page, context, videoDir);
-    } catch (err) {
-      // 失敗時もコンテキストを閉じ、途中までの録画一時ディレクトリを残さない
-      await context.close().catch(() => {});
-      fs.rmSync(videoDir, { recursive: true, force: true });
-      videoDir = null;
-      throw err;
+      // 録画を確定させてパスを受け取る
+      const recordedPath = await finishRecording(page, context);
+      // ここまで来たら成果物が手に入っているので、一時ディレクトリは呼び出し側の後始末に任せる
+      succeeded = true;
+      return recordedPath;
     }
-  } catch (err) {
-    // newContext などコンテキスト生成側で失敗した場合も一時ディレクトリを残さない
-    if (videoDir) {
-      fs.rmSync(videoDir, { recursive: true, force: true });
-      videoDir = null;
-    }
-    throw err;
   } finally {
+    // コンテキストを閉じる（成功時は finishRecording が既に閉じているが、二重呼び出しは無害）
+    if (context) await context.close().catch(() => {});
     // 例外の有無にかかわらずブラウザを必ず閉じる（開いたままだとプロセスが終了しない）
-    await browser.close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
+    // 失敗した場合だけ、途中までの録画が入った一時ディレクトリをここで消す
+    if (!succeeded && videoDir) {
+      fs.rmSync(videoDir, { recursive: true, force: true });
+      videoDir = null;
+    }
   }
 }
 
@@ -587,10 +604,9 @@ async function recordDemoVideo() {
  * 録画を確定させ、生成された webm ファイルのパスを返す。
  * @param {import("@playwright/test").Page} page - 録画対象のページ
  * @param {import("@playwright/test").BrowserContext} context - 録画中のコンテキスト
- * @param {string} videoDir - 録画の出力先ディレクトリ
  * @returns {Promise<string>} 録画された webm ファイルのパス
  */
-async function finishRecording(page, context, videoDir) {
+async function finishRecording(page, context) {
   // 録画中の動画ハンドルを、ページを閉じる前に取得しておく
   const video = page.video();
   // ページを先に閉じて録画を停止させる（コンテキストごと閉じるより末尾が落ちにくい）
