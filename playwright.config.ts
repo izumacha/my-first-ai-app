@@ -1,4 +1,6 @@
 import { defineConfig, devices } from "@playwright/test";
+// ブラウザ起動オプションの組み立ては撮影スクリプトと共有する（重複定義を避けるため）
+import { chromiumLaunchOptions } from "./scripts/lib/chromium-launch-options.mjs";
 
 export default defineConfig({
   testDir: "e2e",
@@ -7,13 +9,8 @@ export default defineConfig({
   use: {
     baseURL: "http://127.0.0.1:3000",
     trace: "on-first-retry",
-    // ブラウザ本体のパスを環境変数で上書きできるようにする。
-    // `npx playwright install` を実行できない環境（システム同梱の Chromium を使う
-    // サンドボックス等）でも E2E を実行できるようにするための逃げ道で、
-    // 未設定時（CI・通常のローカル）は Playwright 既定のブラウザ解決に従う
-    launchOptions: process.env.PLAYWRIGHT_CHROMIUM_PATH
-      ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_PATH }
-      : {},
+    // ブラウザ本体のパスを環境変数で上書きできるようにする逃げ道（判定の実体は共有ヘルパー側）
+    launchOptions: chromiumLaunchOptions(),
   },
   webServer: {
     // standalone サーバーは静的アセットの同梱が必要なので .next/static をコピーしてから起動する。

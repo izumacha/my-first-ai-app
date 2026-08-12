@@ -20,6 +20,7 @@ npm run build        # 本番ビルド
 npm run lint         # ESLint
 npm run typecheck    # tsc --noEmit
 npm run test         # Vitest
+node scripts/capture-demo.mjs  # デモ GIF を再生成（上流 Claude API はスタブ。要 ffmpeg。docs/screenshots/chat-demo.gif を出力）
 ```
 
 ## 3. アーキテクチャ
@@ -60,10 +61,10 @@ npm run test         # Vitest
   2. `chat-category-selected.png` — カテゴリ選択後、入力欄に質問を入力した画面
   3. `chat-error-message.png` — エラー時の日本語メッセージ表示
   4. `chat-mobile.png` — モバイル幅での表示
+- デモ GIF（`docs/screenshots/chat-demo.gif`、「カテゴリ選択 → 質問入力 → ストリーミング回答」）は `scripts/capture-demo.mjs` で自動撮影する。上流 Claude API を模倣するローカルモックを立てて `ANTHROPIC_BASE_URL` で差し替えるため、実 API キー・課金呼び出しなしで再生成できる（実行コマンドは §2）。
 - **未対応（意図的に残している宿題。満たしたらこの節から削除する）**:
   - 公開デモ URL — 未公開。公開時は Anthropic 側の月次利用上限（spend limit）設定が前提条件。
-  - デモ GIF（「カテゴリ選択 → 質問入力 → ストリーミング回答」1 本・10MB 以下）— 未作成。回答のストリーミングを含む撮影は実 API キーでの課金呼び出しを伴うため、上流をスタブした撮影経路を用意してから着手する。
-  - 撮影の自動化スクリプト — 未作成。現状のスクショは手動撮影。作成したら実行コマンドを §2 に追記する。
+  - 静止画スクショ 4 枚の撮影自動化 — 現状は手動撮影（自動化済みなのはデモ GIF のみ）。自動化したら実行コマンドを §2 に追記する。
 
 ---
 
