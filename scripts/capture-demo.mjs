@@ -42,8 +42,10 @@ import { chromiumLaunchOptions } from "./lib/chromium-launch-options.mjs";
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 // ---- 定数（マジックナンバーを避けるため一元管理） ----
-// モック上流サーバーの待受ポート
-const MOCK_UPSTREAM_PORT = 43111;
+// モック上流サーバーの待受ポート。0 を渡すと OS が空きポートを割り当てるため、
+// 固定番号が他プロセス（Linux の ephemeral port 範囲と重なる）に使われていて
+// 起動できない、という事故を避けられる。実際の番号は listen 後に読み取る
+const MOCK_UPSTREAM_PORT = 0;
 // デモ用に起動する Next.js 開発サーバーのポート（通常の dev と衝突しないよう別番号）
 const APP_PORT = 3100;
 // アプリの URL（Next.js dev サーバーは 127.0.0.1 だと cross-origin 扱いで
@@ -110,6 +112,13 @@ const HYDRATION_TIMEOUT_MS = 15_000;
 // next dev が挿入する開発用オーバーレイ（<nextjs-portal> 内）の role="alert" まで
 // 拾ってしまい、アプリはエラーを出していないのに撮影が失敗する。
 const APP_HEADING = "AI 暮らしアシスタント";
+
+// モック上流が実際に待ち受けているポート（listen 後に OS の割り当てを記録する）
+let mockUpstreamPort = null;
+// 起動中／起動済みの next dev プロセス（シグナルハンドラからも参照するため先に宣言する）
+let appProcess = null;
+// 録画の一時ディレクトリ（中断時にも消せるようここで保持する）
+let videoDir = null;
 
 // ログは stderr へ出す（生成物のパスなど結果は stdout と区別する）
 const log = (msg) => process.stderr.write(`[capture-demo] ${msg}\n`);
@@ -227,6 +236,8 @@ function startMockUpstream() {
     const onListenError = (err) => reject(err);
     server.once("error", onListenError);
     server.listen(MOCK_UPSTREAM_PORT, "127.0.0.1", () => {
+      // OS が実際に割り当てたポート番号を控える（アプリへ渡す接続先に使う）
+      mockUpstreamPort = server.address().port;
       // listen 成功後はこのハンドラを外す。付けたままだと解決済み Promise に対する
       // reject になり、以降のサーバーエラーが何の痕跡も残さず消えてしまう（§6）
       server.off("error", onListenError);
@@ -280,13 +291,17 @@ async function startAppServer() {
       ...process.env,
       // ダミーの API キー（モック上流しか呼ばないので実キーは不要）
       ANTHROPIC_API_KEY: "demo-dummy-key",
-      // Anthropic SDK の接続先をローカルのモックへ差し替える
-      ANTHROPIC_BASE_URL: `http://127.0.0.1:${MOCK_UPSTREAM_PORT}`,
+      // Anthropic SDK の接続先をローカルのモックへ差し替える（実際に割り当てられたポート）
+      ANTHROPIC_BASE_URL: `http://127.0.0.1:${mockUpstreamPort}`,
     },
     stdio: ["ignore", "inherit", "inherit"],
     // 自分のプロセスグループを作らせる（後始末でグループごと kill するため）
     detached: true,
   });
+  // 起動待ちの間に Ctrl-C されても確実に kill できるよう、spawn 直後に控える。
+  // 戻り値の代入（appProcess = await startAppServer()）を待つと、最大 120 秒の
+  // 起動待ちの間だけシグナルハンドラが子プロセスを知らず、孤児化してポートを掴み続ける
+  appProcess = child;
   // 子プロセスが先に死んだらポーリングを打ち切るためのフラグ
   let exited = false;
   let exitCode = null;
@@ -354,14 +369,16 @@ async function stopAppServer(child) {
  * 要素の aria-pressed が "true" になるまで待つ（hydration 完了とクリック反映の確認）。
  * @param {import("@playwright/test").Locator} locator - トグルボタンのロケータ
  */
-async function waitForAriaPressed(locator) {
-  // 一定時間ポーリングし、押下状態になったら抜ける
+async function clickUntilPressed(locator) {
+  // 一定時間、クリックと確認を繰り返す
   const deadline = Date.now() + HYDRATION_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    // 現在の aria-pressed 属性を読む
+    // クリックする。hydration 前ならリスナーが無く黙って捨てられるので、後で再試行する
+    await locator.click();
+    // 反映を少し待ってから押下状態を確認する
+    await sleep(300);
+    // aria-pressed が true になっていれば React に届いた証拠なので抜ける
     if ((await locator.getAttribute("aria-pressed")) === "true") return;
-    // まだなら少し待って再確認する
-    await sleep(200);
   }
   // 期限内に押下状態にならなければ hydration 未完了とみなして失敗させる（fail-closed）
   throw new Error(
@@ -370,21 +387,21 @@ async function waitForAriaPressed(locator) {
 }
 
 /**
- * 入力欄の値が期待どおりになるまで待つ（React の state に反映されたことの確認）。
- * @param {import("@playwright/test").Locator} locator - 入力欄のロケータ
- * @param {string} expected - 期待する入力値
+ * 要素が操作可能（enabled）になるまで待つ。
+ * @param {import("@playwright/test").Locator} locator - 対象のロケータ
+ * @param {string} description - 失敗時のメッセージに載せる対象の説明
  */
-async function waitForInputValue(locator, expected) {
-  // 一定時間ポーリングし、値が一致したら抜ける
+async function waitForEnabled(locator, description) {
+  // 一定時間ポーリングし、操作可能になったら抜ける
   const deadline = Date.now() + HYDRATION_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    // 現在の入力値を読む
-    if ((await locator.inputValue()) === expected) return;
+    // 現在の操作可否を確認する
+    if (await locator.isEnabled()) return;
     // まだなら少し待って再確認する
     await sleep(200);
   }
-  // 反映されないまま進むと送信ボタンが disabled のままでクリックが失敗するため中止する
-  throw new Error("入力内容が反映されませんでした（hydration 未完了の可能性）。撮影を中止します。");
+  // 操作可能にならないまま進むとクリックが 30 秒タイムアウトして原因が分かりにくいので中止する
+  throw new Error(`${description}が操作可能になりませんでした。撮影を中止します。`);
 }
 
 /**
@@ -392,10 +409,21 @@ async function waitForInputValue(locator, expected) {
  * @returns {Promise<string>} 録画された webm ファイルのパス
  */
 async function recordDemoVideo() {
-  // 録画の一時出力ディレクトリを OS の一時領域に作る（移植性のため /tmp 直書きを避ける）
-  const videoDir = fs.mkdtempSync(path.join(os.tmpdir(), "chat-demo-video-"));
-  // Chromium を起動する（実行ファイルの差し替え判定は E2E 設定と共有のヘルパーに任せる）
-  const browser = await chromium.launch(chromiumLaunchOptions());
+  // 録画の一時出力ディレクトリを OS の一時領域に作る（移植性のため /tmp 直書きを避ける）。
+  // 中断時にも消せるようモジュール変数へ入れる
+  videoDir = fs.mkdtempSync(path.join(os.tmpdir(), "chat-demo-video-"));
+  // Chromium の起動やコンテキスト生成が失敗しても一時ディレクトリを残さないよう、
+  // 起動処理そのものも try で包む（失敗して例外が出ると空ディレクトリが毎回積み上がる）
+  let browser;
+  try {
+    // Chromium を起動する（実行ファイルの差し替え判定は E2E 設定と共有のヘルパーに任せる）
+    browser = await chromium.launch(chromiumLaunchOptions());
+  } catch (err) {
+    // 録画が始まっていないので一時ディレクトリを消してから中断する
+    fs.rmSync(videoDir, { recursive: true, force: true });
+    videoDir = null;
+    throw err;
+  }
   try {
     // 録画つきのブラウザコンテキストを作る
     const context = await browser.newContext({
@@ -405,29 +433,35 @@ async function recordDemoVideo() {
     try {
       // 新しいページを開く
       const page = await context.newPage();
+      // next dev が挿入する開発ツールのバッジ（画面左下の丸い「N」）を隠す。
+      // 撮影は dev サーバーに対して行うため、そのままだと README の代表画像に
+      // 開発時にしか出ない UI が焼き込まれてしまう
+      await page.addStyleTag({ content: "nextjs-portal { display: none !important; }" });
       // アプリのトップページへ移動する
       await page.goto(APP_URL);
+      // goto でページが再読み込みされると上の style は失われるため、遷移後に入れ直す
+      await page.addStyleTag({ content: "nextjs-portal { display: none !important; }" });
       // 初期画面（カテゴリチップ）が見えるまで待ち、少し静止させる
       const cookingChip = page.getByRole("button", { name: DEMO_CATEGORY_LABEL });
       await cookingChip.waitFor();
       await sleep(1200);
-      // 「料理」カテゴリのチップをクリックする
-      await cookingChip.click();
-      // クリックが React に届いたことを aria-pressed で確認する。
-      // hydration 前のクリックはリスナーが未装着で黙って捨てられるため、待たずに進むと
+      // 「料理」カテゴリのチップを、選択が React に届くまで再試行しながらクリックする。
+      // hydration 前のクリックはリスナーが未装着で黙って捨てられるため、1 回で諦めると
       // カテゴリ未選択（なんでも）のまま撮影が続き、README の説明と食い違う GIF ができる。
-      // e2e/home.spec.ts も同じ理由で hydration 完了を待ってから操作している。
-      await cookingChip.waitFor({ state: "visible" });
-      await waitForAriaPressed(cookingChip);
+      // ここを通過した時点で hydration は完了しているので、以降の入力は React に届く
+      await clickUntilPressed(cookingChip);
       await sleep(800);
       // 入力欄に質問をタイプする（タイピングの様子を見せるため 1 文字ずつ入力する）
       const input = page.getByLabel("メッセージを入力");
       await input.pressSequentially(DEMO_QUESTION, { delay: 35 });
-      // 入力が React の state に反映されたことを確認する（未反映だと送信ボタンが disabled のまま）
-      await waitForInputValue(input, DEMO_QUESTION);
+      // 送信ボタンは disabled={isLoading || !input.trim()} なので、有効化されたことが
+      // 「入力が React の state に入った」唯一の確かな証拠になる（DOM の value は
+      // hydration 前のタイプでも埋まってしまい、判定に使えない）
+      const sendButton = page.getByRole("button", { name: "送信" });
+      await waitForEnabled(sendButton, "送信ボタン");
       await sleep(500);
       // 送信ボタンをクリックする
-      await page.getByRole("button", { name: "送信" }).click();
+      await sendButton.click();
       // ストリーミング回答が完了するまで待つ（送信ボタンが「送信中...」から戻るのを待つ）
       await page.getByRole("button", { name: "送信", exact: true }).waitFor({ timeout: 60_000 });
       // 回答全文を読める静止時間をとる（録画末尾の切り落とし分の余白も兼ねる）
@@ -475,8 +509,16 @@ async function recordDemoVideo() {
       // 失敗時もコンテキストを閉じ、途中までの録画一時ディレクトリを残さない
       await context.close().catch(() => {});
       fs.rmSync(videoDir, { recursive: true, force: true });
+      videoDir = null;
       throw err;
     }
+  } catch (err) {
+    // newContext などコンテキスト生成側で失敗した場合も一時ディレクトリを残さない
+    if (videoDir) {
+      fs.rmSync(videoDir, { recursive: true, force: true });
+      videoDir = null;
+    }
+    throw err;
   } finally {
     // 例外の有無にかかわらずブラウザを必ず閉じる（開いたままだとプロセスが終了しない）
     await browser.close().catch(() => {});
@@ -561,14 +603,14 @@ function convertToGif(videoPath) {
 // ---- メイン処理 ----
 // モック上流 → アプリ → 録画 → GIF 変換の順に実行し、後始末を必ず行う
 const { server: mockServer, stats: mockStats } = await startMockUpstream();
-log(`モック上流を起動しました (port ${MOCK_UPSTREAM_PORT})`);
-let appProcess = null;
+log(`モック上流を起動しました (port ${mockUpstreamPort})`);
 let videoPath = null;
 
 // Ctrl-C などで中断されたときの後始末。detached で起動した next dev は自分の
 // プロセスグループにいるため Ctrl-C が届かず、ハンドラを置かないとポートを掴んだまま
 // 孤児として残り、次回の実行が「ポート使用中」で失敗し続ける。
 // シグナルハンドラ内では await できないので、確実に止まる SIGKILL を同期的に送る。
+// process.exit() は下の finally を実行しないため、一時ファイルもここで消す。
 const cleanUpOnSignal = (signal) => {
   log(`${signal} を受け取りました。後始末して終了します。`);
   if (appProcess) {
@@ -579,6 +621,10 @@ const cleanUpOnSignal = (signal) => {
       // 既に終了していれば何もしなくてよい
     }
   }
+  // 録画の一時ディレクトリ（数 MB の webm）を消す
+  if (videoDir) fs.rmSync(videoDir, { recursive: true, force: true });
+  // 変換途中の一時 GIF を消す（コミット対象のディレクトリに置くため放置しない）
+  fs.rmSync(GIF_TMP_PATH, { force: true });
   // モック上流の接続を切って閉じる
   mockServer.closeAllConnections();
   mockServer.close();
@@ -589,7 +635,8 @@ process.once("SIGINT", () => cleanUpOnSignal("SIGINT"));
 process.once("SIGTERM", () => cleanUpOnSignal("SIGTERM"));
 
 try {
-  appProcess = await startAppServer();
+  // appProcess は startAppServer が spawn 直後に自分で設定する（起動待ち中の中断に備えるため）
+  await startAppServer();
   log(`アプリを起動しました (${APP_URL})`);
   videoPath = await recordDemoVideo();
   log(`録画が完了しました: ${videoPath}`);
@@ -608,7 +655,7 @@ try {
   // アプリのプロセスグループを終了し、実際に終わるまで待つ
   if (appProcess) await stopAppServer(appProcess);
   // 録画の一時ディレクトリ（数 MB の webm）を削除する
-  if (videoPath) fs.rmSync(path.dirname(videoPath), { recursive: true, force: true });
+  if (videoDir) fs.rmSync(videoDir, { recursive: true, force: true });
   // 残っている keep-alive 接続を切ってから閉じる（close() だけだと接続が残る限り完了しない）
   mockServer.closeAllConnections();
   mockServer.close();

@@ -7,8 +7,9 @@
  * 同じ判定を 2 か所に書き写すと、変数名の変更時に片方だけ直し忘れて壊れるため。
  */
 
-// ブラウザ本体のパスを上書きする環境変数の名前（この 1 か所だけが正）
-export const CHROMIUM_PATH_ENV = "PLAYWRIGHT_CHROMIUM_PATH";
+// ブラウザ本体のパスを上書きする環境変数の名前（この 1 か所だけが正）。
+// 外部からは chromiumLaunchOptions() 経由でのみ使うのでモジュール内に閉じる
+const CHROMIUM_PATH_ENV = "PLAYWRIGHT_CHROMIUM_PATH";
 
 /**
  * Chromium の起動オプションを返す。
