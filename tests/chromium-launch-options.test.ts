@@ -5,16 +5,29 @@
  * 両方でブラウザ解決を決めるため、戻り値の形が崩れても型チェックでは気づけない。
  * 「未設定なら Playwright 既定に任せる（空オブジェクト）」という契約を機械的に守る。
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 // 検証対象のヘルパーを読み込む
 import { chromiumLaunchOptions } from "../scripts/lib/chromium-launch-options.mjs";
 
 // テストで書き換える環境変数の名前
 const ENV_NAME = "PLAYWRIGHT_CHROMIUM_PATH";
 
-// 各テストの後に環境変数を消して、他のテストへ影響させない
+// 実行前の値を控える箱（process.env はワーカー内の全テストで共有される状態なので、
+// このテストが勝手に消したままにすると他のテストの前提を壊しかねない）
+let originalValue: string | undefined;
+
+// 各テストの前に元の値を控える
+beforeEach(() => {
+  originalValue = process.env[ENV_NAME];
+});
+
+// 各テストの後に元の状態へ戻す（元が未設定なら削除、設定済みならその値に復元する）
 afterEach(() => {
-  delete process.env[ENV_NAME];
+  if (originalValue === undefined) {
+    delete process.env[ENV_NAME];
+  } else {
+    process.env[ENV_NAME] = originalValue;
+  }
 });
 
 describe("chromiumLaunchOptions", () => {

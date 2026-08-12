@@ -126,6 +126,27 @@ const log = (msg) => process.stderr.write(`[capture-demo] ${msg}\n`);
 // 指定ミリ秒待つユーティリティ
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// Windows かどうか（プロセスの止め方が POSIX と異なるため、この 1 か所で判定して分岐を閉じ込める）
+const IS_WINDOWS = process.platform === "win32";
+
+/**
+ * 子プロセスを、それが起動した孫プロセスもろとも終了させる。
+ * next dev はビルドワーカーを子に持つため、親だけ殺すと孫がポートを掴んだまま残る。
+ * 止め方が OS で異なるので、プラットフォーム差はここだけに閉じ込める（CLAUDE.md §10）。
+ * @param {import("node:child_process").ChildProcess} child - 終了させる子プロセス
+ * @param {NodeJS.Signals} signal - POSIX で送るシグナル（Windows では無視される）
+ */
+function killProcessTree(child, signal) {
+  // Windows にはプロセスグループへのシグナル送出が無いため、taskkill でツリーごと終了させる
+  if (IS_WINDOWS) {
+    // /T は子孫まで、/F は強制終了を意味する
+    spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+    return;
+  }
+  // POSIX では負の PID でプロセスグループ全体へシグナルを送る
+  process.kill(-child.pid, signal);
+}
+
 /**
  * fetch のレスポンス本文を破棄して接続をコネクションプールへ返す。
  * 本文を読まずに放置すると undici がソケットを掴んだままになるため（§8 リソース解放）。
@@ -255,16 +276,35 @@ function startMockUpstream() {
  * @param {number} port - 調べる待受ポート
  * @returns {Promise<boolean>} 使用中なら true（bind できない場合も安全側に倒して true）
  */
-function isPortInUse(port) {
+async function isPortInUse(port) {
+  // IPv4 ループバックを調べる
+  if (await probePort(port, "127.0.0.1")) return true;
+  // IPv6 ループバックも調べる。APP_URL は localhost なので、環境によっては ::1 側へ
+  // 解決される。IPv4 だけ見ていると、::1 だけを掴んでいる別サーバーを「空き」と誤判定し、
+  // 起動した自分のサーバーではなくそちらを録画してしまう
+  return await probePort(port, "::1");
+}
+
+/**
+ * 指定のホスト・ポートに bind できるかを試す。
+ * @param {number} port - 調べる待受ポート
+ * @param {string} host - 調べる待受アドレス
+ * @returns {Promise<boolean>} 既に使われていれば true
+ */
+function probePort(port, host) {
   return new Promise((resolve) => {
     // 実際に bind を試すための使い捨てサーバーを作る
     const probe = net.createServer();
-    // bind できなければ使用中とみなす（EACCES 等も「使えない」ので安全側に倒す）
-    probe.once("error", () => resolve(true));
+    probe.once("error", (err) => {
+      // 使用中・権限不足は「使えない」ので使用中として扱う（安全側）。
+      // IPv6 が無効な環境では ::1 が EAFNOSUPPORT / EADDRNOTAVAIL になるが、
+      // これは「誰も使っていない」ので false を返す（誤検知で起動を止めない）
+      resolve(err.code === "EADDRINUSE" || err.code === "EACCES");
+    });
     // bind できたら空きなので、すぐ閉じて false を返す
     probe.once("listening", () => probe.close(() => resolve(false)));
-    // ループバックに対して bind を試す（アプリの待受と同じ範囲で判定する）
-    probe.listen(port, "127.0.0.1");
+    // 対象のアドレスへ bind を試す
+    probe.listen(port, host);
   });
 }
 
@@ -295,8 +335,15 @@ async function startAppServer() {
       ANTHROPIC_BASE_URL: `http://127.0.0.1:${mockUpstreamPort}`,
     },
     stdio: ["ignore", "inherit", "inherit"],
-    // 自分のプロセスグループを作らせる（後始末でグループごと kill するため）
-    detached: true,
+    // POSIX では自分のプロセスグループを作らせる（後始末でグループごと kill するため）。
+    // Windows には同等の概念が無く、detached はコンソール分離の意味になってしまうので付けない
+    detached: !IS_WINDOWS,
+  });
+  // spawn の失敗は例外ではなく 'error' イベントで通知される。listener が無いと
+  // 未捕捉例外になり、後始末（finally）を飛ばして一時ファイルとサーバーが残る
+  let spawnError = null;
+  child.once("error", (err) => {
+    spawnError = err;
   });
   // 起動待ちの間に Ctrl-C されても確実に kill できるよう、spawn 直後に控える。
   // 戻り値の代入（appProcess = await startAppServer()）を待つと、最大 120 秒の
@@ -312,6 +359,10 @@ async function startAppServer() {
   // サーバーが応答するまで既定の上限時間までポーリングする
   const deadline = Date.now() + APP_STARTUP_TIMEOUT_MS;
   while (Date.now() < deadline) {
+    // spawn 自体に失敗した場合（実行ファイルが無い・プロセス数上限など）は原因を添えて失敗させる
+    if (spawnError) {
+      throw new Error(`next dev を起動できませんでした: ${spawnError.message}`, { cause: spawnError });
+    }
     // 子プロセスが即死した場合は上限まで待たずに原因つきで失敗させる
     if (exited) {
       throw new Error(`next dev が起動前に終了しました (exit code: ${exitCode})。上のログを確認してください。`);
@@ -345,8 +396,8 @@ async function stopAppServer(child) {
   // 終了イベントを待つ Promise を、シグナル送出より先に用意する（取りこぼし防止）
   const exited = new Promise((resolve) => child.once("exit", resolve));
   try {
-    // 負の PID を指定するとプロセスグループ全体へシグナルが送られる
-    process.kill(-child.pid, "SIGTERM");
+    // プロセスツリー全体を終了させる（OS 差は killProcessTree 内に閉じ込めてある）
+    killProcessTree(child, "SIGTERM");
   } catch {
     // 既に終了している場合はそのままでよい（後始末なので失敗を無視してよい唯一の箇所）
     return;
@@ -354,7 +405,7 @@ async function stopAppServer(child) {
   // SIGTERM を無視して居座る場合に備え、猶予後に強制終了する保険をかける
   const killTimer = setTimeout(() => {
     try {
-      process.kill(-child.pid, "SIGKILL");
+      killProcessTree(child, "SIGKILL");
     } catch {
       // 強制終了の時点で既に消えていれば何もしなくてよい
     }
@@ -433,13 +484,12 @@ async function recordDemoVideo() {
     try {
       // 新しいページを開く
       const page = await context.newPage();
-      // next dev が挿入する開発ツールのバッジ（画面左下の丸い「N」）を隠す。
-      // 撮影は dev サーバーに対して行うため、そのままだと README の代表画像に
-      // 開発時にしか出ない UI が焼き込まれてしまう
-      await page.addStyleTag({ content: "nextjs-portal { display: none !important; }" });
       // アプリのトップページへ移動する
       await page.goto(APP_URL);
-      // goto でページが再読み込みされると上の style は失われるため、遷移後に入れ直す
+      // next dev が挿入する開発ツールのバッジ（画面左下の丸い「N」）を隠す。
+      // 撮影は dev サーバーに対して行うため、そのままだと README の代表画像に
+      // 開発時にしか出ない UI が焼き込まれてしまう。
+      // style は文書に紐づくので、goto で読み込んだ後に入れる必要がある
       await page.addStyleTag({ content: "nextjs-portal { display: none !important; }" });
       // 初期画面（カテゴリチップ）が見えるまで待ち、少し静止させる
       const cookingChip = page.getByRole("button", { name: DEMO_CATEGORY_LABEL });
@@ -501,8 +551,16 @@ async function recordDemoVideo() {
           `回答末尾の目印「${ANSWER_TAIL_MARKER}」が ${markerCount} 件一致しました。目印が一意になるよう DEMO_ANSWER を見直してください。`,
         );
       }
-      if (!(await answerMarker.isVisible())) {
-        throw new Error("デモ回答の末尾が画面に表示されていません（描画位置の確認が必要）");
+      // 「表示されている」だけでなく、実際に録画範囲（ビューポート）へ収まっているかを見る。
+      // 回答はスクロールする領域の中にあるため、isVisible() は画面外へスクロールしていても
+      // true を返す。それだと途中までしか写っていない GIF を成功として通してしまう
+      const markerBox = await answerMarker.boundingBox();
+      const markerInViewport =
+        markerBox !== null && markerBox.y >= 0 && markerBox.y + markerBox.height <= VIEWPORT.height;
+      if (!markerInViewport) {
+        throw new Error(
+          "デモ回答の末尾が録画範囲に収まっていません（スクロール位置の確認が必要）。撮影を中止します。",
+        );
       }
       return await finishRecording(page, context, videoDir);
     } catch (err) {
@@ -615,8 +673,8 @@ const cleanUpOnSignal = (signal) => {
   log(`${signal} を受け取りました。後始末して終了します。`);
   if (appProcess) {
     try {
-      // プロセスグループごと強制終了する（孤児化を防ぐ）
-      process.kill(-appProcess.pid, "SIGKILL");
+      // プロセスツリーごと強制終了する（孤児化を防ぐ）
+      killProcessTree(appProcess, "SIGKILL");
     } catch {
       // 既に終了していれば何もしなくてよい
     }
