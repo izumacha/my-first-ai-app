@@ -18,6 +18,18 @@ import path from "node:path";
 // Windows かどうか（プロセスの止め方が POSIX と異なるため、この 1 か所で判定して分岐を閉じ込める）
 export const IS_WINDOWS = process.platform === "win32";
 
+// next dev の起動を待つ上限時間（ミリ秒）。2 つの撮影スクリプトで同じ値を使う
+export const APP_STARTUP_TIMEOUT_MS = 120_000;
+// SIGTERM で終わらない next dev を強制終了するまでの猶予（ミリ秒）
+export const APP_SHUTDOWN_GRACE_MS = 10_000;
+// 起動ヘルスチェック 1 回あたりの上限時間（ミリ秒）。
+// undici の既定タイムアウト（300 秒）は起動待ちの上限より長いため、これを指定しないと
+// 「ポートは開いたが応答しない」状態のときに 1 回の fetch が上限時間を超えて居座り、
+// ループが期限切れに気づけなくなる（＝ startupTimeoutMs が実質的に効かない）
+const HEALTH_CHECK_TIMEOUT_MS = 5_000;
+// ヘルスチェックの再試行間隔（ミリ秒）
+const HEALTH_CHECK_INTERVAL_MS = 1_000;
+
 /**
  * 指定ミリ秒待つ。
  * @param {number} ms - 待機時間（ミリ秒）
@@ -168,8 +180,12 @@ export async function startAppServer({ repoRoot, port, env, startupTimeoutMs, on
       throw new Error(`next dev が起動前に終了しました (exit code: ${exitCode})。上のログを確認してください。`);
     }
     try {
-      // トップページの応答が返れば起動完了とみなす
-      const res = await fetch(appUrl);
+      // トップページの応答が返れば起動完了とみなす。1 回あたりの上限を、
+      // 残り時間と規定値の短い方で切る（残り時間を超えて 1 回の試行が居座らないようにする）
+      const remainingMs = deadline - Date.now();
+      const res = await fetch(appUrl, {
+        signal: AbortSignal.timeout(Math.min(HEALTH_CHECK_TIMEOUT_MS, Math.max(remainingMs, 1))),
+      });
       // 応答本文を破棄してソケットを解放する（読み捨てないと接続が滞留する）
       await discardBody(res);
       if (res.ok) return child;
@@ -179,8 +195,8 @@ export async function startAppServer({ repoRoot, port, env, startupTimeoutMs, on
       // 「アプリが起動しなかった」としか分からなくなるので、最後のエラーを控えておく
       lastHealthCheckError = err;
     }
-    // 1 秒待って再試行する
-    await sleep(1000);
+    // 少し待って再試行する
+    await sleep(HEALTH_CHECK_INTERVAL_MS);
   }
   // 起動しなかった場合は失敗させる（fail-closed）。最後に観測したエラーを添えて原因を追えるようにする
   await stopAppServer(child);
@@ -197,22 +213,31 @@ export async function startAppServer({ repoRoot, port, env, startupTimeoutMs, on
  * @param {import("node:child_process").ChildProcess} child - startAppServer が返したプロセス
  * @param {number} [graceMs=10000] - SIGTERM で終わらない場合に強制終了するまでの猶予（ミリ秒）
  */
-export async function stopAppServer(child, graceMs = 10_000) {
-  // 既に終了しているなら何もしない（終了済みプロセスの exit を待つと永久に待つため）
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  // spawn 自体に失敗していると PID が無い。この場合 'exit' は永遠に来ないので、
-  // 待ちに入る前に抜ける（Windows の taskkill は失敗しても例外を投げないため、
-  // 下の catch では取りこぼしてハングしてしまう）
+export async function stopAppServer(child, graceMs = APP_SHUTDOWN_GRACE_MS) {
+  // spawn 自体に失敗していると PID が無い。プロセスグループも存在しないので何もできない
+  // （Windows の taskkill は失敗しても例外を投げないため、下の catch では取りこぼしてハングする）
   if (!child.pid) return;
-  // 終了イベントを待つ Promise を、シグナル送出より先に用意する（取りこぼし防止）
-  const exited = new Promise((resolve) => child.once("exit", resolve));
+  // 親が既に終了しているか（この場合 'exit' はもう来ないので待ってはいけない）。
+  // ただし「親が死んだ」＝「掃除済み」ではない点が重要で、このモジュールの前提どおり
+  // next dev はビルドワーカーを子に持つため、親が先に落ちた（OOM kill・クラッシュ）ときこそ
+  // 孫がポートを掴んだまま残りやすい。親の生死にかかわらずグループへのシグナルは必ず送る
+  const parentAlreadyExited = child.exitCode !== null || child.signalCode !== null;
+  // 終了イベントを待つ Promise を、シグナル送出より先に用意する（取りこぼし防止）。
+  // 親が終了済みならそもそも待たないので用意しない
+  const exited = parentAlreadyExited
+    ? null
+    : new Promise((resolve) => child.once("exit", resolve));
   try {
     // プロセスツリー全体を終了させる（OS 差は killProcessTree 内に閉じ込めてある）
     killProcessTree(child, "SIGTERM");
   } catch {
-    // 既に終了している場合はそのままでよい（後始末なので失敗を無視してよい唯一の箇所）
+    // グループに誰も残っていなければ ESRCH で失敗する。掃除の目的は果たされているので何もしない
+    // （後始末なので失敗を無視してよい唯一の箇所）
     return;
   }
+  // 親が終了済みの場合、待てる 'exit' が無いのでここで終わる。
+  // 生き残ったワーカーには上で SIGTERM が届いており、次の実行前にはポートが解放される
+  if (!exited) return;
   // SIGTERM を無視して居座る場合に備え、猶予後に強制終了する保険をかける
   const killTimer = setTimeout(() => {
     try {

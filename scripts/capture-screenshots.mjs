@@ -26,8 +26,6 @@
 
 // ファイル操作（一時ディレクトリの作成・生成物の差し替え）を読み込む
 import fs from "node:fs";
-// OS 情報（一時ディレクトリの場所）を読み込む
-import os from "node:os";
 // パス結合ユーティリティを読み込む
 import path from "node:path";
 // file:// URL をファイルパスへ変換するユーティリティを読み込む
@@ -38,24 +36,27 @@ import { chromium } from "@playwright/test";
 import { chromiumLaunchOptions } from "./lib/chromium-launch-options.mjs";
 // アプリサーバーの起動・停止まわり（デモ GIF 撮影と共有）
 import {
+  APP_SHUTDOWN_GRACE_MS,
+  APP_STARTUP_TIMEOUT_MS,
   createLogger,
   killProcessTree,
   sleep,
   startAppServer,
   stopAppServer,
 } from "./lib/app-server.mjs";
-// 上流 Claude API を模倣するモックサーバー（デモ GIF 撮影と共有）
-import { startMockUpstream } from "./lib/mock-upstream.mjs";
-// 撮影で使う質問・回答・画面上の目印（デモ GIF 撮影と共有）
+// 上流 Claude API を模倣するモックサーバーと、その接続先を渡す環境変数（デモ GIF 撮影と共有）
+import { startMockUpstream, stubUpstreamEnv } from "./lib/mock-upstream.mjs";
+// 撮影で使う質問・回答（デモ GIF 撮影と共有）
+import { DEMO_ANSWER, DEMO_CATEGORY_LABEL, DEMO_QUESTION } from "./lib/demo-content.mjs";
+// ページの開き方・hydration 待ち・撮影前の共通検査（デモ GIF 撮影と共有）
 import {
-  APP_HEADING,
-  DEMO_ANSWER,
-  DEMO_CATEGORY_LABEL,
-  DEMO_QUESTION,
-  HIDE_DEV_OVERLAY_CSS,
-} from "./lib/demo-content.mjs";
-// hydration の完了を待ちながら操作するヘルパー（デモ GIF 撮影と共有）
-import { clickUntilPressed, waitForEnabled } from "./lib/page-actions.mjs";
+  clickUntilPressed,
+  openAppPage,
+  RENDER_SETTLE_MS,
+  requireAppRoot,
+  requireNoErrorBanner,
+  waitForEnabled,
+} from "./lib/page-actions.mjs";
 
 // このスクリプト自身の場所からリポジトリルートを求める（どこから実行しても生成物の場所を固定する）
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -74,16 +75,12 @@ const MOBILE_VIEWPORT = { width: 390, height: 844 };
 const MOBILE_DEVICE_SCALE_FACTOR = 2;
 // 生成物の出力先ディレクトリ（README が参照するパスに固定。実行時のカレントディレクトリに依存させない）
 const SCREENSHOT_DIR = path.join(REPO_ROOT, "docs", "screenshots");
-// next dev の起動を待つ上限時間（ミリ秒）
-const APP_STARTUP_TIMEOUT_MS = 120_000;
-// SIGTERM で終わらない next dev を強制終了するまでの猶予（ミリ秒）
-const APP_SHUTDOWN_GRACE_MS = 10_000;
-// 描画が落ち着くまでの待ち時間（ミリ秒）。フォント適用やトランジションの途中を撮らないための余白
-const RENDER_SETTLE_MS = 800;
-// ストリーミングのチャンク送出間隔（ミリ秒）。静止画撮影では回答を待たないため 0 でよい
-const DELTA_INTERVAL_MS = 0;
-// 1 回の text_delta で送る文字数（同上。速度を落とす理由が無いので大きめにする）
-const DELTA_CHUNK_SIZE = 64;
+// 撮影した PNG を一旦置く一時ディレクトリ（出力先と同じファイルシステム上に置く）。
+// OS の一時領域（/tmp）へ置くと、多くのディストリビューションでは tmpfs のため
+// 出力先と別デバイスになり、最後の差し替え（rename）が EXDEV で失敗する。
+// capture-demo.mjs が一時 GIF を出力先と同じディレクトリに置いているのと同じ理由。
+// ドットで始めるのは、撮影中に覗いても生成物と紛れないようにするため
+const STAGING_DIR_NAME = ".capture-staging";
 // レート制限の枠を使い切るために送る試行回数の上限（安全弁）。
 // アプリ側の上限（1 分 20 リクエスト）より十分大きくしつつ、429 が永久に返らない
 // 場合でも無限ループにしないための打ち切り値
@@ -110,77 +107,6 @@ let stagingDir = null;
 
 // ログは stderr へ出す（生成物のパスなど結果は stdout と区別する）
 const log = createLogger("capture-screenshots");
-
-/**
- * アプリ本体の DOM（見出しを含む body 直下の要素）に絞ったロケータを返す。
- * Playwright のロケータは shadow DOM も貫通して探すため、範囲を絞らないと
- * next dev が挿入する開発用オーバーレイ（<nextjs-portal> 内）まで拾ってしまう。
- * @param {import("@playwright/test").Page} page - 対象のページ
- * @returns {import("@playwright/test").Locator} アプリのルート要素
- */
-function appRootOf(page) {
-  // 見出しを含む body 直下の div をアプリのルートとみなす
-  return page.locator("body > div").filter({ has: page.getByRole("heading", { name: APP_HEADING }) });
-}
-
-/**
- * 撮影前の共通検査を行う。アプリのルートが一意に見つかることを確認する。
- * 目印が見つからないまま次の検査へ進むと「0 件だから合格」と素通りしてしまうため、
- * レイアウト変更で検査そのものが無効化されるのを防ぐ（fail-closed）。
- * @param {import("@playwright/test").Page} page - 対象のページ
- * @param {string} shotName - 失敗時のメッセージに載せる撮影対象の名前
- * @returns {Promise<import("@playwright/test").Locator>} 検査済みのアプリのルート要素
- */
-async function requireAppRoot(page, shotName) {
-  // アプリのルート要素を取得する
-  const appRoot = appRootOf(page);
-  // ちょうど 1 件見つからなければレイアウトが変わったとみなして中止する
-  if ((await appRoot.count()) !== 1) {
-    throw new Error(
-      `${shotName}: アプリのルート要素を特定できませんでした（レイアウト変更の可能性）。検査できないため撮影を中止します。`,
-    );
-  }
-  // 以降の検査で使えるようルート要素を返す
-  return appRoot;
-}
-
-/**
- * アプリのエラーバナー（role="alert"）が出ていないことを確認する。
- * エラー撮影以外の 3 枚は「正常時の画面」なので、赤いバナーが写り込んだ画像を
- * 成功として上書きしないためにここで弾く。
- * @param {import("@playwright/test").Locator} appRoot - アプリのルート要素
- * @param {string} shotName - 失敗時のメッセージに載せる撮影対象の名前
- */
-async function requireNoErrorBanner(appRoot, shotName) {
-  // アプリのエラーバナーを探す
-  const errorBanner = appRoot.getByRole("alert");
-  // 1 件でも出ていれば、その文言を添えて失敗させる（原因調査のため）
-  if ((await errorBanner.count()) > 0) {
-    const alertText = await errorBanner.first().innerText();
-    throw new Error(`${shotName}: 撮影中にエラーが表示されました: ${alertText}`);
-  }
-}
-
-/**
- * 撮影用のページを開き、初期画面（カテゴリチップ）が表示されるまで待つ。
- * @param {import("@playwright/test").BrowserContext} context - ページを開くコンテキスト
- * @returns {Promise<import("@playwright/test").Page>} 初期表示が整ったページ
- */
-async function openAppPage(context) {
-  // 新しいページを開く
-  const page = await context.newPage();
-  // アプリのトップページへ移動する
-  await page.goto(APP_URL);
-  // next dev が挿入する開発ツールのバッジ（画面左下の丸い「N」）を隠す。
-  // style は文書に紐づくので、goto で読み込んだ後に入れる必要がある
-  await page.addStyleTag({ content: HIDE_DEV_OVERLAY_CSS });
-  // カテゴリチップが描画されるまで待つ（初期画面が整った目印）
-  await page.getByRole("button", { name: DEMO_CATEGORY_LABEL }).waitFor();
-  // 描画が落ち着くまで少し待つ（トランジション途中を撮らないため）
-  await sleep(RENDER_SETTLE_MS);
-  // 撮影可能になったページを返す
-  return page;
-}
 
 /**
  * 1 枚撮影して一時ディレクトリへ書き出す。
@@ -256,7 +182,7 @@ async function captureDesktopShots(browser) {
   const context = await browser.newContext({ viewport: DESKTOP_VIEWPORT });
   try {
     // アプリのトップページを開く
-    const page = await openAppPage(context);
+    const page = await openAppPage(context, APP_URL);
 
     // ---- 1 枚目: 初期画面（カテゴリチップ表示） ----
     // アプリのルート要素を確認する
@@ -328,7 +254,7 @@ async function captureMobileShot(browser) {
   });
   try {
     // アプリのトップページを開く
-    const page = await openAppPage(context);
+    const page = await openAppPage(context, APP_URL);
     // アプリのルート要素を確認する
     const appRoot = await requireAppRoot(page, SHOTS.mobile);
     // 正常時の画面なのでエラーバナーが無いことを確認する
@@ -346,18 +272,19 @@ async function captureMobileShot(browser) {
  * 4 枚すべてが揃って初めて動かすので、途中で失敗しても既存の画像は損なわれない。
  */
 function publishScreenshots() {
-  // 出力先ディレクトリを保証する
-  fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
-  // 定義した 4 枚を順に移動する
-  for (const fileName of Object.values(SHOTS)) {
-    // 一時ディレクトリ上のパス
-    const from = path.join(stagingDir, fileName);
-    // 揃っていない場合は差し替えを中止する（撮り漏らしに気づかず古い画像を残さないため）
-    if (!fs.existsSync(from)) {
-      throw new Error(`${fileName} が撮影されていません。差し替えを中止します。`);
-    }
-    // 検査を通ったのでコミット対象のパスへ移す
-    fs.renameSync(from, path.join(SCREENSHOT_DIR, fileName));
+  // 定義した全ファイル名を一時ディレクトリ上のパスへ変換する
+  const fileNames = Object.values(SHOTS);
+  // 撮り漏らしが 1 枚でもあれば、1 つも動かさずに中止する。
+  // 「確認しながら 1 枚ずつ動かす」形にすると、途中で欠けに気づいた時点で
+  // 手前の数枚は既に差し替わっており、まさに避けたい「新旧が混ざった状態」が残る
+  const missing = fileNames.filter((fileName) => !fs.existsSync(path.join(stagingDir, fileName)));
+  if (missing.length > 0) {
+    throw new Error(`${missing.join(", ")} が撮影されていません。差し替えを中止します。`);
+  }
+  // 全枚数が揃っていることを確認できたので、コミット対象のパスへ移す
+  // （一時置き場は出力先と同じディレクトリなので、1 枚ずつの rename は原子的に入れ替わる）
+  for (const fileName of fileNames) {
+    fs.renameSync(path.join(stagingDir, fileName), path.join(SCREENSHOT_DIR, fileName));
   }
   // どこへ出力したかを結果として知らせる
   log(`スクリーンショット ${Object.keys(SHOTS).length} 枚を更新しました: ${SCREENSHOT_DIR}`);
@@ -371,12 +298,7 @@ const {
   server: mockServer,
   stats: mockStats,
   port: mockUpstreamPort,
-} = await startMockUpstream({
-  answer: DEMO_ANSWER,
-  deltaIntervalMs: DELTA_INTERVAL_MS,
-  deltaChunkSize: DELTA_CHUNK_SIZE,
-  log,
-});
+} = await startMockUpstream({ answer: DEMO_ANSWER, log });
 log(`モック上流を起動しました (port ${mockUpstreamPort})`);
 
 // Ctrl-C などで中断されたときの後始末。detached で起動した next dev は自分の
@@ -405,8 +327,10 @@ const cleanUpOnSignal = (signal) => {
 process.once("SIGINT", () => cleanUpOnSignal("SIGINT"));
 process.once("SIGTERM", () => cleanUpOnSignal("SIGTERM"));
 
-// 撮影した PNG を一旦置く一時ディレクトリを OS の一時領域に作る（移植性のため /tmp 直書きを避ける）
-stagingDir = fs.mkdtempSync(path.join(os.tmpdir(), "chat-screenshots-"));
+// 出力先ディレクトリと、その配下の一時置き場を用意する（同一ファイルシステム上に置くことで
+// 最後の差し替えを rename 1 回で原子的に行える）
+fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
+stagingDir = fs.mkdtempSync(path.join(SCREENSHOT_DIR, STAGING_DIR_NAME));
 // ブラウザは try の外で宣言し、finally で確実に閉じられるようにする
 let browser = null;
 
@@ -416,12 +340,7 @@ try {
   await startAppServer({
     repoRoot: REPO_ROOT,
     port: APP_PORT,
-    env: {
-      // ダミーの API キー（モック上流しか呼ばないので実キーは不要）
-      ANTHROPIC_API_KEY: "demo-dummy-key",
-      // Anthropic SDK の接続先をローカルのモックへ差し替える（実際に割り当てられたポート）
-      ANTHROPIC_BASE_URL: `http://127.0.0.1:${mockUpstreamPort}`,
-    },
+    env: stubUpstreamEnv(mockUpstreamPort),
     startupTimeoutMs: APP_STARTUP_TIMEOUT_MS,
     onSpawn: (child) => {
       appProcess = child;

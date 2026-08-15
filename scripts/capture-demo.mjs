@@ -38,25 +38,31 @@ import { chromium } from "@playwright/test";
 import { chromiumLaunchOptions } from "./lib/chromium-launch-options.mjs";
 // アプリサーバーの起動・停止まわり（静止画撮影と共有）
 import {
+  APP_SHUTDOWN_GRACE_MS,
+  APP_STARTUP_TIMEOUT_MS,
   createLogger,
   killProcessTree,
   sleep,
   startAppServer,
   stopAppServer,
 } from "./lib/app-server.mjs";
-// 上流 Claude API を模倣するモックサーバー（静止画撮影と共有）
-import { startMockUpstream } from "./lib/mock-upstream.mjs";
-// 撮影で使う質問・回答・画面上の目印（静止画撮影と共有）
+// 上流 Claude API を模倣するモックサーバーと、その接続先を渡す環境変数（静止画撮影と共有）
+import { startMockUpstream, stubUpstreamEnv } from "./lib/mock-upstream.mjs";
+// 撮影で使う質問・回答（静止画撮影と共有）
 import {
   ANSWER_TAIL_MARKER,
-  APP_HEADING,
   DEMO_ANSWER,
   DEMO_CATEGORY_LABEL,
   DEMO_QUESTION,
-  HIDE_DEV_OVERLAY_CSS,
 } from "./lib/demo-content.mjs";
-// hydration の完了を待ちながら操作するヘルパー（静止画撮影と共有）
-import { clickUntilPressed, waitForEnabled } from "./lib/page-actions.mjs";
+// ページの開き方・hydration 待ち・撮影前の共通検査（静止画撮影と共有）
+import {
+  clickUntilPressed,
+  openAppPage,
+  requireAppRoot,
+  requireNoErrorBanner,
+  waitForEnabled,
+} from "./lib/page-actions.mjs";
 
 // このスクリプト自身の場所からリポジトリルートを求める（どこから実行しても生成物の場所を固定する）
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -75,10 +81,8 @@ const DELTA_INTERVAL_MS = 45;
 const DELTA_CHUNK_SIZE = 6;
 // GIF の上限サイズ（CLAUDE.md §15: 10MB 以下）
 const GIF_MAX_BYTES = 10 * 1024 * 1024;
-// next dev の起動を待つ上限時間（ミリ秒）
-const APP_STARTUP_TIMEOUT_MS = 120_000;
-// SIGTERM で終わらない next dev を強制終了するまでの猶予（ミリ秒）
-const APP_SHUTDOWN_GRACE_MS = 10_000;
+// 撮影開始直後に初期画面を見せる静止時間（ミリ秒）。冒頭がいきなり操作から始まらないようにする
+const INTRO_SETTLE_MS = 1200;
 // 回答が出そろってから録画を止めるまでの静止時間（ミリ秒）。
 // Playwright の録画は末尾が数秒切り落とされることがあるため、単に「読める間」だけでなく
 // 切り落とし分の余白も見込んで長めに取る。ここを削ると GIF が
@@ -126,17 +130,11 @@ async function recordDemoVideo() {
       recordVideo: { dir: videoDir, size: VIEWPORT },
     });
     {
-      // 新しいページを開く
-      const page = await context.newPage();
-      // アプリのトップページへ移動する
-      await page.goto(APP_URL);
-      // next dev が挿入する開発ツールのバッジ（画面左下の丸い「N」）を隠す。
-      // style は文書に紐づくので、goto で読み込んだ後に入れる必要がある
-      await page.addStyleTag({ content: HIDE_DEV_OVERLAY_CSS });
-      // 初期画面（カテゴリチップ）が見えるまで待ち、少し静止させる
+      // アプリのトップページを開き、初期画面（カテゴリチップ）が整うまで待つ
+      const page = await openAppPage(context, APP_URL);
+      // 撮影開始前にもう少し静止させる（録画の冒頭に落ち着いた初期画面を入れるため）
       const cookingChip = page.getByRole("button", { name: DEMO_CATEGORY_LABEL });
-      await cookingChip.waitFor();
-      await sleep(1200);
+      await sleep(INTRO_SETTLE_MS);
       // 「料理」カテゴリのチップを、選択が React に届くまで再試行しながらクリックする。
       // hydration 前のクリックはリスナーが未装着で黙って捨てられるため、1 回で諦めると
       // カテゴリ未選択（なんでも）のまま撮影が続き、README の説明と食い違う GIF ができる。
@@ -162,24 +160,10 @@ async function recordDemoVideo() {
       // ここから撮れ高の検証。送信ボタンはエラー時にも「送信」へ戻るため、
       // ボタンの状態だけを根拠にすると、エラー画面の GIF を「成功」として
       // 上書きしてしまう。回答が出ていること・エラーが出ていないことを明示的に確かめる。
-      // 探索範囲をアプリ本体の DOM に限定する（見出しを含む body 直下の要素を目印にする）
-      const appRoot = page
-        .locator("body > div")
-        .filter({ has: page.getByRole("heading", { name: APP_HEADING }) });
-      // 目印が見つからないと以降の検査が「0 件だから合格」と素通りしてしまうため、
-      // まず範囲そのものを確認する（レイアウト変更で検査が無効化されるのを防ぐ fail-closed）
-      if ((await appRoot.count()) !== 1) {
-        throw new Error(
-          "アプリのルート要素を特定できませんでした（レイアウト変更の可能性）。検査できないため撮影を中止します。",
-        );
-      }
+      // 探索範囲をアプリ本体の DOM に限定し、レイアウトが変わっていないことも確認する
+      const appRoot = await requireAppRoot(page, "デモ録画");
       // アプリのエラーバナー（role="alert"）が出ていないことを確認する
-      const errorBanner = appRoot.getByRole("alert");
-      if ((await errorBanner.count()) > 0) {
-        // エラー文言を添えて失敗させる（原因調査のため）
-        const alertText = await errorBanner.first().innerText();
-        throw new Error(`撮影中にエラーが表示されました: ${alertText}`);
-      }
+      await requireNoErrorBanner(appRoot, "デモ録画");
       // 回答の末尾が描画されている＝ストリーミングが最後まで届いたことを確認する。
       // count() は複数一致でも例外にならないので、「出ていない」と「複数一致」を区別できる
       // （isVisible() の失敗をまとめて握り潰すと、目印の重複を配信切れと誤診断してしまう）
@@ -351,12 +335,7 @@ try {
   await startAppServer({
     repoRoot: REPO_ROOT,
     port: APP_PORT,
-    env: {
-      // ダミーの API キー（モック上流しか呼ばないので実キーは不要）
-      ANTHROPIC_API_KEY: "demo-dummy-key",
-      // Anthropic SDK の接続先をローカルのモックへ差し替える（実際に割り当てられたポート）
-      ANTHROPIC_BASE_URL: `http://127.0.0.1:${mockUpstreamPort}`,
-    },
+    env: stubUpstreamEnv(mockUpstreamPort),
     startupTimeoutMs: APP_STARTUP_TIMEOUT_MS,
     onSpawn: (child) => {
       appProcess = child;

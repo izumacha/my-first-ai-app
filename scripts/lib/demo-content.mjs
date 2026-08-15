@@ -54,6 +54,3 @@ export const APP_HEADING = "AI 暮らしアシスタント";
 // 撮影は dev サーバーに対して行うため、そのままだと README の代表画像に
 // 開発時にしか出ない UI が焼き込まれてしまう
 export const HIDE_DEV_OVERLAY_CSS = "nextjs-portal { display: none !important; }";
-
-// hydration（React がサーバー描画済み HTML に操作を結び付ける処理）の完了を待つ上限（ミリ秒）
-export const HYDRATION_TIMEOUT_MS = 15_000;

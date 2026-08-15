@@ -18,6 +18,27 @@ import http from "node:http";
 const LISTEN_PORT = 0;
 // 待受アドレス（ローカルからのみ到達できるようループバックに限定する）
 const LISTEN_HOST = "127.0.0.1";
+// ストリーミング設定の既定値。回答の見た目が要らない用途（静止画撮影のように
+// 「上流が呼ばれていないこと」の確認だけにモックを使う場合）で、意味の無い値を
+// 呼び出し側に書かせないためのフォールバック
+const DEFAULT_DELTA_INTERVAL_MS = 0;
+const DEFAULT_DELTA_CHUNK_SIZE = 64;
+
+/**
+ * 撮影用アプリへ渡す環境変数を組み立てる。
+ * 実 API キーでの課金呼び出しを避けるため、接続先をこのモックへ差し替える。
+ * 2 つの撮影スクリプトで同じ組み合わせを使うので、ここを唯一の参照元にする。
+ * @param {number} port - モック上流が待ち受けているポート
+ * @returns {Record<string, string>} next dev に渡す環境変数
+ */
+export function stubUpstreamEnv(port) {
+  return {
+    // ダミーの API キー（モック上流しか呼ばないので実キーは不要）
+    ANTHROPIC_API_KEY: "demo-dummy-key",
+    // Anthropic SDK の接続先をローカルのモックへ差し替える（実際に割り当てられたポート）
+    ANTHROPIC_BASE_URL: `http://${LISTEN_HOST}:${port}`,
+  };
+}
 
 /**
  * SSE イベントを 1 つ書き出す（event 行 + data 行 + 空行）。
@@ -41,13 +62,18 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * モック上流サーバーを起動する。
  * @param {object} options - モックの応答内容を決めるオプション
  * @param {string} options.answer - ストリーミングで返すデモ回答の全文
- * @param {number} options.deltaIntervalMs - チャンク送出の間隔（ミリ秒）
- * @param {number} options.deltaChunkSize - 1 回の text_delta で送る文字数
  * @param {(msg: string) => void} options.log - 警告を出すためのログ関数
+ * @param {number} [options.deltaIntervalMs] - チャンク送出の間隔（ミリ秒）
+ * @param {number} [options.deltaChunkSize] - 1 回の text_delta で送る文字数
  * @returns {Promise<{ server: import("node:http").Server, stats: { messagesRequests: number }, port: number }>}
  *   待受を開始したサーバー・受け取ったリクエスト数のカウンタ・実際の待受ポート
  */
-export function startMockUpstream({ answer, deltaIntervalMs, deltaChunkSize, log }) {
+export function startMockUpstream({
+  answer,
+  log,
+  deltaIntervalMs = DEFAULT_DELTA_INTERVAL_MS,
+  deltaChunkSize = DEFAULT_DELTA_CHUNK_SIZE,
+}) {
   // モックが実際に呼ばれたかを後から検証するためのカウンタ（課金呼び出し防止の要）
   const stats = { messagesRequests: 0 };
 
