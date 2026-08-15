@@ -21,6 +21,7 @@ npm run lint         # ESLint
 npm run typecheck    # tsc --noEmit
 npm run test         # Vitest
 node scripts/capture-demo.mjs  # デモ GIF を再生成（上流 Claude API はスタブ。要 ffmpeg。docs/screenshots/chat-demo.gif を出力）
+node scripts/capture-screenshots.mjs  # 静止画スクショ 4 枚を再生成（上流 Claude API はスタブ。ffmpeg 不要。docs/screenshots/*.png を出力）
 ```
 
 ## 3. アーキテクチャ
@@ -56,15 +57,17 @@ node scripts/capture-demo.mjs  # デモ GIF を再生成（上流 Claude API は
 ### 見せ方（§15 の具体化）
 
 - スタック形態は「serverless で完結する Web」: Vercel 無料枠での**公開デモ URL 必須**。ただし Claude API は従量課金のため、公開前に既存の IP レート制限（1 分 20 リクエスト）に加えて **Anthropic 側の月次利用上限（spend limit）を必ず設定**する。`ANTHROPIC_API_KEY` は Vercel の環境変数で管理し、デモ用と開発用でキーを分ける。
-- 撮影対象スクリーンショット（`docs/screenshots/` 配下、ダミーの質問のみ使用・個人情報や API キーを写さない）。**以下は実在するファイルと一致させること**（README のデモブロックから参照している）:
+- 撮影対象スクリーンショット（`docs/screenshots/` 配下、ダミーの質問のみ使用・個人情報や API キーを写さない）。**以下は実在するファイルと一致させること**（README のデモブロックから参照している）。ファイル名の唯一の一覧は `scripts/capture-screenshots.mjs` の `SHOTS` 定数:
   1. `chat-initial-categories.png` — 初期画面（カテゴリチップ表示）
   2. `chat-category-selected.png` — カテゴリ選択後、入力欄に質問を入力した画面
   3. `chat-error-message.png` — エラー時の日本語メッセージ表示
   4. `chat-mobile.png` — モバイル幅での表示
-- デモ GIF（`docs/screenshots/chat-demo.gif`、「カテゴリ選択 → 質問入力 → ストリーミング回答」）は `scripts/capture-demo.mjs` で自動撮影する。上流 Claude API を模倣するローカルモックを立てて `ANTHROPIC_BASE_URL` で差し替えるため、実 API キー・課金呼び出しなしで再生成できる（実行コマンドは §2）。
+- **撮影はすべて自動化済み**（実行コマンドは §2）。静止画 4 枚は `scripts/capture-screenshots.mjs`、デモ GIF（`docs/screenshots/chat-demo.gif`、「カテゴリ選択 → 質問入力 → ストリーミング回答」）は `scripts/capture-demo.mjs`。どちらも上流 Claude API を模倣するローカルモックを立てて `ANTHROPIC_BASE_URL` で差し替えるため、実 API キー・課金呼び出しなしで再生成できる。
+  - サーバー起動・モック上流・質問文などの共通部分は `scripts/lib/`（`app-server.mjs` / `mock-upstream.mjs` / `demo-content.mjs` / `page-actions.mjs` / `chromium-launch-options.mjs`）に集約している。撮影の手順を変えるときは、2 つのスクリプトへ書き写さず共有側を直す。
+  - `chat-error-message.png` のエラー表示は、アプリ自身のレート制限（1 分 20 リクエスト）の 429 応答を撮る。ページ内から `/api/chat` を 429 が返るまで叩いて枠を使い切るだけなので上流 Claude API は呼ばれない。上限値はアプリ側の定数を撮影スクリプトへ書き写さず「429 が返るまで」で判定する。
+  - どちらのスクリプトも fail-closed。検査を通らなければ既存の生成物を書き換えない（静止画は 4 枚すべて揃ってから差し替えるので、新旧が混ざった状態も残らない）。モック上流の呼び出し回数を最後に検査し、実 API を叩いていないことを機械的に確かめる。
 - **未対応（意図的に残している宿題。満たしたらこの節から削除する）**:
   - 公開デモ URL — 未公開。公開時は Anthropic 側の月次利用上限（spend limit）設定が前提条件。
-  - 静止画スクショ 4 枚の撮影自動化 — 現状は手動撮影（自動化済みなのはデモ GIF のみ）。自動化したら実行コマンドを §2 に追記する。
 
 ---
 
