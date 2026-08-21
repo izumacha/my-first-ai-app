@@ -427,8 +427,8 @@ describe("dependabot.yml の ESLint major 保留", () => {
           `${GUARDED_DEPENDENCY} の ignore がちょうど 1 件ある状態を保ってください。` +
           `0 件なら削除されたか、別エコシステム(docker 等)・別ディレクトリのブロックへ` +
           `移されています。2 件以上なら Dependabot が両方を適用し、意図より広く止まります。` +
-          `この保留が要る理由は .github/dependabot.yml のコメントと CLAUDE.md ` +
-          `「ESLint は 9 系に意図的に留め置いている」を参照 (消すと lint が ` +
+          `この保留が要る理由は .github/dependabot.yml のコメントと CLAUDE.md §3 ` +
+          `「テスト」節の eslint 留め置きの項を参照 (消すと lint が ` +
           `contextOrFilename.getFilename is not a function で落ちます)。`,
       ).toHaveLength(1);
       // 名前が eslint そのものであること。`*` へ**書き換えられた**場合、
