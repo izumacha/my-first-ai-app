@@ -29,8 +29,11 @@ updates:
       #   入れてローカル再現済み)。アプリ側の eslint.config.mjs では回避できず、
       #   ESLint 10 対応版の eslint-plugin-react も現時点で存在しない。
       #
-      # 外す条件: eslint-plugin-react の peerDependencies が eslint 10 以上を含む版が出て、
-      #   eslint-config-next がそれを取り込んだら、この ignore を削除して major 更新を取る。
+      # 外す条件: eslint-config-next が引き込む eslint プラグイン **すべて**
+      #   (eslint-plugin-react / -import / -jsx-a11y / -react-hooks) の peerDependencies が
+      #   eslint 10 以上を含む版になったら、この ignore を削除して major 更新を取る。
+      #   **react 1 つだけが対応しても外せない** — 同じ lint 実行に載る他のプラグインが
+      #   eslint を 9 までに制限したままなら、結局 lint は落ちる。
       #   この条件は tests/dependabot-eslint-guard.test.ts が package-lock.json の
       #   解決済み peer 範囲を読んで自動で見張る。人が気付くのを待たずに、上流が
       #   eslint 10 に言及した時点でテストが落ちる (保留が効いている限り package.json の

@@ -2,7 +2,8 @@
 // 宣言している eslint のバージョン範囲が食い違っていないことを固定するテスト。
 //
 // なぜテストで縛るのか:
-//   この ignore は「上流 (eslint-plugin-react) が ESLint 10 に未対応な間だけ」有効な
+//   この ignore は「上流のプラグイン群 (eslint-config-next が引き込む eslint-plugin-react /
+//   -import / -jsx-a11y / -react-hooks) が ESLint 10 に未対応な間だけ」有効な
 //   一時的な措置で、外す条件はコメントにしか書かれていない。人手の約束のままだと、
 //   上流が対応して eslint を 10 系へ上げた日に ignore を消し忘れる。消し忘れても
 //   lint も型チェックも通るので誰も気付かないまま、**その先の major (11 以降) が
@@ -88,6 +89,17 @@ const HELD_MAJOR = 9;
 // 保留の起点になっている設定パッケージ。ここが引き込むプラグイン群が
 // eslint のどこまでを許すかで、保留を外せるかどうかが決まる
 const UPSTREAM_CONFIG_PACKAGE = "eslint-config-next";
+// 実際に eslint を 9 系までに制限しているプラグイン。期限判定はこの全員が
+// 次の major を許したときだけ発火させる。
+// **走査で必ず見つかること自体も固定する**: 設定パッケージ本体の peer は `>=9.0.0` と
+// 緩く、それだけを拾えた状態でも「全員が 10 を許した」に見えてしまう。上流の依存構成が
+// 変わってプラグインが走査から外れたら、誤って保留解除を促す前に落とす (fail-closed)
+const REQUIRED_UPSTREAM_PLUGINS = [
+  "eslint-plugin-react",
+  "eslint-plugin-import",
+  "eslint-plugin-jsx-a11y",
+  "eslint-plugin-react-hooks",
+];
 
 // dependabot.yml のうち、この検査が読む部分だけを表す型。
 // 全項目を書き写すと設定を増やすたびに型の更新が要るので、必要な枝だけ宣言する
@@ -227,11 +239,10 @@ function collectUpstreamPeers(lock: unknown): UpstreamPeer[] {
   const config = table[`node_modules/${UPSTREAM_CONFIG_PACKAGE}`];
   // オブジェクトで書かれていなければ前提が崩れているので空を返す
   if (typeof config !== "object" || config === null) return [];
-  // 設定パッケージ本体と、その直接依存すべてを走査対象にする
-  const names = [
-    UPSTREAM_CONFIG_PACKAGE,
-    ...Object.keys(asRecord((config as Record<string, unknown>).dependencies)),
-  ];
+  // 設定パッケージが引き込む依存を走査対象にする。
+  // **本体そのものは含めない**: その peer は `>=9.0.0` と緩く、常に次の major を許すため、
+  // 混ぜると「全員が許した」の判定を無条件に甘くしてしまう
+  const names = Object.keys(asRecord((config as Record<string, unknown>).dependencies));
   // 集めた peer 範囲を溜める配列
   const peers: UpstreamPeer[] = [];
   // 走査対象を順に見ていく
@@ -340,32 +351,44 @@ describe("dependabot.yml の ESLint major 保留", () => {
     expect(allowedMajor).not.toBeNull();
   });
 
-  it("保留の理由になっている上流が、ロックファイルから読み取れる", () => {
-    // 上流が依存ツリーから消えた・キーの形が変わったなら、保留の前提が崩れている。
-    // 黙って「期限切れの検査ができない」状態にせず、ここで落として見直しを促す
-    expect(
-      upstreamPeers.length,
-      `${UPSTREAM_CONFIG_PACKAGE} 配下に eslint へ peer 依存するパッケージが見つかりません。` +
-        `依存構成が変わったなら、保留の前提ごと見直してください。`,
-    ).toBeGreaterThan(0);
+  it("保留の理由になっている上流プラグインが、すべてロックファイルから読み取れる", () => {
+    // 走査で拾えたパッケージ名の一覧
+    const found = upstreamPeers.map((peer) => peer.name);
+    // 実際に eslint を制限しているプラグインが 1 つでも走査から外れると、
+    // 残った緩い peer だけを見て「全員が次の major を許した」と誤読しうる。
+    // 上流の依存構成が変わったなら、保留の前提ごと見直す合図として落とす
+    for (const plugin of REQUIRED_UPSTREAM_PLUGINS) {
+      expect(
+        found,
+        `${plugin} が ${UPSTREAM_CONFIG_PACKAGE} 配下の eslint peer 依存として見つかりません` +
+          `(見つかったのは ${found.join(", ") || "なし"})。依存構成が変わったなら、` +
+          `REQUIRED_UPSTREAM_PLUGINS と保留の前提を見直してください。`,
+      ).toContain(plugin);
+    }
   });
 
-  it("上流がまだ次の major に対応していない (= 保留の理由が残っている)", () => {
-    // 上流のどれか 1 つでも次の major を許していなければ、保留はまだ必要。
-    // **全部が許すようになって初めて**保留を外せる — eslint-plugin-react だけが
-    // 先に対応しても、同じ lint 実行に載る import / jsx-a11y / react-hooks が
-    // 9 までに制限したままなら lint は落ちるため。
-    // ここで落ちたら「上流が出揃った」合図。ignore を外して major 更新を取りにいく
-    // (この検査が無いと、保留が効いている限り package.json は 9 のまま動かず、
-    //  package.json の major を見る判定が永久に発火しないという循環に陥る)
-    expect(
-      blockingPeers.map((peer) => peer.name),
-      `${UPSTREAM_CONFIG_PACKAGE} 配下のすべてが eslint ${nextMajorVersion} を許すようになりました` +
-        `(${upstreamPeers.map((peer) => `${peer.name}: ${peer.range}`).join(", ")})。` +
-        `.github/dependabot.yml の ignore とこのテストを削除し、eslint の major 更新を` +
-        `取り込んでください。`,
-    ).not.toHaveLength(0);
-  });
+  // 保留そのものが無ければ、この検査は対象外 (skip として CI の出力にも現れる)。
+  // 上流が出揃って ignore を消したあと、このテストだけが赤く残り続けて
+  // 「もう存在しない ignore を消せ」と言い続ける状態を避ける
+  it.skipIf(ignoreEntries.length === 0)(
+    "上流がまだ次の major に対応していない (= 保留の理由が残っている)",
+    () => {
+      // 上流のどれか 1 つでも次の major を許していなければ、保留はまだ必要。
+      // **全部が許すようになって初めて**保留を外せる — eslint-plugin-react だけが
+      // 先に対応しても、同じ lint 実行に載る import / jsx-a11y / react-hooks が
+      // 9 までに制限したままなら lint は落ちるため。
+      // ここで落ちたら「上流が出揃った」合図。ignore を外して major 更新を取りにいく
+      // (この検査が無いと、保留が効いている限り package.json は 9 のまま動かず、
+      //  package.json の major を見る判定が永久に発火しないという循環に陥る)
+      expect(
+        blockingPeers.map((peer) => peer.name),
+        `${UPSTREAM_CONFIG_PACKAGE} 配下のすべてが eslint ${nextMajorVersion} を許すようになりました` +
+          `(${upstreamPeers.map((peer) => `${peer.name}: ${peer.range}`).join(", ")})。` +
+          `.github/dependabot.yml の ignore とこのテストを削除し、eslint の major 更新を` +
+          `取り込んでください。`,
+      ).not.toHaveLength(0);
+    },
+  );
 
   // 留め置き中でなければ、この検査は対象外 (skip として CI の出力にも現れる)
   it.skipIf(allowedMajor !== HELD_MAJOR)(
@@ -377,6 +400,10 @@ describe("dependabot.yml の ESLint major 保留", () => {
       // (Dependabot は複数の条件をすべて適用するため、update-types 無しのエントリが
       //  1 件混ざるだけで全バージョンが止まる)
       expect(ignoreEntries).toHaveLength(1);
+      // 名前が eslint そのものであること。`*` へ**書き換えられた**場合、
+      // 件数も update-types もキー集合も想定どおりのまま素通りしてしまうが、
+      // 実際には npm の全パッケージの major 更新が止まる (next / prisma / react …)
+      expect(ignoreEntries[0]?.["dependency-name"]).toBe(GUARDED_DEPENDENCY);
       // 止める対象は major だけ。update-types ごと消えると Dependabot は
       // 「全バージョンを無視」と解釈し、9 系の修正まで届かなくなる
       expect(ignoreEntries[0]?.["update-types"]).toEqual([MAJOR_UPDATE_TYPE]);
