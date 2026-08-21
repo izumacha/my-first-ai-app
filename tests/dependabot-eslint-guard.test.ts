@@ -14,9 +14,11 @@
 //       ignore が残っている状態 (= 用済みのガードが以後の major を止め続ける)。
 //   (b) 保留の消失 … まだ eslint 9 系に留まっているのに ignore だけ消された状態
 //       (= 落ちると分かっている Dependabot PR が毎週再び立つ)。
-//   (c) 保留の効きすぎ … update-types が消える・minor / patch まで対象になるなど、
-//       eslint 9 系の修正まで届かなくなる状態 (Dependabot は update-types を書かない
-//       ignore エントリを「全バージョンを無視」として扱うため、行が 1 つ消えるだけで起きる)。
+//   (c) 保留の効きすぎ … update-types が消える・`versions` のような別の絞り込みが
+//       足される・同じパッケージのエントリが 2 件になるなどで、eslint 9 系の修正まで
+//       届かなくなる状態。Dependabot は update-types を書かない ignore エントリを
+//       「全バージョンを無視」として扱い、かつ複数のエントリを**すべて適用する**ため、
+//       行が 1 つ増減するだけで起きる。
 //   (d) 保留の置き場所間違い … ignore が npm 以外のエコシステム (docker 等) の下に
 //       置かれた状態。npm には何も効かないので (b) と同じ結末になる。
 //
@@ -55,9 +57,16 @@ const GUARDED_DEPENDENCY = "eslint";
 const GUARDED_ECOSYSTEM = "npm";
 // major 更新だけを止めるための update-types 値 (Dependabot の予約語)
 const MAJOR_UPDATE_TYPE = "version-update:semver-major";
-// 上流 (eslint-plugin-react) が未対応で、保留を続ける必要がある最初の major。
-// package.json がこの major 以上を許すようになったら ignore は用済み
-const UNSUPPORTED_MAJOR = 10;
+// ignore エントリに書いてよいキーの一覧 (これ以外が増えると効き方が変わる)。
+// 例えば `versions: [">=9.40.0"]` を足すと 9 系の更新まで止まるので、
+// 「major だけを止める」という意図と実際の効き方がずれる
+const ALLOWED_IGNORE_KEYS = ["dependency-name", "update-types"];
+// いま eslint を留め置いている major。package.json の宣言もこの major であることを前提に、
+// 「保留が要る / 用済み」を判定する。
+// **上流が対応して次の major へ進んだら**、この ignore ごと削除するのが基本。
+// ただし将来また別の major (11 など) で同じ足踏みが起きたときは、ignore を残したまま
+// この値を新しい major へ更新する運用もありうる (下の失敗メッセージで両方を案内する)
+const HELD_MAJOR = 9;
 
 // dependabot.yml のうち、この検査が読む部分だけを表す型。
 // 全項目を書き写すと設定を増やすたびに型の更新が要るので、必要な枝だけ宣言する
@@ -85,27 +94,44 @@ function asArray(value: unknown): unknown[] {
 }
 
 /**
- * 指定したエコシステムの ignore から、対象パッケージのエントリを 1 つ取り出す。
+ * 指定したエコシステムの ignore から、対象パッケージのエントリを**すべて**集める。
  *
- * 見つからなければ undefined を返す。エコシステム違い・パッケージ名違いは
- * すべて「見つからない」に落ちるので、置き場所を間違えた ignore を
- * 有効なものと取り違えることはない。
+ * 1 件目だけを取らないのは、Dependabot が同じパッケージに対する複数のエントリを
+ * **すべて適用する**ため。`- dependency-name: "eslint"` だけのエントリ (update-types 無し =
+ * 全バージョンを無視) が 2 件目に足されると、1 件目だけ見ていては「major だけ止めている」
+ * と誤読したまま、実際には 9 系の更新も止まっている状態を見逃す。
+ *
+ * エコシステム違い・パッケージ名違いはすべて「見つからない」に落ちるので、
+ * 置き場所を間違えた ignore を有効なものと取り違えることもない。
  */
-function findIgnoreEntry(
+function collectIgnoreEntries(
   config: DependabotConfig,
   ecosystem: string,
   dependencyName: string,
-): DependabotIgnoreEntry | undefined {
+): DependabotIgnoreEntry[] {
   // updates 直下から目的のエコシステムのブロックを探す
   const block = asArray(config.updates)
     .map((entry) => entry as DependabotUpdateEntry)
     .find((entry) => entry["package-ecosystem"] === ecosystem);
   // ブロックが無ければ ignore も無い
-  if (!block) return undefined;
-  // そのブロックの ignore から対象パッケージのエントリを探して返す
+  if (!block) return [];
+  // そのブロックの ignore から対象パッケージのエントリをすべて集めて返す
   return asArray(block.ignore)
     .map((entry) => entry as DependabotIgnoreEntry)
-    .find((entry) => entry["dependency-name"] === dependencyName);
+    .filter((entry) => entry["dependency-name"] === dependencyName);
+}
+
+/**
+ * ignore エントリに書かれているキーを並べ替えて返す。
+ *
+ * 想定外のキー (`versions` など) が増えていないかを比較するために使う。
+ * オブジェクトでなければ空配列を返し、呼び出し側の比較を落とす方向へ倒す。
+ */
+function sortedKeysOf(entry: DependabotIgnoreEntry): string[] {
+  // オブジェクトでなければキーを数えようがない
+  if (typeof entry !== "object" || entry === null) return [];
+  // キーを取り出して並べ替える (比較しやすくするため)
+  return Object.keys(entry).sort();
 }
 
 /**
@@ -155,8 +181,12 @@ describe("dependabot.yml の ESLint major 保留", () => {
   const declaredRange = readDevDependencyRange(packageJson, GUARDED_DEPENDENCY);
   // 許容している最小 major (解釈できなければ null)
   const allowedMajor = parseAllowedMajor(declaredRange);
-  // npm エコシステムの ignore にある eslint のエントリ (無ければ undefined)
-  const ignoreEntry = findIgnoreEntry(dependabotConfig, GUARDED_ECOSYSTEM, GUARDED_DEPENDENCY);
+  // npm エコシステムの ignore にある eslint のエントリ (複数書かれていればすべて)
+  const ignoreEntries = collectIgnoreEntries(
+    dependabotConfig,
+    GUARDED_ECOSYSTEM,
+    GUARDED_DEPENDENCY,
+  );
 
   it("package.json の eslint バージョン範囲が、このテストで解釈できる形で書かれている", () => {
     // 解釈できない書き方だと以降の判定が意味を失うので、ここで落として気付けるようにする
@@ -164,24 +194,48 @@ describe("dependabot.yml の ESLint major 保留", () => {
     expect(allowedMajor).not.toBeNull();
   });
 
-  it("eslint 9 系に留まっている間は major 更新の ignore を維持している", () => {
-    // まだ上流未対応の major (10) へ上げていない = 保留が必要な状態
-    if (allowedMajor === null || allowedMajor >= UNSUPPORTED_MAJOR) return;
+  it("留め置いている major に居る間は、major 更新の ignore を 1 件だけ維持している", () => {
+    // 留め置いている major から動いていない = 保留が必要な状態
+    if (allowedMajor !== HELD_MAJOR) return;
 
-    // npm エコシステムの ignore にエントリが存在すること
-    // (消された場合も、docker など別エコシステムへ移された場合もここで落ちる)
-    expect(ignoreEntry).toBeDefined();
+    // npm エコシステムの ignore にエントリが「ちょうど 1 件」あること。
+    // 消された場合・docker など別エコシステムへ移された場合はもちろん、
+    // 2 件目が足された場合もここで落ちる (Dependabot は複数の条件をすべて適用するため、
+    // update-types 無しのエントリが 1 件混ざるだけで全バージョンが止まる)
+    expect(ignoreEntries).toHaveLength(1);
     // 止める対象は major だけ。update-types ごと消えると Dependabot は
     // 「全バージョンを無視」と解釈し、9 系の修正まで届かなくなる
-    expect(ignoreEntry?.["update-types"]).toEqual([MAJOR_UPDATE_TYPE]);
+    expect(ignoreEntries[0]?.["update-types"]).toEqual([MAJOR_UPDATE_TYPE]);
+    // 書かれているキーがちょうど想定どおりであること。`versions` のような
+    // 別の絞り込みが足されると、update-types が正しくても効き方が変わってしまう
+    expect(sortedKeysOf(ignoreEntries[0])).toEqual([...ALLOWED_IGNORE_KEYS].sort());
   });
 
-  it("eslint 10 以上へ上げたら、用済みの ignore が残っていない", () => {
-    // 上流が対応して 10 以上を許すようになった = 保留の理由が消えた状態
-    if (allowedMajor === null || allowedMajor < UNSUPPORTED_MAJOR) return;
+  it("留め置いている major から先へ進んだら、用済みの ignore が残っていない", () => {
+    // 留め置き中、または解釈できない範囲のときは、このテストの出番ではない
+    if (allowedMajor === null || allowedMajor <= HELD_MAJOR) return;
 
-    // ここで落ちたら dependabot.yml の ignore を削除する (以後の major を止めないため)。
+    // ここで落ちたときの直し方は 2 通りある。どちらが正しいかは「なぜ major を
+    // 上げたのか」で決まるので、片方だけを指示せず両方を示す:
+    //   (1) 上流が対応して保留の理由が消えたのなら → dependabot.yml の ignore と
+    //       このテストごと削除する (以後の major を止めないため)
+    //   (2) 次の major (11 など) でまた上流が足踏みしていて、新しい major で
+    //       留め置き直すのなら → HELD_MAJOR をその major へ更新する
     // 判定は構文解析の結果なので、クォートの種類やキーの順といった整形では揺れない
-    expect(ignoreEntry).toBeUndefined();
+    expect(
+      ignoreEntries,
+      `eslint が major ${HELD_MAJOR} から ${allowedMajor} へ動いています。` +
+        `保留が不要になったなら ignore とこのテストを削除し、` +
+        `新しい major で留め置き直すなら HELD_MAJOR を ${allowedMajor} へ更新してください。`,
+    ).toHaveLength(0);
+  });
+
+  it("留め置いている major より下へは戻っていない", () => {
+    // 解釈できない範囲のときは、このテストの出番ではない (上のテストが落とす)
+    if (allowedMajor === null) return;
+
+    // ダウングレードは想定していない。起きたなら HELD_MAJOR との対応が崩れているので、
+    // 保留の判定そのものを見直す合図として落とす
+    expect(allowedMajor).toBeGreaterThanOrEqual(HELD_MAJOR);
   });
 });
