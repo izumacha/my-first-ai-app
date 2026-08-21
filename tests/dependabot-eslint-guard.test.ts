@@ -14,26 +14,33 @@
 //       ignore が残っている状態 (= 用済みのガードが以後の major を止め続ける)。
 //   (b) 保留の消失 … まだ eslint 9 系に留まっているのに ignore だけ消された状態
 //       (= 落ちると分かっている Dependabot PR が毎週再び立つ)。
+//   (c) 保留の効きすぎ … update-types が消える・minor / patch まで対象になるなど、
+//       eslint 9 系の修正まで届かなくなる状態 (Dependabot は update-types を書かない
+//       ignore エントリを「全バージョンを無視」として扱うため、行が 1 つ消えるだけで起きる)。
+//   (d) 保留の置き場所間違い … ignore が npm 以外のエコシステム (docker 等) の下に
+//       置かれた状態。npm には何も効かないので (b) と同じ結末になる。
 //
-// **なぜ YAML を構文解析しないのか**:
-//   YAML パーサを新規依存として足さずに済ませたい (CLAUDE.md §9「新規依存は最小限に」)。
-//   一方で「YAML の形を自前で真似て読む」書き方 (インデントとクォートの並びを行単位で
-//   追う方式) は最初にこの検査を書いたときに実際に破綻した: `"eslint"` を `'eslint'` に
-//   書き換える・キーの順を入れ替えるといった**意味の変わらない整形**でエントリを見失い、
-//   「ignore は存在しない」と誤読して (a) の検査が緑のまま素通りしてしまう。
-//   そこで構造を読むのはやめ、**「eslint を名指しする ignore エントリが 1 つでも
-//   書かれているか」をテキストとして見る**方式に寄せた。整形の揺れに強く、
-//   どちらへ転んでも安全側 (fail-closed) に倒れる。
-//
-//   この単純化は「この ignore リストのエントリは eslint 1 件だけ」という前提の上に
-//   成り立つ (update-types の検査をファイル全体に対して行うため)。前提が崩れたら
-//   判定が意味を失うので、**前提そのものもテストで固定して落とす**。
+// **なぜ YAML パーサ (yaml) を devDependency として入れたのか**:
+//   最初はパーサを足さずに済ませようと自前でテキストを読んでいたが、2 通り試して
+//   どちらも正確性の穴を作った:
+//     1 回目 (行の形を追う方式) … `"eslint"` を `'eslint'` に書き換えるだけの
+//        意味の変わらない整形でエントリを見失い、(a) の検査が緑のまま素通りした。
+//     2 回目 (ファイル全体をテキスト一致で見る方式) … コメント文中の
+//        `version-update:semver-major` にも一致してしまい、設定行が消えても
+//        検査が通る (c) の穴と、エコシステムを区別できない (d) の穴が残った。
+//   「YAML を正しく読む」ことがこの検査の本体である以上、それを近似で済ませると
+//   検出網そのものが静かに緩む。yaml (ISC / 依存ゼロ / Prettier も採用) を
+//   devDependency として入れ、構造をそのまま読む方式に切り替えた
+//   (CLAUDE.md §9「新規依存は最小限に絞って出所・メンテ状況を確認する」)。
+//   これでコメントは解析時に落ち、エコシステム・エントリ単位で正確に見られる。
 
 // Vitest の DSL
 import { describe, expect, it } from "vitest";
 // 設定ファイルを読むため (Node 標準の同期 API で十分)
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+// dependabot.yml を構造として読むため
+import { parse as parseYaml } from "yaml";
 
 // リポジトリのルート (このテストファイルは tests/ 直下にある)
 const REPO_ROOT = resolve(__dirname, "..");
@@ -44,42 +51,61 @@ const PACKAGE_JSON_PATH = resolve(REPO_ROOT, "package.json");
 
 // ignore の対象パッケージ名 (dependabot.yml の dependency-name と一致させる)
 const GUARDED_DEPENDENCY = "eslint";
+// 保留を書いているエコシステム。ここ以外に置いても npm には効かない
+const GUARDED_ECOSYSTEM = "npm";
 // major 更新だけを止めるための update-types 値 (Dependabot の予約語)
 const MAJOR_UPDATE_TYPE = "version-update:semver-major";
-// major 以外の update-types。9 系の修正が届かなくなるので書かれていてはいけない
-const NON_MAJOR_UPDATE_TYPES = [
-  "version-update:semver-minor",
-  "version-update:semver-patch",
-];
 // 上流 (eslint-plugin-react) が未対応で、保留を続ける必要がある最初の major。
 // package.json がこの major 以上を許すようになったら ignore は用済み
 const UNSUPPORTED_MAJOR = 10;
 
-// ignore エントリの `dependency-name:` 行からパッケージ名を取り出す正規表現。
-// 整形の揺れに強くするため、次をすべて同じものとして拾う:
-//   `      - dependency-name: "eslint"` / `- dependency-name: 'eslint'`
-//   `        dependency-name: eslint`   (リスト項目の 2 つ目以降のキーとして書いた場合)
-//   行末の `# コメント` 付き
-// 逆に `#` で始まるコメント行は拾わない (コメントアウトされた ignore は効いていないため、
-// 「存在しない」と読むのが正しい)。`\s*` は `#` に一致しないので自然にそうなる。
-const DEPENDENCY_NAME_LINE = /^\s*(?:-\s*)?dependency-name:\s*["']?([^"'\s#]+)["']?\s*(?:#.*)?$/gm;
+// dependabot.yml のうち、この検査が読む部分だけを表す型。
+// 全項目を書き写すと設定を増やすたびに型の更新が要るので、必要な枝だけ宣言する
+interface DependabotIgnoreEntry {
+  "dependency-name"?: unknown;
+  "update-types"?: unknown;
+}
+interface DependabotUpdateEntry {
+  "package-ecosystem"?: unknown;
+  ignore?: unknown;
+}
+interface DependabotConfig {
+  updates?: unknown;
+}
 
 /**
- * dependabot.yml に書かれている ignore エントリのパッケージ名をすべて集める。
+ * 配列でなければ空配列にして返す。
  *
- * 構造 (どのエコシステムの ignore か) は見ない。この設定ファイルで `dependency-name` を
- * 使うのは npm ブロックの ignore だけで、増えたら下の「前提」テストが落ちるため。
+ * YAML は何でも書けるので、想定した形でなければ「空」として扱い、
+ * 呼び出し側の検査 (エントリが存在すること) を落とす方向へ倒す。
  */
-function collectIgnoredDependencyNames(yaml: string): string[] {
-  // 集めたパッケージ名を溜める配列
-  const names: string[] = [];
-  // 正規表現は g フラグ付きなので、matchAll で全一致を順に取り出す
-  for (const match of yaml.matchAll(DEPENDENCY_NAME_LINE)) {
-    // キャプチャした 1 つ目のグループがパッケージ名
-    names.push(match[1]);
-  }
-  // 見つかった順に返す
-  return names;
+function asArray(value: unknown): unknown[] {
+  // 配列ならそのまま、そうでなければ空配列 (= 見つからなかった扱い)
+  return Array.isArray(value) ? value : [];
+}
+
+/**
+ * 指定したエコシステムの ignore から、対象パッケージのエントリを 1 つ取り出す。
+ *
+ * 見つからなければ undefined を返す。エコシステム違い・パッケージ名違いは
+ * すべて「見つからない」に落ちるので、置き場所を間違えた ignore を
+ * 有効なものと取り違えることはない。
+ */
+function findIgnoreEntry(
+  config: DependabotConfig,
+  ecosystem: string,
+  dependencyName: string,
+): DependabotIgnoreEntry | undefined {
+  // updates 直下から目的のエコシステムのブロックを探す
+  const block = asArray(config.updates)
+    .map((entry) => entry as DependabotUpdateEntry)
+    .find((entry) => entry["package-ecosystem"] === ecosystem);
+  // ブロックが無ければ ignore も無い
+  if (!block) return undefined;
+  // そのブロックの ignore から対象パッケージのエントリを探して返す
+  return asArray(block.ignore)
+    .map((entry) => entry as DependabotIgnoreEntry)
+    .find((entry) => entry["dependency-name"] === dependencyName);
 }
 
 /**
@@ -102,19 +128,35 @@ function parseAllowedMajor(range: unknown): number | null {
   return Number(matched[1]);
 }
 
+/**
+ * package.json の devDependencies から、指定パッケージのバージョン範囲を取り出す。
+ *
+ * `JSON.parse` の戻り値は `any` になるため (CLAUDE.md §6 で禁止)、`unknown` で受けてから
+ * 必要な枝だけを型で絞る。キー名を書き間違えても静かに undefined にならないよう、
+ * 途中の形が想定と違えば undefined を返し、呼び出し側の「解釈できる形か」検査で落ちる。
+ */
+function readDevDependencyRange(json: unknown, dependencyName: string): unknown {
+  // トップレベルがオブジェクトでなければ読み進めない
+  if (typeof json !== "object" || json === null) return undefined;
+  // devDependencies の枝を取り出す
+  const devDependencies = (json as { devDependencies?: unknown }).devDependencies;
+  // それ自体がオブジェクトでなければ、やはり読み進めない
+  if (typeof devDependencies !== "object" || devDependencies === null) return undefined;
+  // 目的のパッケージのバージョン範囲を返す (無ければ undefined)
+  return (devDependencies as Record<string, unknown>)[dependencyName];
+}
+
 describe("dependabot.yml の ESLint major 保留", () => {
-  // 設定ファイルの中身 (どのテストからも同じものを読む)
-  const dependabotYaml = readFileSync(DEPENDABOT_PATH, "utf8");
-  // package.json は JSON なのでそのままパースできる
-  const packageJson = JSON.parse(readFileSync(PACKAGE_JSON_PATH, "utf8"));
+  // Dependabot 設定を構造として読む (コメントはパーサが落とすので検査に混ざらない)
+  const dependabotConfig = parseYaml(readFileSync(DEPENDABOT_PATH, "utf8")) as DependabotConfig;
+  // package.json も同様に unknown で受けてから絞る
+  const packageJson: unknown = JSON.parse(readFileSync(PACKAGE_JSON_PATH, "utf8"));
   // devDependencies に書かれている eslint のバージョン範囲 (無ければ undefined)
-  const declaredRange: unknown = packageJson.devDependencies?.[GUARDED_DEPENDENCY];
+  const declaredRange = readDevDependencyRange(packageJson, GUARDED_DEPENDENCY);
   // 許容している最小 major (解釈できなければ null)
   const allowedMajor = parseAllowedMajor(declaredRange);
-  // ignore に名前が挙がっているパッケージの一覧
-  const ignoredNames = collectIgnoredDependencyNames(dependabotYaml);
-  // eslint が ignore に挙がっているか
-  const eslintIsIgnored = ignoredNames.includes(GUARDED_DEPENDENCY);
+  // npm エコシステムの ignore にある eslint のエントリ (無ければ undefined)
+  const ignoreEntry = findIgnoreEntry(dependabotConfig, GUARDED_ECOSYSTEM, GUARDED_DEPENDENCY);
 
   it("package.json の eslint バージョン範囲が、このテストで解釈できる形で書かれている", () => {
     // 解釈できない書き方だと以降の判定が意味を失うので、ここで落として気付けるようにする
@@ -122,27 +164,16 @@ describe("dependabot.yml の ESLint major 保留", () => {
     expect(allowedMajor).not.toBeNull();
   });
 
-  it("ignore に載っているのは eslint だけ (update-types をファイル全体で見る前提)", () => {
-    // 下の update-types 検査はファイル全体を対象にするため、エントリが増えると
-    // 「どのエントリの update-types か」を取り違える。前提が崩れたら落として、
-    // 判定方法ごと見直すよう促す (黙って緩めない)
-    expect(ignoredNames.filter((name) => name !== GUARDED_DEPENDENCY)).toEqual([]);
-    // 同じパッケージを 2 度書くのも同様に前提外
-    expect(ignoredNames.length).toBeLessThanOrEqual(1);
-  });
-
   it("eslint 9 系に留まっている間は major 更新の ignore を維持している", () => {
     // まだ上流未対応の major (10) へ上げていない = 保留が必要な状態
     if (allowedMajor === null || allowedMajor >= UNSUPPORTED_MAJOR) return;
 
-    // ignore エントリ自体が存在すること (消されていないこと)
-    expect(eslintIsIgnored).toBe(true);
-    // 止める対象に major が含まれること
-    expect(dependabotYaml).toContain(MAJOR_UPDATE_TYPE);
-    // minor / patch まで止めると 9 系の修正が届かなくなるので、書かれていてはいけない
-    for (const updateType of NON_MAJOR_UPDATE_TYPES) {
-      expect(dependabotYaml).not.toContain(updateType);
-    }
+    // npm エコシステムの ignore にエントリが存在すること
+    // (消された場合も、docker など別エコシステムへ移された場合もここで落ちる)
+    expect(ignoreEntry).toBeDefined();
+    // 止める対象は major だけ。update-types ごと消えると Dependabot は
+    // 「全バージョンを無視」と解釈し、9 系の修正まで届かなくなる
+    expect(ignoreEntry?.["update-types"]).toEqual([MAJOR_UPDATE_TYPE]);
   });
 
   it("eslint 10 以上へ上げたら、用済みの ignore が残っていない", () => {
@@ -150,7 +181,7 @@ describe("dependabot.yml の ESLint major 保留", () => {
     if (allowedMajor === null || allowedMajor < UNSUPPORTED_MAJOR) return;
 
     // ここで落ちたら dependabot.yml の ignore を削除する (以後の major を止めないため)。
-    // 判定は整形に左右されないテキスト一致なので、書き方を変えても見逃さない
-    expect(eslintIsIgnored).toBe(false);
+    // 判定は構文解析の結果なので、クォートの種類やキーの順といった整形では揺れない
+    expect(ignoreEntry).toBeUndefined();
   });
 });
