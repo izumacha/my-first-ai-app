@@ -31,14 +31,23 @@ updates:
       #
       # 外す条件: eslint-plugin-react の peerDependencies が eslint 10 以上を含む版が出て、
       #   eslint-config-next がそれを取り込んだら、この ignore を削除して major 更新を取る。
-      #   (`npm view eslint-plugin-react peerDependencies` で確認できる)
+      #   この条件は tests/dependabot-eslint-guard.test.ts が package-lock.json の
+      #   解決済み peer 範囲を読んで自動で見張る。人が気付くのを待たずに、上流が
+      #   eslint 10 に言及した時点でテストが落ちる (保留が効いている限り package.json の
+      #   eslint は 9 のまま動かないので、「package.json を見る」判定だけでは
+      #   この条件は永久に発火しない — 判定が循環してしまう)。
       #
       # 効き方: `version-update:semver-major` だけを対象にするので、9 系の
       #   minor / patch 更新は従来どおり npm-minor-and-patch グループで届く。
       #   ただし 9 系で修正されない脆弱性が出た場合はこの ignore ごと見直す必要があるため、
       #   放置ではなく「上流待ちの保留」として扱う (§9 依存の管理)。
-      #   停止したことに気付けないまま残らないよう、tests/dependabot-eslint-guard.test.ts が
-      #   この ignore と package.json の eslint 範囲が食い違ったら落とす。
+      #
+      # 未検証の注意点: Dependabot の security updates に対して、`version-update:` 接頭辞の
+      #   update-types がどう扱われるか (major 以外の security 更新まで止まらないか) は
+      #   この環境から docs.github.com へ到達できず確認できていない。もし security updates が
+      #   update-types を無視するなら、この条件は eslint 全体の無視として働きうる。
+      #   eslint に CVE が出たときは Dependabot の PR を待たず、この ignore を一時的に
+      #   外して更新を取り込むこと。上記の挙動を確認できた時点でこの段落を更新する。
       - dependency-name: "eslint"
         update-types: ["version-update:semver-major"]
 
