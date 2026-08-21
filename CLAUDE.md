@@ -52,6 +52,7 @@ node scripts/capture-screenshots.mjs  # 静止画スクショ 4 枚を再生成�
 
 - テストファイル: `tests/**/*.test.ts`（ユニット）, `tests/**/*.test.tsx`（コンポーネント）。
 - API ルートのテストでは Anthropic API をモックする（実際には呼ばない）。各カテゴリのシステムプロンプトが空でないことを検証する。
+- **`eslint` の major 更新（9 → 10 以降）は `.github/dependabot.yml` の `ignore` で意図的に止めている。** 理由は上流の非互換で、`eslint-config-next` が引き込む `eslint-plugin-react` / `eslint-plugin-import` / `eslint-plugin-jsx-a11y` / `eslint-plugin-react-hooks` がいずれも eslint を `^9` までに制限しており、eslint 10 では削除済みの `context.getFilename()` を呼ぶため `npm run lint` が必ず落ちる（`peerDependencies` は `>=9.0.0` と緩いので npm はインストールを許してしまう）。**`package.json` の `eslint` を手で上げたり、この `ignore` を消したりしない。** 整合性は `tests/dependabot-eslint-guard.test.ts` が機械的に見張る: (a) 解除漏れ、(b) 保留の消失、(c) 効きすぎ（`update-types` の欠落・`versions` の追加・エントリの重複。Dependabot は複数エントリを**すべて適用**し、`update-types` の無いエントリは全バージョン無視を意味する）、(d) 置き場所間違い（別エコシステム・別ディレクトリ）、(e) **保留の期限切れ**（`package-lock.json` の解決済み `peerDependencies` を `semver` で評価し、上記プラグインが揃って eslint 10 を許した時点で落ちる。保留が効いている限り `package.json` は 9 のまま動かないため、`package.json` の major だけを見る判定では解除条件が永久に発火しない）。落ちたら `ignore` とこのテストごと削除して major 更新を取り込む。
 - `tests/contrast.test.tsx` は §7 の WCAG AA（通常文 4.5:1）を CI で機械検証する。描画した DOM から `text-*` / `bg-*` クラスを抜き出し、Tailwind の `theme.css` の OKLCH 定義を sRGB へ変換してコントラスト比を計算する（期待値のハードコードなし）。文字色クラスを変えると自動で測り直されるので、UI の色を変更したら `npm run test` を必ず通す。
 
 ### 見せ方（§15 の具体化）

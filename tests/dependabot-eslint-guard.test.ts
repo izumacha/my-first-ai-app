@@ -19,27 +19,28 @@
 //       届かなくなる状態。Dependabot は update-types を書かない ignore エントリを
 //       「全バージョンを無視」として扱い、かつ複数のエントリを**すべて適用する**ため、
 //       行が 1 つ増減するだけで起きる。
-//   (d) 保留の置き場所間違い … ignore が npm 以外のエコシステム (docker 等) の下に
-//       置かれた状態。npm には何も効かないので (b) と同じ結末になる。
+//   (d) 保留の置き場所間違い … ignore が npm 以外のエコシステム (docker 等) や、
+//       npm でも別ディレクトリのブロックの下に置かれた状態。このプロジェクトには
+//       何も効かないので (b) と同じ結末になる。
 //   (e) 保留の期限切れ … 上流が ESLint 10 に対応したのに保留が残り続ける状態。
 //       (a) だけでは検出できない: 保留が効いている限り Dependabot は eslint 10 を
 //       提案しないので package.json は 9 のまま動かず、「package.json の major を見る」
 //       判定は永久に発火しない(判定が循環している)。そこで上流の peer 範囲を
 //       package-lock.json から直接読み、保留の理由が消えた時点で落とす。
+//       判定対象は eslint-plugin-react 1 つではなく、eslint-config-next が引き込む
+//       eslint peer 依存すべて(import / jsx-a11y / react-hooks 等)。1 つだけが先に
+//       対応しても lint は落ちたままなので、全部が揃って初めて保留を外せる。
 //
-// **なぜ YAML パーサ (yaml) を devDependency として入れたのか**:
-//   最初はパーサを足さずに済ませようと自前でテキストを読んでいたが、2 通り試して
-//   どちらも正確性の穴を作った:
-//     1 回目 (行の形を追う方式) … `"eslint"` を `'eslint'` に書き換えるだけの
-//        意味の変わらない整形でエントリを見失い、(a) の検査が緑のまま素通りした。
-//     2 回目 (ファイル全体をテキスト一致で見る方式) … コメント文中の
-//        `version-update:semver-major` にも一致してしまい、設定行が消えても
-//        検査が通る (c) の穴と、エコシステムを区別できない (d) の穴が残った。
-//   「YAML を正しく読む」ことがこの検査の本体である以上、それを近似で済ませると
-//   検出網そのものが静かに緩む。yaml (ISC / 依存ゼロ / Prettier も採用) を
-//   devDependency として入れ、構造をそのまま読む方式に切り替えた
-//   (CLAUDE.md §9「新規依存は最小限に絞って出所・メンテ状況を確認する」)。
-//   これでコメントは解析時に落ち、エコシステム・エントリ単位で正確に見られる。
+// **なぜ YAML パーサ (yaml) を使うのか**:
+//   設定を自前でテキストとして読むと、この検査の本体である「YAML を正しく読む」部分が
+//   近似になり、検出網が静かに緩む。実際に近似で書いたときは
+//   (1) クォートの種類を変えただけでエントリを見失う、
+//   (2) 解説コメント中の `version-update:semver-major` にも一致して設定行の削除を見逃す、
+//   (3) エコシステムを区別できない、という穴がそれぞれ生じた。
+//   yaml (ISC / 依存ゼロ / Prettier も採用) を devDependency として入れ、構造を
+//   そのまま読む方式にしてある (CLAUDE.md §9「新規依存は最小限に絞って出所・メンテ状況を
+//   確認する」に沿って採否を判断した)。パーサがコメントを落とすため (2) は原理的に起きず、
+//   エコシステム → ignore → エントリと辿るので (3) も塞がる。
 
 // Vitest の DSL
 import { describe, expect, it } from "vitest";
@@ -48,6 +49,12 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 // dependabot.yml を構造として読むため
 import { parse as parseYaml } from "yaml";
+// peer 範囲が特定のバージョンを許すかを正しく判定するため。
+// 自前で「範囲に現れる数字の最大値」を見る方式は、`>=9.7` のような開いた範囲を
+// 「9 まで」と読み違え(期限切れを見逃す)、`>=9.0.0 <10.0.0` のような上限付きを
+// 「10 に言及している」と読み違える(誤って保留解除を促す)。範囲の解釈は
+// 専用ライブラリに任せる (§9 自前実装しない)
+import { satisfies } from "semver";
 
 // リポジトリのルート (このテストファイルは tests/ 直下にある)
 const REPO_ROOT = resolve(__dirname, "..");
@@ -55,7 +62,7 @@ const REPO_ROOT = resolve(__dirname, "..");
 const DEPENDABOT_PATH = resolve(REPO_ROOT, ".github/dependabot.yml");
 // 検査対象 2: eslint のバージョン範囲を宣言している場所
 const PACKAGE_JSON_PATH = resolve(REPO_ROOT, "package.json");
-// 検査対象 3: 上流 (eslint-plugin-react) の peer 範囲が解決済みで記録されている場所。
+// 検査対象 3: 上流プラグインの peer 範囲が解決済みで記録されている場所。
 // package.json には現れない推移依存なので、ロックファイルを読む
 const PACKAGE_LOCK_PATH = resolve(REPO_ROOT, "package-lock.json");
 
@@ -63,6 +70,9 @@ const PACKAGE_LOCK_PATH = resolve(REPO_ROOT, "package-lock.json");
 const GUARDED_DEPENDENCY = "eslint";
 // 保留を書いているエコシステム。ここ以外に置いても npm には効かない
 const GUARDED_ECOSYSTEM = "npm";
+// 保留を書いている対象ディレクトリ。npm のブロックが複数ある構成 (モノレポ等) で、
+// 別ディレクトリのブロックに書かれた ignore を「効いている」と読み違えないために見る
+const GUARDED_DIRECTORY = "/";
 // major 更新だけを止めるための update-types 値 (Dependabot の予約語)
 const MAJOR_UPDATE_TYPE = "version-update:semver-major";
 // ignore エントリに書いてよいキーの一覧 (これ以外が増えると効き方が変わる)。
@@ -75,10 +85,9 @@ const ALLOWED_IGNORE_KEYS = ["dependency-name", "update-types"];
 // ただし将来また別の major (11 など) で同じ足踏みが起きたときは、ignore を残したまま
 // この値を新しい major へ更新する運用もありうる (下の失敗メッセージで両方を案内する)
 const HELD_MAJOR = 9;
-// 保留の原因になっている上流パッケージ。ロックファイル上のキーの末尾で見つける
-// (eslint-config-next の推移依存なので、巻き上げの有無で `node_modules/...` の
-//  前置きが変わりうる。末尾一致にしておけばどちらでも拾える)
-const UPSTREAM_PACKAGE_SUFFIX = "node_modules/eslint-plugin-react";
+// 保留の起点になっている設定パッケージ。ここが引き込むプラグイン群が
+// eslint のどこまでを許すかで、保留を外せるかどうかが決まる
+const UPSTREAM_CONFIG_PACKAGE = "eslint-config-next";
 
 // dependabot.yml のうち、この検査が読む部分だけを表す型。
 // 全項目を書き写すと設定を増やすたびに型の更新が要るので、必要な枝だけ宣言する
@@ -88,6 +97,7 @@ interface DependabotIgnoreEntry {
 }
 interface DependabotUpdateEntry {
   "package-ecosystem"?: unknown;
+  directory?: unknown;
   ignore?: unknown;
 }
 interface DependabotConfig {
@@ -140,77 +150,111 @@ function ignoreNameMatches(pattern: unknown, dependencyName: string): boolean {
 function collectIgnoreEntries(
   config: DependabotConfig,
   ecosystem: string,
+  directory: string,
   dependencyName: string,
 ): DependabotIgnoreEntry[] {
-  // updates 直下から目的のエコシステムのブロックを探す
-  const block = asArray(config.updates)
+  // updates 直下から「エコシステムとディレクトリの両方が一致する」ブロックを集める。
+  // エコシステムだけで最初の 1 件を採ると、npm のブロックが複数ある構成 (モノレポ等) で
+  // 別ディレクトリのブロックに書かれた ignore を、このプロジェクトに効いていると読み違える
+  const blocks = asArray(config.updates)
     .map((entry) => entry as DependabotUpdateEntry)
-    .find((entry) => entry["package-ecosystem"] === ecosystem);
-  // ブロックが無ければ ignore も無い
-  if (!block) return [];
-  // そのブロックの ignore から対象パッケージに当たるエントリをすべて集めて返す
+    .filter((entry) => entry["package-ecosystem"] === ecosystem && entry.directory === directory);
+  // 該当ブロックの ignore から対象パッケージに当たるエントリをすべて集めて返す
   // (完全一致だけでなく `*` / `eslint*` のようなワイルドカードも拾う)
-  return asArray(block.ignore)
-    .map((entry) => entry as DependabotIgnoreEntry)
-    .filter((entry) => ignoreNameMatches(entry["dependency-name"], dependencyName));
+  return blocks.flatMap((block) =>
+    asArray(block.ignore)
+      .map((entry) => entry as DependabotIgnoreEntry)
+      .filter((entry) => ignoreNameMatches(entry["dependency-name"], dependencyName)),
+  );
 }
 
 /**
- * ロックファイルに記録されている上流パッケージの peer 範囲 (eslint に対するもの) を集める。
+ * ロックファイルから、指定パッケージのメタデータを取り出す。
  *
- * 上流は推移依存なので package.json には現れない。ロックファイルは解決済みの
- * peerDependencies をそのまま持っているため、ネットワークに出ずに「上流がどの eslint まで
- * 対応しているか」を読める。巻き上げの有無でキーの前置きが変わりうるので末尾一致で探す。
- *
- * 1 件も見つからなければ空配列を返し、呼び出し側で落とす — 上流が依存ツリーから
- * 消えたなら、保留の前提そのものを見直す必要があるため (fail-closed)。
+ * npm のロックファイルは「巻き上げ (hoist) された `node_modules/<name>`」と
+ * 「入れ子の `node_modules/<親>/node_modules/<name>`」のどちらにも書かれうるので、
+ * 入れ子を優先しつつ両方を見る。
  */
-function collectUpstreamPeerRanges(lock: unknown): string[] {
+function findLockEntry(
+  packages: Record<string, unknown>,
+  parentName: string,
+  name: string,
+): Record<string, unknown> | undefined {
+  // 入れ子 → 巻き上げの順に候補パスを並べる
+  const candidates = [`node_modules/${parentName}/node_modules/${name}`, `node_modules/${name}`];
+  // 先に見つかった方を採用する
+  for (const key of candidates) {
+    // その候補パスのメタデータを取り出す
+    const meta = packages[key];
+    // オブジェクトで書かれていれば採用
+    if (typeof meta === "object" && meta !== null) return meta as Record<string, unknown>;
+  }
+  // どちらにも無ければ見つからなかったことを伝える
+  return undefined;
+}
+
+// 上流パッケージ 1 つ分の「eslint に対する peer 範囲」
+interface UpstreamPeer {
+  // パッケージ名 (失敗メッセージに出す)
+  name: string;
+  // eslint に対する peer 範囲の文字列
+  range: string;
+}
+
+/**
+ * 設定パッケージ (eslint-config-next) 本体と、それが引き込む依存のうち
+ * eslint に peer 依存しているものをロックファイルから集める。
+ *
+ * **eslint-plugin-react だけを見ないのが要点。** 同じ lint 実行に載る
+ * eslint-plugin-import / jsx-a11y / react-hooks も eslint を `^9` までに制限しており、
+ * react だけが先に ESLint 10 へ対応しても lint は落ちたままになる。1 つだけを見ていると
+ * 「上流が対応した」と誤って知らせ、保留を外させて元の破損を呼び戻してしまう。
+ *
+ * 1 件も見つからなければ空配列を返し、呼び出し側で落とす — 依存の構成が変わったなら、
+ * 保留の前提そのものを見直す必要があるため (fail-closed)。
+ */
+function collectUpstreamPeers(lock: unknown): UpstreamPeer[] {
   // トップレベルがオブジェクトでなければ読み進めない
   if (typeof lock !== "object" || lock === null) return [];
   // packages の枝 (パッケージのパス → メタデータ) を取り出す
   const packages = (lock as { packages?: unknown }).packages;
   // それ自体がオブジェクトでなければ、やはり読み進めない
   if (typeof packages !== "object" || packages === null) return [];
-  // 見つかった peer 範囲を溜める配列
-  const ranges: string[] = [];
-  // すべてのパッケージを順に見て、目的の上流パッケージだけを拾う
-  for (const [path, meta] of Object.entries(packages as Record<string, unknown>)) {
-    // キーの末尾が目的のパッケージでなければ対象外
-    if (!path.endsWith(UPSTREAM_PACKAGE_SUFFIX)) continue;
-    // メタデータがオブジェクトでなければ読み進めない
-    if (typeof meta !== "object" || meta === null) continue;
-    // peerDependencies の枝を取り出す
-    const peers = (meta as { peerDependencies?: unknown }).peerDependencies;
-    // それ自体がオブジェクトでなければ対象外
-    if (typeof peers !== "object" || peers === null) continue;
+  // 型を絞った参照を用意する
+  const table = packages as Record<string, unknown>;
+  // 設定パッケージ本体のメタデータを取り出す (これが無ければ前提が崩れている)。
+  // 本体は直接の devDependency なので必ず巻き上げ側 (`node_modules/<name>`) に居る
+  const config = table[`node_modules/${UPSTREAM_CONFIG_PACKAGE}`];
+  // オブジェクトで書かれていなければ前提が崩れているので空を返す
+  if (typeof config !== "object" || config === null) return [];
+  // 設定パッケージ本体と、その直接依存すべてを走査対象にする
+  const names = [
+    UPSTREAM_CONFIG_PACKAGE,
+    ...Object.keys(asRecord((config as Record<string, unknown>).dependencies)),
+  ];
+  // 集めた peer 範囲を溜める配列
+  const peers: UpstreamPeer[] = [];
+  // 走査対象を順に見ていく
+  for (const name of names) {
+    // そのパッケージのロックエントリを引く (設定パッケージ配下の入れ子も見る)
+    const meta = findLockEntry(table, UPSTREAM_CONFIG_PACKAGE, name);
+    // 見つからなければ対象外 (別の依存に巻き上げられているだけの場合もある)
+    if (!meta) continue;
     // eslint に対する peer 範囲を取り出す
-    const range = (peers as Record<string, unknown>)[GUARDED_DEPENDENCY];
-    // 文字列で書かれていれば採用する
-    if (typeof range === "string") ranges.push(range);
+    const range = asRecord(meta.peerDependencies)[GUARDED_DEPENDENCY];
+    // 文字列で書かれていれば採用する (eslint に peer 依存しないパッケージは対象外)
+    if (typeof range === "string") peers.push({ name, range });
   }
   // 見つかった分を返す (空なら呼び出し側が落とす)
-  return ranges;
+  return peers;
 }
 
 /**
- * `"^3 || ^4 || ... || ^9.7"` のような peer 範囲から、言及されている最大の major を返す。
- *
- * 完全な semver 範囲の解釈はしない (そこまでやるなら semver ライブラリが要る)。
- * ここで知りたいのは「上流が HELD_MAJOR より上の major に言及し始めたか」だけなので、
- * 範囲に現れる major の最大値を見れば足りる。`^10` が足された瞬間に 10 が返り、
- * 保留の理由が消えたことに気付ける。
- *
- * 数字が 1 つも読めなければ null を返し、呼び出し側で落とす (読めない範囲を
- * 「まだ 9 までだろう」と決めつけると、期限切れの検出が黙って止まるため)。
+ * オブジェクトなら Record として、そうでなければ空オブジェクトとして返す小さな補助。
  */
-function maxMajorIn(range: string): number | null {
-  // 各節の先頭 (行頭・空白・`||` の直後) にある比較演算子を読み飛ばして major の数字を拾う
-  const majors = [...range.matchAll(/(?:^|\|\||\s)\s*[\^~><=]*\s*(\d+)/g)].map((m) => Number(m[1]));
-  // 1 つも読めなければ「解釈できなかった」ことを伝える
-  if (majors.length === 0) return null;
-  // 言及されている中で最大の major を返す
-  return Math.max(...majors);
+function asRecord(value: unknown): Record<string, unknown> {
+  // オブジェクト以外は「キーが無い」ものとして扱う
+  return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
 }
 
 /**
@@ -250,8 +294,8 @@ function parseAllowedMajor(range: unknown): number | null {
  * package.json の devDependencies から、指定パッケージのバージョン範囲を取り出す。
  *
  * `JSON.parse` の戻り値は `any` になるため (CLAUDE.md §6 で禁止)、`unknown` で受けてから
- * 必要な枝だけを型で絞る。キー名を書き間違えても静かに undefined にならないよう、
- * 途中の形が想定と違えば undefined を返し、呼び出し側の「解釈できる形か」検査で落ちる。
+ * 必要な枝だけを型で絞る。途中の形が想定と違えば undefined を返し、呼び出し側の
+ * 「解釈できる形か」検査で落ちる。
  */
 function readDevDependencyRange(json: unknown, dependencyName: string): unknown {
   // トップレベルがオブジェクトでなければ読み進めない
@@ -269,7 +313,7 @@ describe("dependabot.yml の ESLint major 保留", () => {
   const dependabotConfig = parseYaml(readFileSync(DEPENDABOT_PATH, "utf8")) as DependabotConfig;
   // package.json も同様に unknown で受けてから絞る
   const packageJson: unknown = JSON.parse(readFileSync(PACKAGE_JSON_PATH, "utf8"));
-  // ロックファイル (上流 eslint-plugin-react の peer 範囲を読むため)
+  // ロックファイル (上流プラグイン群の peer 範囲を読むため)
   const packageLock: unknown = JSON.parse(readFileSync(PACKAGE_LOCK_PATH, "utf8"));
   // devDependencies に書かれている eslint のバージョン範囲 (無ければ undefined)
   const declaredRange = readDevDependencyRange(packageJson, GUARDED_DEPENDENCY);
@@ -279,11 +323,16 @@ describe("dependabot.yml の ESLint major 保留", () => {
   const ignoreEntries = collectIgnoreEntries(
     dependabotConfig,
     GUARDED_ECOSYSTEM,
+    GUARDED_DIRECTORY,
     GUARDED_DEPENDENCY,
   );
 
-  // ロックファイルに記録されている上流の peer 範囲 (通常 1 件)
-  const upstreamPeerRanges = collectUpstreamPeerRanges(packageLock);
+  // ロックファイルに記録されている上流プラグイン群の peer 範囲
+  const upstreamPeers = collectUpstreamPeers(packageLock);
+  // 留め置きを外せるかの判定に使う「次の major」の代表バージョン
+  const nextMajorVersion = `${HELD_MAJOR + 1}.0.0`;
+  // 次の major をまだ許していない上流 (= 保留の理由として残っているもの)
+  const blockingPeers = upstreamPeers.filter((peer) => !satisfies(nextMajorVersion, peer.range));
 
   it("package.json の eslint バージョン範囲が、このテストで解釈できる形で書かれている", () => {
     // 解釈できない書き方だと以降の判定が意味を失うので、ここで落として気付けるようにする
@@ -294,30 +343,28 @@ describe("dependabot.yml の ESLint major 保留", () => {
   it("保留の理由になっている上流が、ロックファイルから読み取れる", () => {
     // 上流が依存ツリーから消えた・キーの形が変わったなら、保留の前提が崩れている。
     // 黙って「期限切れの検査ができない」状態にせず、ここで落として見直しを促す
-    expect(upstreamPeerRanges.length).toBeGreaterThan(0);
-    // 範囲が解釈できることも併せて確かめる (下の期限切れ検査が空振りしないように)
-    for (const range of upstreamPeerRanges) {
-      expect(maxMajorIn(range), `peer 範囲 "${range}" から major を読み取れません`).not.toBeNull();
-    }
+    expect(
+      upstreamPeers.length,
+      `${UPSTREAM_CONFIG_PACKAGE} 配下に eslint へ peer 依存するパッケージが見つかりません。` +
+        `依存構成が変わったなら、保留の前提ごと見直してください。`,
+    ).toBeGreaterThan(0);
   });
 
   it("上流がまだ次の major に対応していない (= 保留の理由が残っている)", () => {
-    // 上流の peer 範囲が言及する最大の major を求める
-    const upstreamMax = upstreamPeerRanges
-      .map((range) => maxMajorIn(range))
-      .filter((major): major is number => major !== null);
-    // 読み取れた範囲すべてについて、留め置き中の major を超えていないこと。
-    // ここで落ちたら「上流が対応した」合図。ignore を外して major 更新を取りにいく
+    // 上流のどれか 1 つでも次の major を許していなければ、保留はまだ必要。
+    // **全部が許すようになって初めて**保留を外せる — eslint-plugin-react だけが
+    // 先に対応しても、同じ lint 実行に載る import / jsx-a11y / react-hooks が
+    // 9 までに制限したままなら lint は落ちるため。
+    // ここで落ちたら「上流が出揃った」合図。ignore を外して major 更新を取りにいく
     // (この検査が無いと、保留が効いている限り package.json は 9 のまま動かず、
     //  package.json の major を見る判定が永久に発火しないという循環に陥る)
-    for (const major of upstreamMax) {
-      expect(
-        major,
-        `eslint-plugin-react の peer 範囲が eslint ${major} に言及しています。` +
-          `上流が対応したなら .github/dependabot.yml の ignore とこのテストを削除し、` +
-          `eslint の major 更新を取り込んでください。`,
-      ).toBeLessThanOrEqual(HELD_MAJOR);
-    }
+    expect(
+      blockingPeers.map((peer) => peer.name),
+      `${UPSTREAM_CONFIG_PACKAGE} 配下のすべてが eslint ${nextMajorVersion} を許すようになりました` +
+        `(${upstreamPeers.map((peer) => `${peer.name}: ${peer.range}`).join(", ")})。` +
+        `.github/dependabot.yml の ignore とこのテストを削除し、eslint の major 更新を` +
+        `取り込んでください。`,
+    ).not.toHaveLength(0);
   });
 
   // 留め置き中でなければ、この検査は対象外 (skip として CI の出力にも現れる)
