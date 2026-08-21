@@ -14,6 +14,50 @@ updates:
       # minor / patch 更新は 1 本の PR にまとめてレビュー負荷を下げる (major は個別 PR)
       npm-minor-and-patch:
         update-types: ["minor", "patch"]
+    ignore:
+      # ESLint の major 更新 (9 → 10 以降) を保留する。
+      #
+      # なぜ止めるのか: 上流が未対応で、上げると lint が必ず落ちるため。
+      #   eslint-config-next@16.3.0 は peerDependencies に `eslint: ">=9.0.0"` と
+      #   書いており、npm は eslint 10 のインストールを許してしまう。しかし同 config が
+      #   内包する eslint-plugin-react は最新 7.37.5 でも peer が `^9.7` までで、
+      #   ESLint 10 で削除された `context.getFilename()` を呼ぶ。結果、設定を 1 行も
+      #   変えていなくても実行時に
+      #     TypeError: Error while loading rule 'react/display-name':
+      #       contextOrFilename.getFilename is not a function
+      #   で exit code 2 になる (Dependabot PR #39 の CI 失敗、および eslint@10.8.1 を
+      #   入れてローカル再現済み)。アプリ側の eslint.config.mjs では回避できず、
+      #   ESLint 10 対応版の eslint-plugin-react も現時点で存在しない。
+      #
+      # 外す条件: eslint-config-next が引き込む eslint プラグイン **すべて**
+      #   (eslint-plugin-react / -import / -jsx-a11y / -react-hooks) の peerDependencies が
+      #   eslint 10 以上を含む版になったら、この ignore を削除して major 更新を取る。
+      #   **react 1 つだけが対応しても外せない** — 同じ lint 実行に載る他のプラグインが
+      #   eslint を 9 までに制限したままなら、結局 lint は落ちる。
+      #   この条件は tests/dependabot-eslint-guard.test.ts が package-lock.json の
+      #   解決済み peer 範囲を読んで自動で見張る。人が気付くのを待たずに、上流が
+      #   eslint 10 に言及した時点でテストが落ちる (保留が効いている限り package.json の
+      #   eslint は 9 のまま動かないので、「package.json を見る」判定だけでは
+      #   この条件は永久に発火しない — 判定が循環してしまう)。
+      #
+      # 効き方: `version-update:semver-major` だけを対象にするので、9 系の
+      #   minor / patch 更新は従来どおり npm-minor-and-patch グループで届く。
+      #   ただし 9 系で修正されない脆弱性が出た場合はこの ignore ごと見直す必要があるため、
+      #   放置ではなく「上流待ちの保留」として扱う (§9 依存の管理)。
+      #
+      # security updates との関係: `version-update:` 接頭辞の update-types は
+      #   version updates 向けの指定で、Dependabot security updates には適用されない
+      #   （したがって eslint に CVE が出れば、この ignore があっても security update の PR は
+      #   届く）という理解でこの形にしている。**ただしこの環境からは docs.github.com へ
+      #   到達できず裏取りできていない**ので、次の順序で扱うこと:
+      #     1. CVE が出たらまず security update の PR が来るかを確認する。
+      #     2. 来ないと分かった場合に限り、9 系へ修正が入っているならそれを取り込み、
+      #        10 系にしか修正が無いなら保留の解除ごと(= lint の破損対応込みで)判断する。
+      #   **CVE を見た時点で反射的にこの ignore を外さないこと** — 外すと eslint 10 が入り、
+      #   上に書いた lint の破損をそのまま踏む。挙動を確認できたらこの段落を確定形に直す。
+      #   参照: GitHub Docs の Dependabot options reference (ignore / update-types の節)
+      - dependency-name: "eslint"
+        update-types: ["version-update:semver-major"]
 
   # Dockerfile のベースイメージ (node 等)
   - package-ecosystem: "docker"
