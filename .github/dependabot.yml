@@ -45,12 +45,17 @@ updates:
       #   ただし 9 系で修正されない脆弱性が出た場合はこの ignore ごと見直す必要があるため、
       #   放置ではなく「上流待ちの保留」として扱う (§9 依存の管理)。
       #
-      # 未検証の注意点: Dependabot の security updates に対して、`version-update:` 接頭辞の
-      #   update-types がどう扱われるか (major 以外の security 更新まで止まらないか) は
-      #   この環境から docs.github.com へ到達できず確認できていない。もし security updates が
-      #   update-types を無視するなら、この条件は eslint 全体の無視として働きうる。
-      #   eslint に CVE が出たときは Dependabot の PR を待たず、この ignore を一時的に
-      #   外して更新を取り込むこと。上記の挙動を確認できた時点でこの段落を更新する。
+      # security updates との関係: `version-update:` 接頭辞の update-types は
+      #   version updates 向けの指定で、Dependabot security updates には適用されない
+      #   （したがって eslint に CVE が出れば、この ignore があっても security update の PR は
+      #   届く）という理解でこの形にしている。**ただしこの環境からは docs.github.com へ
+      #   到達できず裏取りできていない**ので、次の順序で扱うこと:
+      #     1. CVE が出たらまず security update の PR が来るかを確認する。
+      #     2. 来ないと分かった場合に限り、9 系へ修正が入っているならそれを取り込み、
+      #        10 系にしか修正が無いなら保留の解除ごと(= lint の破損対応込みで)判断する。
+      #   **CVE を見た時点で反射的にこの ignore を外さないこと** — 外すと eslint 10 が入り、
+      #   上に書いた lint の破損をそのまま踏む。挙動を確認できたらこの段落を確定形に直す。
+      #   参照: GitHub Docs の Dependabot options reference (ignore / update-types の節)
       - dependency-name: "eslint"
         update-types: ["version-update:semver-major"]
 

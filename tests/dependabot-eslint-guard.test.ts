@@ -109,7 +109,9 @@ interface DependabotIgnoreEntry {
 }
 interface DependabotUpdateEntry {
   "package-ecosystem"?: unknown;
+  // Dependabot は単数形の `directory` と複数形の `directories`(配列) の両方を受け付ける
   directory?: unknown;
+  directories?: unknown;
   ignore?: unknown;
 }
 interface DependabotConfig {
@@ -149,6 +151,21 @@ function ignoreNameMatches(pattern: unknown, dependencyName: string): boolean {
 }
 
 /**
+ * update ブロックが、対象ディレクトリを担当しているかを判定する。
+ *
+ * Dependabot は単数形の `directory: "/"` と複数形の `directories: ["/"]` の両方を
+ * 受け付ける。単数形だけを見ていると、複数形へ書き換えられた瞬間に「ブロックが無い」と
+ * 読み違え、実際には効いている ignore を「消えた」と報告してしまう
+ * (その指摘に従って 2 件目を足すと、今度は Dependabot が両方を適用して効きすぎる)。
+ */
+function coversDirectory(entry: DependabotUpdateEntry, directory: string): boolean {
+  // 単数形が一致すればそれで確定
+  if (entry.directory === directory) return true;
+  // 複数形の配列に含まれていれば、そのブロックが担当している
+  return asArray(entry.directories).includes(directory);
+}
+
+/**
  * 指定したエコシステムの ignore から、対象パッケージのエントリを**すべて**集める。
  *
  * 1 件目だけを取らないのは、Dependabot が同じパッケージに対する複数のエントリを
@@ -170,7 +187,9 @@ function collectIgnoreEntries(
   // 別ディレクトリのブロックに書かれた ignore を、このプロジェクトに効いていると読み違える
   const blocks = asArray(config.updates)
     .map((entry) => entry as DependabotUpdateEntry)
-    .filter((entry) => entry["package-ecosystem"] === ecosystem && entry.directory === directory);
+    .filter(
+      (entry) => entry["package-ecosystem"] === ecosystem && coversDirectory(entry, directory),
+    );
   // 該当ブロックの ignore から対象パッケージに当たるエントリをすべて集めて返す
   // (完全一致だけでなく `*` / `eslint*` のようなワイルドカードも拾う)
   return blocks.flatMap((block) =>
@@ -367,10 +386,13 @@ describe("dependabot.yml の ESLint major 保留", () => {
     }
   });
 
-  // 保留そのものが無ければ、この検査は対象外 (skip として CI の出力にも現れる)。
-  // 上流が出揃って ignore を消したあと、このテストだけが赤く残り続けて
-  // 「もう存在しない ignore を消せ」と言い続ける状態を避ける
-  it.skipIf(ignoreEntries.length === 0)(
+  // 次のどちらかなら、この検査は対象外 (skip として CI の出力にも現れる):
+  //   - 保留そのものが無い … 上流が出揃って ignore を消したあと、このテストだけが
+  //     赤く残り続けて「もう存在しない ignore を消せ」と言い続ける状態を避ける
+  //   - 上流を 1 つも読み取れていない … 前提が崩れているだけなのに blockingPeers が空になり、
+  //     「全員が許した」と読める文言で保留の削除を促してしまう。前提崩れは
+  //     直前の「上流プラグインがすべて読み取れる」テストが専用の文言で落とす役割
+  it.skipIf(ignoreEntries.length === 0 || upstreamPeers.length === 0)(
     "上流がまだ次の major に対応していない (= 保留の理由が残っている)",
     () => {
       // 上流のどれか 1 つでも次の major を許していなければ、保留はまだ必要。
@@ -399,7 +421,16 @@ describe("dependabot.yml の ESLint major 保留", () => {
       // 2 件目 (ワイルドカード `*` を含む) が足された場合もここで落ちる
       // (Dependabot は複数の条件をすべて適用するため、update-types 無しのエントリが
       //  1 件混ざるだけで全バージョンが止まる)
-      expect(ignoreEntries).toHaveLength(1);
+      expect(
+        ignoreEntries,
+        `${GUARDED_ECOSYSTEM} / ${GUARDED_DIRECTORY} のブロックに ` +
+          `${GUARDED_DEPENDENCY} の ignore がちょうど 1 件ある状態を保ってください。` +
+          `0 件なら削除されたか、別エコシステム(docker 等)・別ディレクトリのブロックへ` +
+          `移されています。2 件以上なら Dependabot が両方を適用し、意図より広く止まります。` +
+          `この保留が要る理由は .github/dependabot.yml のコメントと CLAUDE.md ` +
+          `「ESLint は 9 系に意図的に留め置いている」を参照 (消すと lint が ` +
+          `contextOrFilename.getFilename is not a function で落ちます)。`,
+      ).toHaveLength(1);
       // 名前が eslint そのものであること。`*` へ**書き換えられた**場合、
       // 件数も update-types もキー集合も想定どおりのまま素通りしてしまうが、
       // 実際には npm の全パッケージの major 更新が止まる (next / prisma / react …)
