@@ -3,7 +3,7 @@
 //
 // なぜテストで縛るのか:
 //   この ignore は「上流のプラグイン群 (eslint-config-next が引き込む eslint-plugin-react /
-//   -import / -jsx-a11y / -react-hooks) が ESLint 10 に未対応な間だけ」有効な
+//   -import / -jsx-a11y など) が ESLint 10 に未対応な間だけ」有効な
 //   一時的な措置で、外す条件はコメントにしか書かれていない。人手の約束のままだと、
 //   上流が対応して eslint を 10 系へ上げた日に ignore を消し忘れる。消し忘れても
 //   lint も型チェックも通るので誰も気付かないまま、**その先の major (11 以降) が
@@ -29,8 +29,9 @@
 //       判定は永久に発火しない(判定が循環している)。そこで上流の peer 範囲を
 //       package-lock.json から直接読み、保留の理由が消えた時点で落とす。
 //       判定対象は eslint-plugin-react 1 つではなく、REQUIRED_UPSTREAM_PLUGINS に
-//       明示した「実際に eslint を制限しているプラグイン」全部。1 つだけが先に
-//       対応しても lint は落ちたままなので、全部が揃って初めて保留を外せる。
+//       明示した「同じ lint 実行に載り、eslint に peer 依存を宣言しているもの」全部
+//       (現時点で 9 系に制限しているかは問わない)。1 つだけが先に対応しても
+//       lint は落ちたままなので、全部が揃って初めて保留を外せる。
 //
 // **なぜ YAML パーサ (yaml) を使うのか**:
 //   設定を自前でテキストとして読むと、この検査の本体である「YAML を正しく読む」部分が
@@ -89,26 +90,62 @@ const HELD_MAJOR = 9;
 // 保留の起点になっている設定パッケージ。ここが引き込むプラグイン群が
 // eslint のどこまでを許すかで、保留を外せるかどうかが決まる
 const UPSTREAM_CONFIG_PACKAGE = "eslint-config-next";
-// **eslint を 9 系までに制限しているプラグインの一覧(この検査の対象そのもの)。**
+// **同じ lint 実行に載り、eslint に peer 依存するルールプラグインの一覧
+// (この検査が peer 範囲を見張る対象そのもの)。**
 // 期限判定はここに挙げた全員が次の major を許したときだけ発火する。
 //
-// 「eslint に peer 依存するもの全部」を機械的に集めない理由は 2 つある:
-//   - 緩いものが混ざると誤報になる … 同じ設定パッケージ配下でも
-//     eslint-import-resolver-typescript の peer は `*`、typescript-eslint は既に `^10` を
-//     含む。これらを数に入れると、本当に制限しているプラグインが走査から外れた瞬間に
-//     「全員が 10 を許した」と読めてしまい、保留解除を促してしまう。
-//   - 無関係なものが混ざると解除できなくなる … eslint に peer 依存するだけの別パッケージが
-//     9 に留まっているせいで、条件を満たしても永久に発火しなくなる。
+// **「今 9 系に制限しているか」で出し入れしない — 載るなら制限の有無を問わず挙げる。**
+// 現時点で eslint-plugin-react-hooks (7.1.1) の peer は
+// `... || ^9.0.0 || ^10.0.0` で既に 10 を許しており、保留を実際に塞いでいるのは
+// 残る 3 つ (react: `^9.7` まで / import・jsx-a11y: `^9` まで) だけ。それでも
+// react-hooks を一覧に残すのは、**将来 peer が狭まったことを検出できる唯一の経路が
+// ここだから**。外すと「react-hooks が 10 非対応の版へ差し替わり、同時に他の 3 つが
+// 10 対応した」ときに blockingPeers が空になり、期限判定が「全部 10 を許した、
+// ignore を消せ」と誤って指示する (従うと lint が壊れる)。
+// 逆に一覧へ残しておけば、その版が blockingPeers に現れて保留が正しく維持される。
 //
-// **同じ lint 実行に載るプラグインを増やしたら(直接 devDependency として足した場合も
-// 含めて)、それが eslint を制限しているならここへ追加する。** 列挙したものが
-// ロックファイルから 1 つでも読み取れなければ前提崩れとして落ちる (fail-closed)
+// **一覧の決め方(この規則で機械的に導ける):**
+//   `eslint-config-next` の直接依存のうち、**eslint に peer 依存を宣言しているもの全部**。
+//   eslint.config.mjs は core-web-vitals と typescript の両方を読み込むので、
+//   同 config の直接依存はすべて同じ lint 実行に載る。
+//   2026-08 時点の該当は以下 6 つ(範囲は package-lock.json の解決済み値):
+//     eslint-plugin-react               ^9.7 まで   ← 保留を塞いでいる
+//     eslint-plugin-import              ^9   まで   ← 保留を塞いでいる
+//     eslint-plugin-jsx-a11y            ^9   まで   ← 保留を塞いでいる
+//     eslint-plugin-react-hooks         ^10 を許す
+//     typescript-eslint                 ^10 を許す
+//     eslint-import-resolver-typescript `*`(常に充足)
+//
+// **peer 依存を宣言していないものはここへ入れられない。**
+//   @next/eslint-plugin-next / eslint-import-resolver-node / globals は同じ lint 実行に
+//   載るが peerDependencies.eslint を持たない。collectUpstreamPeers は peer 範囲が
+//   文字列で書かれているものしか拾わないため、入れると upstreamPeers が一覧より
+//   短いままになり、**期限判定が永久に skip され、存在確認が永久に落ちる**
+//   (検出網が両方向に死ぬ)。追跡したくなったら、まず「存在確認」と「peer 範囲の評価」を
+//   別の一覧に分ける設計変更が要る。
+//
+// **eslint.config.mjs へ直接 spread したプラグイン**は規則の外側なので、
+//   この一覧と LOCALLY_ADDED_LINT_PLUGINS の両方へ足す(下のコメント参照)。
+//
+// 規則どおりかは下の「規則から導いた一覧と一致する」テストが機械的に照合する
+// (上流が新しい制限付き依存を足したときに手で気付く必要がないようにするため)。
 const REQUIRED_UPSTREAM_PLUGINS = [
   "eslint-plugin-react",
   "eslint-plugin-import",
   "eslint-plugin-jsx-a11y",
   "eslint-plugin-react-hooks",
+  "typescript-eslint",
+  "eslint-import-resolver-typescript",
 ];
+
+// REQUIRED_UPSTREAM_PLUGINS のうち、**規則では導けない分**の受け皿。
+// 判定基準は「設定パッケージの依存かどうか」であって devDependencies への記載有無ではない
+// (上流のプラグインを版固定のため devDependencies に書いても、規則側で導けるのでここには不要)。
+// eslint.config.mjs へ直接 spread したプラグインだけがここへ来る。
+// 受け皿が無いと、それを足した瞬間に規則照合が永久に落ち、直す手段が
+// 「一覧から外す」= 検出網に穴を開けることしか無くなる。
+// 現在は該当なし — eslint.config.mjs は eslint-config-next の 2 つの入口だけを読む
+const LOCALLY_ADDED_LINT_PLUGINS: string[] = [];
 
 // dependabot.yml のうち、この検査が読む部分だけを表す型。
 // 全項目を書き写すと設定を増やすたびに型の更新が要るので、必要な枝だけ宣言する
@@ -266,41 +303,132 @@ interface UpstreamPeer {
 }
 
 /**
+ * ロックファイルの `packages` 枝 (パッケージのパス → メタデータ) を取り出す。
+ *
+ * 形が違えば空オブジェクトを返し、呼び出し側が「1 つも読めなかった」ものとして
+ * 落ちる方向へ倒す (fail-closed)。読み取りの入口を 1 か所に集めておくことで、
+ * 下の 2 つの走査が同じ前提で動くことを保証する (§6 DRY)。
+ */
+function readLockPackages(lock: unknown): Record<string, unknown> {
+  // トップレベルがオブジェクトでなければ読み進めない
+  if (typeof lock !== "object" || lock === null) return {};
+  // packages の枝を取り出す
+  const packages = (lock as { packages?: unknown }).packages;
+  // それ自体がオブジェクトでなければ、やはり読み進めない
+  if (typeof packages !== "object" || packages === null) return {};
+  // 型を絞った参照を返す
+  return packages as Record<string, unknown>;
+}
+
+/**
+ * 指定パッケージが宣言している eslint の peer 範囲を返す (無ければ undefined)。
+ *
+ * **この 1 か所が「監視対象になりうるか」の唯一の判定**。下の 2 つの走査
+ * (規則から導く / 一覧の範囲を集める) が同じ条件で動かないと、
+ * 件数一致を見る skipIf が意味を失うため、条件をここへ集約する (§6 DRY)。
+ */
+function readEslintPeerRange(
+  table: Record<string, unknown>,
+  name: string,
+): string | undefined {
+  // そのパッケージのロックエントリを引く (設定パッケージ配下の入れ子 → 巻き上げの順)
+  const meta = findLockEntry(table, UPSTREAM_CONFIG_PACKAGE, name);
+  // 引けなければ判定できない
+  if (!meta) return undefined;
+  // eslint に対する peer 範囲を取り出す
+  const range = asRecord(meta.peerDependencies)[GUARDED_DEPENDENCY];
+  // 文字列で宣言されているものだけを採用する (宣言が無い/形が違うものは対象外)
+  return typeof range === "string" ? range : undefined;
+}
+
+/**
+ * 一覧の決め方(規則)をロックファイルから実際に導く。
+ *
+ * `eslint-config-next` の直接依存を読み、そのうち `peerDependencies.eslint` を
+ * **文字列で**宣言しているものだけを返す。REQUIRED_UPSTREAM_PLUGINS はこの規則で
+ * 決めると宣言しているので、宣言どおりかを機械的に照合するために使う。
+ *
+ * これが無いと、上流が新しく「eslint を 9 までに制限する依存」を足したときに
+ * 一覧から漏れたまま気付けない。漏れた分は blockingPeers に現れないので、既存の
+ * 監視対象が 10 対応した時点で期限判定が「全部そろった、ignore を消せ」と誤って指示する。
+ *
+ * **この repo 自身の devDependency として lint に載せたプラグインはここには現れない**
+ * (設定パッケージの依存ではないため)。それらは LOCALLY_ADDED_LINT_PLUGINS 側に書く。
+ *
+ * 見つからない・形が違う場合は空配列を返し、呼び出し側の一致比較を落とす (fail-closed)。
+ */
+function deriveExpectedPlugins(lock: unknown): string[] {
+  // packages 枝を共通ヘルパーで取り出す
+  const table = readLockPackages(lock);
+  // 設定パッケージ自身のロックエントリを引く
+  const config = table[`node_modules/${UPSTREAM_CONFIG_PACKAGE}`];
+  // 無ければ導けない (fail-closed)
+  if (typeof config !== "object" || config === null) return [];
+  // その直接依存 (名前 → 範囲) を取り出す
+  const dependencies = asRecord((config as Record<string, unknown>).dependencies);
+  // 直接依存のうち eslint への peer 宣言があるものだけを採る
+  return Object.keys(dependencies).filter(
+    (name) => readEslintPeerRange(table, name) !== undefined,
+  );
+}
+
+/**
  * REQUIRED_UPSTREAM_PLUGINS に挙げたプラグインの eslint peer 範囲をロックファイルから集める。
  *
- * **「eslint に peer 依存するものを機械的に全部」ではなく、明示した一覧だけを見る。**
- * 同じ設定パッケージ配下にも peer が `*` や `^10` を含む緩いパッケージが混ざっており、
- * それらを数に入れると、本当に制限しているプラグインが走査から外れた瞬間に
- * 「全員が次の major を許した」と読めてしまう (= 誤って保留解除を促す)。
- * 逆に無関係な 9 止まりのパッケージが混ざると、条件を満たしても永久に発火しなくなる。
+ * **ロックファイルを機械的に走査するのではなく、明示した一覧だけを見る。**
+ * 「eslint に peer 依存するもの全部」を自動で拾うと、lint 実行に載らない無関係な
+ * パッケージ (依存の依存など) まで数に入り、それが 9 に留まっているせいで条件を
+ * 満たしても永久に発火しなくなる。何を見張るかは一覧側で明示的に決める
+ * (決め方の規則は REQUIRED_UPSTREAM_PLUGINS のコメント)。
+ *
+ * **peer 範囲が文字列で書かれているものしか拾わない。** peerDependencies.eslint を
+ * 持たないパッケージを一覧へ入れると、ここで取りこぼされて戻り値が一覧より短くなり、
+ * 呼び出し側の件数一致チェックが永久に成立しなくなる (同コメントの注意書きを参照)。
  *
  * 一覧に挙げたものが見つからなければ、その分は戻り値に現れない。呼び出し側は
  * 「全員そろって読み取れたか」を別途確かめ、欠けていれば前提崩れとして落とす (fail-closed)。
  */
 function collectUpstreamPeers(lock: unknown): UpstreamPeer[] {
-  // トップレベルがオブジェクトでなければ読み進めない
-  if (typeof lock !== "object" || lock === null) return [];
-  // packages の枝 (パッケージのパス → メタデータ) を取り出す
-  const packages = (lock as { packages?: unknown }).packages;
-  // それ自体がオブジェクトでなければ、やはり読み進めない
-  if (typeof packages !== "object" || packages === null) return [];
-  // 型を絞った参照を用意する
-  const table = packages as Record<string, unknown>;
+  // packages 枝を共通ヘルパーで取り出す
+  const table = readLockPackages(lock);
   // 集めた peer 範囲を溜める配列
   const peers: UpstreamPeer[] = [];
   // 明示した一覧だけを順に見ていく
   for (const name of REQUIRED_UPSTREAM_PLUGINS) {
-    // そのパッケージのロックエントリを引く (設定パッケージ配下の入れ子 → 巻き上げの順)
-    const meta = findLockEntry(table, UPSTREAM_CONFIG_PACKAGE, name);
-    // 見つからなければ戻り値に含めない (呼び出し側の存在確認で落ちる)
-    if (!meta) continue;
-    // eslint に対する peer 範囲を取り出す
-    const range = asRecord(meta.peerDependencies)[GUARDED_DEPENDENCY];
-    // 文字列で書かれていれば採用する
-    if (typeof range === "string") peers.push({ name, range });
+    // eslint への peer 範囲を共通ヘルパーで読む (判定条件は 1 か所に集約)
+    const range = readEslintPeerRange(table, name);
+    // 宣言が無い / 読めないものは戻り値に含めない (呼び出し側の存在確認で落ちる)
+    if (range === undefined) continue;
+    // 読めた範囲を採用する
+    peers.push({ name, range });
   }
   // 見つかった分を返す
   return peers;
+}
+
+/**
+ * パッケージ名の一覧を比較用に正規化する (並び順は意味を持たないので揃える)。
+ *
+ * skipIf の判定 (sameNameSet) と規則照合テストの `toEqual` が**同じ正規化**を通ることで、
+ * 片方だけ条件が変わって「skip されるのに落ちない / 落ちるのに skip されない」という
+ * 食い違いが起きないようにする (§6 DRY)。
+ */
+function sortedNames(names: readonly string[]): string[] {
+  // 元の配列を壊さないよう複製してから並べ替える
+  return [...names].sort();
+}
+
+/**
+ * 2 つのパッケージ名一覧が「集合として」一致するかを返す。
+ *
+ * 期限判定を走らせてよいか (= 一覧が規則どおりか) の判断に使う。
+ */
+function sameNameSet(left: readonly string[], right: readonly string[]): boolean {
+  // 先に件数で振るう (違えば中身を見るまでもない)
+  if (left.length !== right.length) return false;
+  // 同じ正規化を通してから 1 要素ずつ突き合わせる
+  const sortedRight = sortedNames(right);
+  return sortedNames(left).every((name, index) => name === sortedRight[index]);
 }
 
 /**
@@ -383,6 +511,11 @@ describe("dependabot.yml の ESLint major 保留", () => {
 
   // ロックファイルに記録されている上流プラグイン群の peer 範囲
   const upstreamPeers = collectUpstreamPeers(packageLock);
+  // 規則 (設定パッケージの直接依存 ＋ repo 固有分) から導いた「見張るべき一覧」
+  const derivedPlusLocal = [...deriveExpectedPlugins(packageLock), ...LOCALLY_ADDED_LINT_PLUGINS];
+  // 一覧が規則どおりか。ずれているなら「見張るべきなのに見張れていない」ものが居る。
+  // 下の規則照合テストと同じ正規化 (sortedNames) を通すので、判定が食い違わない
+  const pluginListMatchesRule = sameNameSet(derivedPlusLocal, REQUIRED_UPSTREAM_PLUGINS);
   // 留め置きを外せるかの判定に使う「次の major」の代表バージョン
   const nextMajorVersion = `${HELD_MAJOR + 1}.0.0`;
   // 次の major をまだ許していない上流 (= 保留の理由として残っているもの)
@@ -402,6 +535,38 @@ describe("dependabot.yml の ESLint major 保留", () => {
     ).not.toBeNull();
   });
 
+  it("REQUIRED_UPSTREAM_PLUGINS が規則から導いた一覧と一致する", () => {
+    // 規則 (eslint-config-next の直接依存のうち eslint に peer 依存を宣言しているもの) を
+    // ロックファイルから実際に導く
+    // 規則から導いた一覧が「正」。手書きの REQUIRED_UPSTREAM_PLUGINS を received 側に
+    // 置くことで、Vitest の差分が「期待 = 規則 / 実際 = 手書き」の向きで表示される
+    // (逆にすると、古い手書きの一覧が正であるかのように読めてしまう)
+    const expected = sortedNames(derivedPlusLocal);
+    // 並び順は意味を持たないので、両方を並べ替えてから比較する
+    expect(
+      sortedNames(REQUIRED_UPSTREAM_PLUGINS),
+      `REQUIRED_UPSTREAM_PLUGINS が規則からずれています。` +
+        `規則は「${UPSTREAM_CONFIG_PACKAGE} の直接依存のうち ${GUARDED_DEPENDENCY} に ` +
+        `peer 依存を宣言しているもの全部 ＋ LOCALLY_ADDED_LINT_PLUGINS」で、` +
+        `規則から導けるのは [${expected.join(", ") || "なし"}]、` +
+        `一覧に書かれているのは [${sortedNames(REQUIRED_UPSTREAM_PLUGINS).join(", ")}]。` +
+        `**一覧に足りないものがあるなら、そのパッケージは lint 実行に載るのに ` +
+        `見張られていません** — 9 系に留まったまま他が 10 対応すると、期限判定が誤って ` +
+        `保留解除を促します(そのため一覧がずれている間、期限判定は skip されます)。` +
+        `上流の依存構成が変わったなら REQUIRED_UPSTREAM_PLUGINS を合わせてください。` +
+        `${UPSTREAM_CONFIG_PACKAGE} の依存ではなく eslint.config.mjs へ直接載せた ` +
+        `プラグインなら、REQUIRED_UPSTREAM_PLUGINS と LOCALLY_ADDED_LINT_PLUGINS の ` +
+        `両方へ足すと一致します。` +
+        `**一覧の増減は .github/dependabot.yml と CLAUDE.md §3 の説明にも反映してください** ` +
+        `(そちらは機械検査が無いので、直さないとコードと説明が食い違ったまま残ります)。`,
+    ).toEqual(expected);
+  });
+
+  // 上の規則照合と重なる部分はあるが、独立した意味がある:
+  //   - LOCALLY_ADDED_LINT_PLUGINS の分は規則からは導けないので、そちらが
+  //     ロックファイルから読めなくなったことはこの検査でしか分からない。
+  //   - 期限判定の skip 条件 (件数一致) が拠り所にしているのはこの検査の文言なので、
+  //     「なぜ skip されたか」を専用のメッセージで示す役割も持つ。
   it("保留の理由になっている上流プラグインが、すべてロックファイルから読み取れる", () => {
     // 走査で拾えたパッケージ名の一覧
     const found = upstreamPeers.map((peer) => peer.name);
@@ -421,23 +586,68 @@ describe("dependabot.yml の ESLint major 保留", () => {
   // 次のどちらかなら、この検査は対象外 (skip として CI の出力にも現れる):
   //   - 保留そのものが無い … 上流が出揃って ignore を消したあと、このテストだけが
   //     赤く残り続けて「もう存在しない ignore を消せ」と言い続ける状態を避ける
-  //   - 上流を 1 つも読み取れていない … 前提が崩れているだけなのに blockingPeers が空になり、
+  //   - 上流を 1 つでも読み取れていない … 前提が崩れているだけなのに blockingPeers が空になり、
   //     「全員が許した」と読める文言で保留の削除を促してしまう。前提崩れは
   //     直前の「上流プラグインがすべて読み取れる」テストが専用の文言で落とす役割
-  it.skipIf(ignoreEntries.length === 0 || upstreamPeers.length === 0)(
+  //
+  // **判定は「1 つも読めない」ではなく「全員そろって読めたか」で行う。** `=== 0` だと
+  // 部分的にしか読めていないとき(例: 既に 10 を許しているものだけが読め、実際に
+  // 制限しているものがロックファイルの想定パスから消えた場合)に skip されず、
+  // blockingPeers が空になって「すべてが eslint 10 を許すようになりました … ignore を
+  // 削除してください」という**事実と異なる指示**が出る。直前の存在確認も同時に落ちるので
+  // CI 自体は赤のままだが、2 つの失敗のうち誤った方に従って ignore を消すと eslint 10 が
+  // 入り、contextOrFilename.getFilename is not a function で lint が壊れる。
+  // collectUpstreamPeers は REQUIRED_UPSTREAM_PLUGINS ぶんしか走査しないので、
+  // 全員そろった状態は「件数が一覧の長さと一致すること」で表せる。
+  //
+  // **一覧そのものが規則からずれているときも判定しない (pluginListMatchesRule)。**
+  // 件数一致は「一覧に挙げた分が全部読めたか」しか見ておらず、**一覧に挙げ忘れている**
+  // ものは検知できない。上流が「eslint を 9 に制限する直接依存」を新設し、既存の
+  // 監視対象が全部 10 対応した場合、upstreamPeers は一覧どおり全部読めるので件数は
+  // 一致し、blockingPeers は空になって「全部 10 を許した、ignore を消せ」と誤指示する
+  // (新設分は走査対象外なので blockingPeers に現れない)。規則照合テストも同時に落ちるが、
+  // 2 つの失敗のうち誤った方に従うと lint が壊れるのは部分読み取りのときと同じ。
+  // ずれているあいだは「まだ判定できない」として skip し、規則照合テスト側の
+  // 専用メッセージに任せる
+  it.skipIf(
+    ignoreEntries.length === 0 ||
+      upstreamPeers.length !== REQUIRED_UPSTREAM_PLUGINS.length ||
+      !pluginListMatchesRule,
+  )(
     "上流がまだ次の major に対応していない (= 保留の理由が残っている)",
     () => {
       // 上流のどれか 1 つでも次の major を許していなければ、保留はまだ必要。
       // **全部が許すようになって初めて**保留を外せる — eslint-plugin-react だけが
-      // 先に対応しても、同じ lint 実行に載る import / jsx-a11y / react-hooks が
-      // 9 までに制限したままなら lint は落ちるため。
+      // 先に対応しても、同じ lint 実行に載る他のプラグインが 9 までに制限したままなら
+      // lint は落ちるため
+      // (react-hooks / typescript-eslint / eslint-import-resolver-typescript は現時点で
+      //  既に 10 を許しているが、将来狭まる可能性があるので判定対象からは外さない。
+      //  理由は REQUIRED_UPSTREAM_PLUGINS のコメント)。
       // ここで落ちたら「上流が出揃った」合図。ignore を外して major 更新を取りにいく
       // (この検査が無いと、保留が効いている限り package.json は 9 のまま動かず、
       //  package.json の major を見る判定が永久に発火しないという循環に陥る)
       expect(
         blockingPeers.map((peer) => peer.name),
-        `${UPSTREAM_CONFIG_PACKAGE} 配下のすべてが eslint ${nextMajorVersion} を許すようになりました` +
-          `(${upstreamPeers.map((peer) => `${peer.name}: ${peer.range}`).join(", ")})。` +
+        // 「配下のすべて」とは書かない — 実際に見たのは REQUIRED_UPSTREAM_PLUGINS に
+        // 挙げた分だけで、peer 依存を宣言していないもの(@next/eslint-plugin-next 等)は
+        // そもそも走査できていない。評価した対象を明示しないと、読み手が
+        // 「もう何も確認せず ignore を消してよい」と受け取ってしまう。
+        // `*` のような常に充足する範囲は「10 に対応した」という表明ではないので、
+        // 対応の根拠として並べず、未表明であることが分かる印を付ける
+        `${UPSTREAM_CONFIG_PACKAGE} 配下の監視対象プラグイン` +
+          `(${REQUIRED_UPSTREAM_PLUGINS.length} 件)がすべて eslint ${nextMajorVersion} を許すようになりました` +
+          `(${upstreamPeers
+            .map(
+              (peer) =>
+                `${peer.name}: ${peer.range}${
+                  // どんな版でも充足する範囲は互換性を何も述べていない。
+                  // 読み手が「このパッケージも 10 対応済み」と誤読しないよう注記する
+                  satisfies("0.0.0", peer.range) ? " ※常に充足。10 対応の表明ではない" : ""
+                }`,
+            )
+            .join(", ")})。` +
+          `peer 依存を宣言していないプラグイン(@next/eslint-plugin-next 等)は` +
+          `この判定に含まれていないので、削除前に別途確認してください。` +
           `.github/dependabot.yml の ignore とこのテストを削除し、eslint の major 更新を` +
           `取り込んでください。`,
       ).not.toHaveLength(0);
