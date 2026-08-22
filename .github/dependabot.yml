@@ -28,10 +28,20 @@ updates:
       #   で exit code 2 になる (Dependabot PR #39 の CI 失敗、および eslint@10.8.1 を
       #   入れてローカル再現済み)。アプリ側の eslint.config.mjs では回避できず、
       #   ESLint 10 対応版の eslint-plugin-react も現時点で存在しない。
+      #   なお同じ lint 実行に載る eslint-plugin-react-hooks / typescript-eslint /
+      #   eslint-import-resolver-typescript は既に eslint 10 を許しているため、
+      #   現時点で保留を塞いでいるのは react (`^9.7`) / import (`^9`) / jsx-a11y (`^9`)
+      #   の 3 つ。ただし後述のテストは「eslint に peer 依存を宣言している直接依存」
+      #   全部を見張る (いま緩いものが将来狭まる可能性があり、
+      #   外すと誤って保留解除を促すため)。
       #
       # 外す条件: eslint-config-next が引き込む eslint プラグイン **すべて**
-      #   (eslint-plugin-react / -import / -jsx-a11y / -react-hooks) の peerDependencies が
+      #   (eslint に peer 依存を宣言している直接依存) の peerDependencies が
       #   eslint 10 以上を含む版になったら、この ignore を削除して major 更新を取る。
+      #   **ただしこれだけでは十分条件にならない** — @next/eslint-plugin-next のように
+      #   peer 依存を宣言しないプラグインは同じ lint 実行に載るのに自動判定できない。
+      #   テストが「出揃った」と言ってきたら、削除前にそれらを別途確認すること
+      #   (この限界は tests/dependabot-eslint-guard.test.ts のコメントにも書いてある)。
       #   **react 1 つだけが対応しても外せない** — 同じ lint 実行に載る他のプラグインが
       #   eslint を 9 までに制限したままなら、結局 lint は落ちる。
       #   この条件は tests/dependabot-eslint-guard.test.ts が package-lock.json の
