@@ -191,7 +191,12 @@ function asArray(value: unknown): unknown[] {
  * このファイルが掲げている「何を直せばよいか分かる日本語の失敗文言」が一切出ない。
  *
  * そこで読めない形の要素はここで落とし、「そのエントリは無かった」ものとして扱う。
- * 数が減る方向なので、呼び出し側の件数検査は本来の文言のまま落ちる (fail-closed)。
+ *
+ * **ただし「落とした」こと自体は握り潰さない。** 落とすだけだと、正しいエントリの
+ * *隣* に空要素が増えたケース (`[{...}, null]`) で件数が変わらず、設定が壊れている
+ * のに全検査が緑になる — 直前まで収集時エラーで赤かったものが静かに通るので、
+ * 修正がかえって検出網を緩めてしまう。下の countUnreadableElements で数を突き合わせ、
+ * 読めない要素が 1 つでもあれば専用の検査が落ちるようにしてある。
  */
 function objectElementsOf(value: unknown): Record<string, unknown>[] {
   // 配列でなければ空配列 (= 要素なし) にしてから、要素を 1 つずつ振るう
@@ -200,6 +205,30 @@ function objectElementsOf(value: unknown): Record<string, unknown>[] {
     (entry): entry is Record<string, unknown> =>
       typeof entry === "object" && entry !== null && !Array.isArray(entry),
   );
+}
+
+/**
+ * 設定の中に「読めない形のリスト要素」がいくつあるかを数える。
+ *
+ * objectElementsOf が振るい落とした分がそのまま「設定として壊れている箇所」の数になる。
+ * 数えるのは実際に読んでいる 2 か所 — `updates` 直下と、各ブロックの `ignore` 直下。
+ *
+ * これを検査しないと、空要素 `-` が正しいエントリの隣に増えたときに件数が変わらず、
+ * 壊れた設定のまま緑になる。**Dependabot がこの形の設定をどう扱うかは
+ * docs.github.com へ到達できず裏取りできていない**ので、「無害だから通してよい」とは
+ * 判断せず、意図して書いた形でない時点で落とす (fail-closed)。
+ */
+function countUnreadableElements(config: DependabotConfig): number {
+  // updates 直下で振るい落とされた数 (元の要素数 − 読めた要素数)
+  const blocks = objectElementsOf(config.updates);
+  let unreadable = asArray(config.updates).length - blocks.length;
+  // 読めたブロックそれぞれについて、ignore 直下も同じ基準で数える
+  for (const block of blocks) {
+    // ignore の元の要素数から、読めた要素数を引いた分が壊れている箇所
+    unreadable += asArray(block.ignore).length - objectElementsOf(block.ignore).length;
+  }
+  // 合計を返す (0 なら設定内に読めない要素は無い)
+  return unreadable;
 }
 
 /**
@@ -282,19 +311,18 @@ function collectIgnoreEntries(
   // updates 直下から「エコシステムとディレクトリの両方が一致する」ブロックを集める。
   // エコシステムだけで最初の 1 件を採ると、npm のブロックが複数ある構成 (モノレポ等) で
   // 別ディレクトリのブロックに書かれた ignore を、このプロジェクトに効いていると読み違える
-  // 読める形 (オブジェクト) の要素だけを見る。空要素 `-` が混ざっていても収集時エラーにしない
-  const blocks = objectElementsOf(config.updates)
-    .map((entry) => entry as DependabotUpdateEntry)
-    .filter(
-      (entry) => entry["package-ecosystem"] === ecosystem && coversDirectory(entry, directory),
-    );
+  // 読める形 (オブジェクト) の要素だけを見る。空要素 `-` が混ざっていても収集時エラーにしない。
+  // objectElementsOf は既に Record を返すので、以前あった `as` での読み替えは不要
+  const blocks = objectElementsOf(config.updates).filter(
+    (entry) => entry["package-ecosystem"] === ecosystem && coversDirectory(entry, directory),
+  );
   // 該当ブロックの ignore から対象パッケージに当たるエントリをすべて集めて返す
   // (完全一致だけでなく `*` / `eslint*` のようなワイルドカードも拾う)。
   // ignore 側のリストにも空要素は書けるので、同じヘルパーで振るう
   return blocks.flatMap((block) =>
-    objectElementsOf(block.ignore)
-      .map((entry) => entry as DependabotIgnoreEntry)
-      .filter((entry) => ignoreNameMatches(entry["dependency-name"], dependencyName)),
+    objectElementsOf(block.ignore).filter((entry) =>
+      ignoreNameMatches(entry["dependency-name"], dependencyName),
+    ),
   );
 }
 
@@ -522,8 +550,15 @@ function readDevDependencyRange(json: unknown, dependencyName: string): unknown 
 }
 
 describe("dependabot.yml の ESLint major 保留", () => {
-  // Dependabot 設定を構造として読む (コメントはパーサが落とすので検査に混ざらない)
-  const dependabotConfig = parseYaml(readFileSync(DEPENDABOT_PATH, "utf8")) as DependabotConfig;
+  // Dependabot 設定を構造として読む (コメントはパーサが落とすので検査に混ざらない)。
+  // **パース結果は null にもなる** — 空ファイルや、全体をコメントアウトしたファイルが該当する
+  // (どちらも実測済み)。null のまま枝を読むと describe のトップレベルで TypeError になり、
+  // 全検査が収集時エラーとして落ちてこのファイルの日本語文言が一切出ない。
+  // asRecord でオブジェクトへ均しておけば、updates が空として扱われ、
+  // 「ignore がちょうど 1 件」の検査が本来の文言で落ちる (fail-closed)
+  const dependabotConfig: DependabotConfig = asRecord(
+    parseYaml(readFileSync(DEPENDABOT_PATH, "utf8")),
+  );
   // package.json も同様に unknown で受けてから絞る
   const packageJson: unknown = JSON.parse(readFileSync(PACKAGE_JSON_PATH, "utf8"));
   // ロックファイル (上流プラグイン群の peer 範囲を読むため)
@@ -532,6 +567,8 @@ describe("dependabot.yml の ESLint major 保留", () => {
   const declaredRange = readDevDependencyRange(packageJson, GUARDED_DEPENDENCY);
   // 許容している最小 major (解釈できなければ null)
   const allowedMajor = parseAllowedMajor(declaredRange);
+  // 設定内にオブジェクトとして読めないリスト要素がいくつあるか (0 が正常)
+  const unreadableElementCount = countUnreadableElements(dependabotConfig);
   // npm エコシステムの ignore にある eslint のエントリ (複数書かれていればすべて)
   const ignoreEntries = collectIgnoreEntries(
     dependabotConfig,
@@ -551,6 +588,24 @@ describe("dependabot.yml の ESLint major 保留", () => {
   const nextMajorVersion = `${HELD_MAJOR + 1}.0.0`;
   // 次の major をまだ許していない上流 (= 保留の理由として残っているもの)
   const blockingPeers = upstreamPeers.filter((peer) => !satisfies(nextMajorVersion, peer.range));
+
+  it(".github/dependabot.yml に読めない形のリスト要素が無い", () => {
+    // 空要素 `-` (ブロックをコメントアウトした残り) が混ざっていないかを見る。
+    // この検査が無いと、正しいエントリの**隣**に空要素が増えたケースで
+    // ignore の件数が変わらず、壊れた設定のまま全検査が緑になる。
+    // 読み手側 (このテスト) が黙って読み飛ばすようになった分、
+    // 「意図して書いた形か」は独立した検査で担保する
+    expect(
+      unreadableElementCount,
+      `.github/dependabot.yml の updates / ignore に、オブジェクトとして読めない` +
+        `リスト要素が ${unreadableElementCount} 個あります。` +
+        `ブロックをコメントアウトしたときに残った空要素 \`-\` が典型です。` +
+        `この検査はそれを読み飛ばすので、放置すると設定が壊れたまま他の検査が緑になります。` +
+        `不要な \`-\` を削除してください` +
+        `(Dependabot 側がこの形をどう扱うかはこの環境から裏取りできていないため、` +
+        `無害と決めつけず意図した形でない時点で落としています)。`,
+    ).toBe(0);
+  });
 
   it("package.json の eslint バージョン範囲が、このテストで解釈できる形で書かれている", () => {
     // ここが落ちると、下の構造検査とダウングレード検査が skip され、
@@ -720,7 +775,10 @@ describe("dependabot.yml の ESLint major 保留", () => {
       expect(ignoreEntries[0]?.["update-types"]).toEqual([MAJOR_UPDATE_TYPE]);
       // 書かれているキーがちょうど想定どおりであること。`versions` のような
       // 別の絞り込みが足されると、update-types が正しくても効き方が変わってしまう
-      expect(sortedKeysOf(ignoreEntries[0])).toEqual([...ALLOWED_IGNORE_KEYS].sort());
+      // 直前の件数検査が通っていれば [0] は必ずあるが、上の 2 行と同じく
+      // 添字アクセスを無防備に置かない (検査の順序を入れ替えたときに
+      // Object.keys(undefined) の TypeError で日本語文言が消えるのを防ぐ)
+      expect(sortedKeysOf(ignoreEntries[0] ?? {})).toEqual([...ALLOWED_IGNORE_KEYS].sort());
     },
   );
 
