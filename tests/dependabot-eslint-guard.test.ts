@@ -210,16 +210,18 @@ function objectElementsOf(value: unknown): Record<string, unknown>[] {
 /**
  * 「書かなくてよいが、書くならリストであるべきキー」がリストでないなら 1 を返す。
  *
- * **現在の呼び出し元は `ignore` の 1 か所だけ** (countUnreadableElements)。
- * ignore は省略できるので「無い」は壊れではないが、`ignore: {}` のように
- * リスト以外へ書き換えると asArray が空配列へ均すため、**要素を数える方式では
- * 0 のまま素通りする**。この 1 を足すことで「書いたのに読まれていない」を捉える。
+ * 呼び出し元は countUnreadableElements の `ignore` と `directories` の 2 か所。
+ * どちらも省略できるので「無い」は壊れではないが、`ignore: {}` や
+ * `directories: "/"` のようにリスト以外へ書き換えると asArray が空配列へ均すため、
+ * **要素を数える方式では 0 のまま素通りする**。この 1 を足すことで
+ * 「書いたのに読まれていない」を捉える。
  *
- * 他のキーがここを通らないのは、必要な判定が違うため:
- *   - `updates` … 省略できないので「無い」も壊れ。countUnreadableElements 側で
- *     `Array.isArray(...)` 1 つに畳んである (キーの有無で場合分けしない)。
- *   - `directory` / `directories` … キーの有無や形ではなく「使える値が 1 つでも
- *     あるか」で見る必要がある (`directories: []` はリストだが値が無い)。
+ * `updates` がここを通らないのは、省略できないので「無い」も壊れであり、
+ * countUnreadableElements 側で `Array.isArray(...)` 1 つに畳んであるため
+ * (キーの有無で場合分けする必要がない)。
+ *
+ * なお `directories` については、これとは別に「使える値が 1 つでもあるか」も見る
+ * (`directories: []` はリストなのでここでは 0 だが、値が無いので担当から外れる)。
  */
 function countNonListKey(container: Record<string, unknown>, key: string): number {
   // キーが無いのは「書いていない」だけなので壊れではない
@@ -238,11 +240,12 @@ function countNonListKey(container: Record<string, unknown>, key: string): numbe
  * 共有できるよう、エコシステムの照合を 1 か所に置く (§6 DRY)。
  * 手で書き写すと、照合規則を変えたときに「読む場所」と「数える場所」がずれる。
  */
-function ecosystemBlocksOf(config: DependabotConfig, ecosystem: string): Record<string, unknown>[] {
-  // updates 直下から、オブジェクトとして読める要素だけを取り出してエコシステムで絞る
-  return objectElementsOf(config.updates).filter(
-    (entry) => entry["package-ecosystem"] === ecosystem,
-  );
+function ecosystemBlocksOf(
+  blocks: readonly Record<string, unknown>[],
+  ecosystem: string,
+): Record<string, unknown>[] {
+  // 読み込み済みのブロック配列をエコシステムで絞る
+  return blocks.filter((entry) => entry["package-ecosystem"] === ecosystem);
 }
 
 /**
@@ -322,8 +325,11 @@ function countUnreadableElements(
   ).length;
   // (2) directory / directories: coversDirectory が呼ばれるのはエコシステムが一致した
   //     ブロックだけ (guardedBlocksOf が ecosystemBlocksOf の戻り値にだけ
-  //     coversDirectory を掛けるため)。読む範囲に合わせて同じ絞り込みを使う
-  for (const block of ecosystemBlocksOf(config, ecosystem)) {
+  //     coversDirectory を掛けるため)。読む範囲に合わせて同じ絞り込みを使う。
+  //     **同じ blocks 配列を渡す**ので、読み手と数え手が同じ要素集合を見ることが
+  //     引数の受け渡しで保証される (走査し直すと同一性を目視で確かめる羽目になる)
+  const ecosystemBlocks = ecosystemBlocksOf(blocks, ecosystem);
+  for (const block of ecosystemBlocks) {
     // **「キーがあるか」ではなく「使える値が 1 つでもあるか」で見る。**
     // キーの有無や形だけを個別に数えると、`directories: []`(空リスト) や
     // `directory: ""` のように**キーはあるが値が無い**形を取りこぼす。どれも
@@ -336,18 +342,20 @@ function countUnreadableElements(
     if (!declaredDirectories.some((value) => typeof value === "string" && value !== "")) {
       unreadable += 1;
     }
-    // 複数形のリストに紛れた文字列以外の要素も、読み手が黙って捨てるので数える。
-    // **ここは「過剰側に倒す」方針の例外が 1 つある**: 使える `directory` がある
-    // ブロックで `directories` だけがリストでない形 (`directories: "/"` 等) の場合、
-    // coversDirectory は `directory` の一致で先に true を返すため読まれず、
-    // asArray も空になるので数に現れない。担当ブロックは正しく選ばれるので
-    // 検出網が止まる心配は無く、意図して数えていない
+    // `directories` がキーごとリストでない形 (`directories: "/"` 等) も数える。
+    // **「使える directory があるなら害は無い」は成り立たない** — `directory` が
+    // 空でない文字列でも、それが担当ディレクトリと違えば (`directory: "/app"`)
+    // coversDirectory は false になり、そのブロックの ignore は**丸ごと読まれない**。
+    // そこに `dependency-name: "*"` (update-types 無し = 全バージョン無視) が
+    // 書かれていても全検査が緑のまま通ってしまう
+    unreadable += countNonListKey(block, "directories");
+    // 複数形のリストに紛れた文字列以外の要素も、読み手が黙って捨てるので数える
     unreadable += asArray(block["directories"]).filter(
       (value) => typeof value !== "string",
     ).length;
   }
   // (3)(4) ignore 直下: 実際に読むのは担当ブロックだけなので、同じ絞り込みを通してから数える
-  for (const block of guardedBlocksOf(config, ecosystem, directory)) {
+  for (const block of guardedBlocksOf(blocks, ecosystem, directory)) {
     // ignore もキーごとリストでない形を先に数える
     unreadable += countNonListKey(block, "ignore");
     // ignore のうちオブジェクトとして読めたエントリ
@@ -517,14 +525,14 @@ function readParsed(path: string, parse: (text: string) => unknown): ReadResult 
  * 「壊れを数えている場所」がずれ、読み飛ばしの検査に穴が空く。
  */
 function guardedBlocksOf(
-  config: DependabotConfig,
+  blocks: readonly Record<string, unknown>[],
   ecosystem: string,
   directory: string,
 ): Record<string, unknown>[] {
   // エコシステムの照合は共通ヘルパーに任せ、ここではディレクトリだけを見る。
   // エコシステムだけで最初の 1 件を採ると、npm のブロックが複数ある構成 (モノレポ等) で
   // 別ディレクトリのブロックに書かれた ignore を、このプロジェクトに効いていると読み違える
-  return ecosystemBlocksOf(config, ecosystem).filter((entry) =>
+  return ecosystemBlocksOf(blocks, ecosystem).filter((entry) =>
     coversDirectory(entry, directory),
   );
 }
@@ -548,7 +556,7 @@ function collectIgnoreEntries(
 ): DependabotIgnoreEntry[] {
   // 担当ブロック (エコシステムとディレクトリの両方が一致するもの) を共通ヘルパーで得る
   // (絞り込みの理由は guardedBlocksOf 側に書いてある)
-  const blocks = guardedBlocksOf(config, ecosystem, directory);
+  const blocks = guardedBlocksOf(objectElementsOf(config.updates), ecosystem, directory);
   // 該当ブロックの ignore から対象パッケージに当たるエントリをすべて集めて返す
   // (完全一致だけでなく `*` / `eslint*` のようなワイルドカードも拾う)。
   // ignore 側のリストにも空要素は書けるので、同じヘルパーで振るう
