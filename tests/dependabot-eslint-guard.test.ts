@@ -226,6 +226,31 @@ function countNonListKey(container: Record<string, unknown>, key: string): numbe
 }
 
 /**
+ * 「無いと読み進めないキー」が 1 つも書かれていないなら 1 を返す。
+ *
+ * countNonListKey は「キーはあるが形が違う」を捉える一方、**キーごと消えた場合**は
+ * 素通りする。しかし読み手にとっては同じで、`directory` も `directories` も無い
+ * ブロックは coversDirectory が黙って不一致にし、担当ブロックが 0 件になって
+ * 保留の期限判定ごと skip される（値を消した `directory` とまったく同じ結末）。
+ *
+ * 対象は「書かないという選択があり得ないキー」だけに絞る — update ブロックは
+ * 対象ディレクトリを持たなければ何も指さないし、dependabot.yml は `updates` が
+ * 無ければ設定として空。**この環境から Dependabot の必須要件を裏取りできない**ので、
+ * 「無くても既定で動くのかもしれない」とは考えず、意図して書いた形でない時点で
+ * 落とす（このファイル全体と同じ fail-closed の立場）。
+ *
+ * `directory` / `directories` のように「どちらか一方あればよい」形も扱えるよう、
+ * キーは配列で受けて「1 つも無い」ときだけ数える。
+ */
+function countMissingRequiredKeys(
+  container: Record<string, unknown>,
+  keys: readonly string[],
+): number {
+  // どれか 1 つでも書かれていれば読み進められるので壊れではない
+  return keys.some((key) => key in container) ? 0 : 1;
+}
+
+/**
  * 指定エコシステムの update ブロックを返す (ディレクトリでは絞らない)。
  *
  * guardedBlocksOf の絞り込みは `エコシステム一致 && coversDirectory(...)` で、
@@ -305,6 +330,8 @@ function countUnreadableElements(
   //     結果は directory を消したときと同じで、担当ブロックが 0 件になって
   //     期限判定ごと skip され、検出網が静かに止まる
   let unreadable = countNonListKey(config as Record<string, unknown>, "updates");
+  // (0') `updates` がキーごと無い設定も同じく空として読み飛ばされるので数える
+  unreadable += countMissingRequiredKeys(config as Record<string, unknown>, ["updates"]);
   // (1) updates 直下: 元の要素数から、オブジェクトとして読めた数を引く
   const blocks = objectElementsOf(config.updates);
   unreadable += asArray(config.updates).length - blocks.length;
@@ -316,6 +343,9 @@ function countUnreadableElements(
     // 担当ブロックが 0 件になり **期限判定ごと skip されて検出網が静かに止まる**。
     // 値の消えた `directory` はここで数えて落とす
     if ("directory" in block && typeof block["directory"] !== "string") unreadable += 1;
+    // どちらのキーも無いブロックは、値を消した `directory` と同じ結末になる
+    // (coversDirectory が黙って不一致 → 担当ブロック 0 件 → 期限判定ごと skip)
+    unreadable += countMissingRequiredKeys(block, ["directory", "directories"]);
     // 複数形の `directories` は、キーごとリストでない形も要素単位の壊れも数える
     unreadable += countNonListKey(block, "directories");
     unreadable += asArray(block["directories"]).filter(
