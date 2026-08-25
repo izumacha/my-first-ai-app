@@ -48,7 +48,7 @@
 import { describe, expect, it } from "vitest";
 // 設定ファイルを読むため (Node 標準の同期 API で十分)
 import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname, relative, resolve } from "node:path";
 // このファイル自身の場所を ESM の標準的な方法で求めるため。
 // `__dirname` は CommonJS の変数で、いまは Vitest の互換シムのおかげで動いているだけ。
 // このファイルが素の ESM として読まれた時点で ReferenceError になるので、
@@ -214,7 +214,16 @@ function objectElementsOf(value: unknown): Record<string, unknown>[] {
  * 揃える** — 読まない場所の壊れを数えても、この保留の正しさとは関係が無いのに
  * eslint の保留を守る検査が無関係なエコシステムの設定まで咎めることになる。
  * 該当するのは次の 4 か所で、どれも読み手が黙って要素を捨てる。
- * **どこまでが「読む場所」かは読み手の絞り込みと厳密に一致させる**:
+ *
+ * **範囲は「読み手が読みうる場所」を覆う向きに合わせる (厳密な一致ではなく過剰側)。**
+ * 読み手には短絡があるため、ある実行で実際に触れる要素だけを厳密に写すことはできない
+ * — 例えば coversDirectory は単数形の `directory` が一致した時点で true を返し、
+ * `directories` を読まずに終わる。それでも `directories` は数える: 過剰に数えると
+ * 「壊れていないのに落ちる」だけ (fail-closed) だが、取りこぼすと「壊れているのに緑」
+ * になり、この検査の存在理由そのものが失われるため。
+ * 一方で**エコシステムが違うブロックのように、どう転んでも読まない場所は数えない** —
+ * eslint の保留を守る検査が無関係な設定を咎めても直し方の案内にならないので、
+ * そこは絞る:
  *
  *   1. `updates` 直下 … objectElementsOf がオブジェクト以外を捨てる。
  *      全ブロックが担当判定の対象なので、全要素が読む対象。
@@ -224,6 +233,9 @@ function objectElementsOf(value: unknown): Record<string, unknown>[] {
  *      **coversDirectory が呼ばれるのはエコシステムが一致したブロックだけ**。
  *      全ブロックを数えると、読みもしない docker ブロックの空要素を
  *      eslint の保留を守る検査が咎めることになる。
+ *      なお同じブロックでも、単数形の `directory` が一致していれば
+ *      `directories` は実際には読まれない (上記の過剰側に倒す方針どおり数える。
+ *      `directory` の書き方が変われば読まれるようになるため)。
  *   3. **担当ブロックの** `ignore` 直下 … objectElementsOf がオブジェクト以外を捨てる。
  *      ignore を読むのは担当ブロック (エコシステム＋ディレクトリが一致) だけなので、
  *      ここは担当分に絞る。
@@ -653,16 +665,18 @@ describe("dependabot.yml の ESLint major 保留", () => {
   const packageJsonRead = readParsed(PACKAGE_JSON_PATH, JSON.parse);
   // ロックファイル (上流プラグイン群の peer 範囲を読むため)
   const packageLockRead = readParsed(PACKAGE_LOCK_PATH, JSON.parse);
-  // 読めなかったファイルだけを、原因付きで集める (下の専用テストが報告する)
+  // 読めなかったファイルだけを、原因付きで集める (下の専用テストが報告する)。
+  // 表示名はパス定数から導く — 文字列で書き写すと、定数を変えたときに
+  // 「読んでいるファイル」と「文言が名指しするファイル」がずれる (§6 一元管理)
   const unreadableSources = [
-    { label: ".github/dependabot.yml", error: dependabotRead.error },
-    { label: "package.json", error: packageJsonRead.error },
-    { label: "package-lock.json", error: packageLockRead.error },
+    { path: DEPENDABOT_PATH, error: dependabotRead.error },
+    { path: PACKAGE_JSON_PATH, error: packageJsonRead.error },
+    { path: PACKAGE_LOCK_PATH, error: packageLockRead.error },
   ]
     // 読めたものは報告対象から外す
     .filter((source) => source.error !== null)
-    // 失敗文言に載せるため、原因を文字列へ直す
-    .map((source) => `${source.label}: ${String(source.error)}`);
+    // 失敗文言に載せるため、repo ルートからの相対パスと原因を組み立てる
+    .map((source) => `${relative(REPO_ROOT, source.path)}: ${String(source.error)}`);
   // **パース結果は null にもなる** — 空ファイルや、全体をコメントアウトしたファイルが該当する
   // (どちらも実測済み)。null のまま枝を読むと TypeError で全検査が収集時エラーになる。
   // asRecord でオブジェクトへ均しておけば、updates が空として扱われ、
@@ -713,8 +727,10 @@ describe("dependabot.yml の ESLint major 保留", () => {
       unreadableSources,
       `検査に使う入力ファイルを読めませんでした: ${unreadableSources.join(" / ")}。` +
         `削除・改名されていないか、YAML / JSON として壊れていないかを確認してください。` +
-        `.github/dependabot.yml が消えている場合は eslint の major 保留も一緒に消えており、` +
-        `package-lock.json が読めない場合は上流プラグインの peer 範囲を評価できません` +
+        `${relative(REPO_ROOT, DEPENDABOT_PATH)} が消えている場合は ` +
+        `${GUARDED_DEPENDENCY} の major 保留も一緒に消えており、` +
+        `${relative(REPO_ROOT, PACKAGE_LOCK_PATH)} が読めない場合は ` +
+        `上流プラグインの peer 範囲を評価できません` +
         `(どちらもこのファイルの検査対象そのものなので、ここで止めて他の検査に` +
         `誤った前提で判断させないようにしています)。`,
     ).toEqual([]);
@@ -728,7 +744,7 @@ describe("dependabot.yml の ESLint major 保留", () => {
     // 「意図して書いた形か」は独立した検査で担保する
     expect(
       unreadableElementCount,
-      `.github/dependabot.yml のうち、この検査が実際に読む 4 か所` +
+      `${relative(REPO_ROOT, DEPENDABOT_PATH)} のうち、この検査が実際に読む 4 か所` +
         `(updates 直下 / ${GUARDED_ECOSYSTEM} ブロックの directories 直下 / ` +
         `${GUARDED_ECOSYSTEM}・${GUARDED_DIRECTORY} ブロックの ignore 直下と、` +
         `その dependency-name が文字列であること) に、` +
