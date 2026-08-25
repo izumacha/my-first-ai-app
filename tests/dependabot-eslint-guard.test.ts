@@ -254,7 +254,7 @@ function ecosystemBlocksOf(
  * 読み飛ばしを握り潰さないための検査。**数える範囲は「この検査が実際に読む場所」に
  * 揃える** — 読まない場所の壊れを数えても、この保留の正しさとは関係が無いのに
  * eslint の保留を守る検査が無関係なエコシステムの設定まで咎めることになる。
- * 該当するのは次の 4 か所で、どれも読み手が黙って要素を捨てる。
+ * 該当するのは次の 6 通りで、どれも読み手が黙って要素・値を捨てる。
  *
  * **範囲は「読み手が読みうる場所」を覆う向きに合わせる (厳密な一致ではなく過剰側)。**
  * 読み手には短絡があるため、ある実行で実際に触れる要素だけを厳密に写すことはできない
@@ -266,22 +266,31 @@ function ecosystemBlocksOf(
  * eslint の保留を守る検査が無関係な設定を咎めても直し方の案内にならないので、
  * そこは絞る:
  *
+ *   0. `updates` そのもの … 無い / 配列でない場合。asArray が空へ均すので
+ *      「ブロックが 1 つも無い設定」として黙って読み進んでしまう。
  *   1. `updates` 直下 … objectElementsOf がオブジェクト以外を捨てる。
  *      全ブロックが担当判定の対象なので、全要素が読む対象。
+ *   1'. 全ブロックの `package-ecosystem` … 文字列でない場合。ecosystemBlocksOf は
+ *      `=== ecosystem` で比べるだけなので、値が消えるとそのブロックが静かに脱落する。
+ *      この値は全ブロックについて読むので、エコシステムで絞らず全ブロックを見る。
  *   2. **エコシステムが一致するブロックの** `directories` 直下 …
  *      coversDirectory が文字列以外を捨てる。guardedBlocksOf の絞り込みは
  *      ecosystemBlocksOf の戻り値にだけ coversDirectory を掛けるため
  *      **coversDirectory が呼ばれるのはエコシステムが一致したブロックだけ**。
  *      全ブロックを数えると、読みもしない docker ブロックの空要素を
  *      eslint の保留を守る検査が咎めることになる。
- *      なお同じブロックでも、単数形の `directory` が一致していれば
- *      `directories` は実際には読まれない (上記の過剰側に倒す方針どおり数える。
- *      `directory` の書き方が変われば読まれるようになるため)。
- *      **単数形の `directory` 自体も、キーがあるのに文字列でない形 (`directory:` と
- *      値を消す等) を数える。** coversDirectory が黙って不一致にすると担当ブロックが
- *      0 件になり、(3)(4) が何も数えられなくなるうえ**保留の期限判定ごと skip され、
- *      検出網が静かに止まる**（このとき唯一赤くなる ignore 件数の検査は
- *      「別のブロックへ移された」と案内するので、原因からも遠ざかる）。
+ *      **判定は単数形・複数形をまとめて「空でない文字列を 1 つでも持つか」で行う。**
+ *      `directory:` と値を消す・`directory: ""`・`directories: []` はどれも
+ *      「どこも指していない」ブロックになり、coversDirectory が黙って不一致にする。
+ *      すると担当ブロックが 0 件になり、(3)(4) が何も数えられなくなるうえ
+ *      **保留の期限判定ごと skip され、検出網が静かに止まる**（このとき唯一赤くなる
+ *      ignore 件数の検査は「別のブロックへ移された」と案内するので、原因からも遠ざかる）。
+ *      逆に**どこかを指してさえいれば単数形の形は問わない** — `directory:` を消しても
+ *      `directories: ["/"]` があれば読めるので、それは壊れではない。
+ *   2'. **指す先はあるが `directories` だけがリストでない形** (`directories: "/"`)。
+ *      `directory` が担当ディレクトリと違えば (`directory: "/app"`) そのブロックの
+ *      ignore は丸ごと読まれず、`dependency-name: "*"` が潜んでいても緑で通る。
+ *      2 と排他にして、同じキーの壊れを二重に数えないようにしている。
  *   3. **担当ブロックの** `ignore` 直下 … objectElementsOf がオブジェクト以外を捨てる。
  *      ignore を読むのは担当ブロック (エコシステム＋ディレクトリが一致) だけなので、
  *      ここは担当分に絞る。
@@ -338,17 +347,24 @@ function countUnreadableElements(
     // (しかも唯一赤くなる ignore 件数の検査は「別のブロックへ移された」と案内し、
     //  原因から遠ざかる)。単数形・複数形をまとめて 1 つの条件で見る
     const declaredDirectories = [block["directory"], ...asArray(block["directories"])];
-    // 空でない文字列が 1 つも無ければ、このブロックはどこも指していない
-    if (!declaredDirectories.some((value) => typeof value === "string" && value !== "")) {
+    // 空でない文字列が 1 つでもあれば、このブロックはどこかを指している
+    const pointsSomewhere = declaredDirectories.some(
+      (value) => typeof value === "string" && value !== "",
+    );
+    if (!pointsSomewhere) {
+      // どこも指していない = 壊れているので 1 つ数える
       unreadable += 1;
+    } else {
+      // 指す先はあるが、`directories` だけがリストでない形 (`directories: "/"` 等) の場合。
+      // **「使える directory があるなら害は無い」は成り立たない** — `directory` が
+      // 空でない文字列でも、それが担当ディレクトリと違えば (`directory: "/app"`)
+      // coversDirectory は false になり、そのブロックの ignore は**丸ごと読まれない**。
+      // そこに `dependency-name: "*"` (update-types 無し = 全バージョン無視) が
+      // 書かれていても全検査が緑のまま通ってしまう。
+      // 上の分岐と else で分けるのは、`directories: "/"` 単独のときに
+      // 「どこも指していない」と二重に数えて件数が実際の 2 倍になるのを避けるため
+      unreadable += countNonListKey(block, "directories");
     }
-    // `directories` がキーごとリストでない形 (`directories: "/"` 等) も数える。
-    // **「使える directory があるなら害は無い」は成り立たない** — `directory` が
-    // 空でない文字列でも、それが担当ディレクトリと違えば (`directory: "/app"`)
-    // coversDirectory は false になり、そのブロックの ignore は**丸ごと読まれない**。
-    // そこに `dependency-name: "*"` (update-types 無し = 全バージョン無視) が
-    // 書かれていても全検査が緑のまま通ってしまう
-    unreadable += countNonListKey(block, "directories");
     // 複数形のリストに紛れた文字列以外の要素も、読み手が黙って捨てるので数える
     unreadable += asArray(block["directories"]).filter(
       (value) => typeof value !== "string",
@@ -441,6 +457,20 @@ function directoryPatternCovers(pattern: string, directory: string): boolean {
 function displayPath(path: string): string {
   // repo ルートからの相対パスにすると、環境ごとの絶対パスが文言に混ざらない
   return relative(REPO_ROOT, path);
+}
+
+/**
+ * 読み取り例外を、環境ごとの絶対パスを含まない形の文字列にする。
+ *
+ * 例外メッセージには絶対パスがそのまま入る (ENOENT は
+ * `open '/home/<誰か>/my-first-ai-app/package-lock.json'` の形)。displayPath で
+ * ファイル名だけ相対化しても、隣に貼る原因文字列から絶対パスが漏れては同じこと
+ * — CI の出力が実行機ごとに変わり、手元と突き合わせづらくなる。
+ * repo ルートの接頭辞だけを畳んで、相対パスとして読めるようにする。
+ */
+function describeReadError(error: unknown, root: string): string {
+  // 例外を文字列にしてから、repo ルートの接頭辞をすべて取り除く
+  return String(error).split(`${root}/`).join("");
 }
 
 /**
@@ -818,7 +848,9 @@ describe("dependabot.yml の ESLint major 保留", () => {
     // 読めたものは報告対象から外す
     .filter((source) => source.error !== null)
     // 失敗文言に載せるため、repo ルートからの相対パスと原因を組み立てる
-    .map((source) => `${displayPath(source.path)}: ${String(source.error)}`);
+    .map(
+      (source) => `${displayPath(source.path)}: ${describeReadError(source.error, REPO_ROOT)}`,
+    );
   // **パース結果は null にもなる** — 空ファイルや、全体をコメントアウトしたファイルが該当する
   // (どちらも実測済み)。null のまま枝を読むと TypeError で全検査が収集時エラーになる。
   // asRecord でオブジェクトへ均しておけば、updates が空として扱われ、
@@ -942,13 +974,19 @@ describe("dependabot.yml の ESLint major 保留", () => {
       // 「意図して書いた形か」は独立した検査で担保する
       expect(
         unreadableElementCount,
-        `${displayPath(DEPENDABOT_PATH)} のうち、この検査が実際に読む場所` +
-          `(updates 直下 / ${GUARDED_ECOSYSTEM} ブロックの directory・directories / ` +
-          `${GUARDED_ECOSYSTEM}・${GUARDED_DIRECTORY} ブロックの ignore 直下と、` +
-          `その dependency-name が文字列であること) に、` +
+        `${displayPath(DEPENDABOT_PATH)} のうち、この検査が実際に読む場所に、` +
           `想定した形で書かれていない箇所が ${unreadableElementCount} 個あります。` +
-          `ブロックをコメントアウトしたときに残った空要素 \`-\`、値を消した \`directory:\`、` +
-          `\`dependency-name: ["eslint"]\` のような書き崩れが典型です。` +
+          `読む場所と典型的な壊れ方は次のとおりです — ` +
+          `(a) updates そのもの: キーが無い / リストでない。` +
+          `(b) updates 直下: ブロックをコメントアウトしたときに残った空要素 \`-\`。` +
+          `(c) **全ブロックの** package-ecosystem: 値が消えている ` +
+          `(${GUARDED_ECOSYSTEM} 以外のブロックも対象。値で担当を選ぶため全部読みます)。` +
+          `(d) ${GUARDED_ECOSYSTEM} ブロックの directory / directories: ` +
+          `どこも指していない (\`directory:\` と値を消す・\`directories: []\`) か、` +
+          `directories がリストでない (\`directories: "/"\`)。` +
+          `(e) ${GUARDED_ECOSYSTEM}・${GUARDED_DIRECTORY} ブロックの ignore: ` +
+          `キーがリストでない・空要素 \`-\`・` +
+          `\`dependency-name: ["eslint"]\` のように名前が文字列でない。` +
           `この検査はそれを読み飛ばすので、放置すると設定が壊れたまま他の検査が緑になります` +
           `(とくに \`directory\` が読めないと担当ブロックが 0 件になり、` +
           `保留の期限判定ごと skip されて検出網が静かに止まります)。` +
