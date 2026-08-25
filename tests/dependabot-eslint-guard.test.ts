@@ -208,6 +208,41 @@ function objectElementsOf(value: unknown): Record<string, unknown>[] {
 }
 
 /**
+ * 「リストであるべきキーが、リストでない形で書かれている」なら 1 を返す。
+ *
+ * `updates: {...}` や `directories: "/"` のようにキーごと別の形へ書き換えると、
+ * asArray が空配列へ均すため**要素を数える方式では 0 のまま素通りする**。
+ * 結果は値を消した `directory` と同じで、担当ブロックが 0 件になって
+ * 保留の期限判定ごと skip され、検出網が静かに止まる。
+ *
+ * キーが無い場合は数えない — 書いていないことは壊れではなく、
+ * Dependabot 側の既定に従うだけだから (`directories` 未指定で `directory` を使う等)。
+ */
+function countNonListKey(container: Record<string, unknown>, key: string): number {
+  // キーが無いのは「書いていない」だけなので壊れではない
+  if (!(key in container)) return 0;
+  // キーがあるのに配列でなければ、asArray が空へ均して読み飛ばす形なので 1 つ数える
+  return Array.isArray(container[key]) ? 0 : 1;
+}
+
+/**
+ * 指定エコシステムの update ブロックを返す (ディレクトリでは絞らない)。
+ *
+ * guardedBlocksOf の絞り込みは `エコシステム一致 && coversDirectory(...)` で、
+ * `&&` が短絡するため **coversDirectory が呼ばれるのはここまで通ったブロックだけ**。
+ * つまり「directory / directories が読まれる範囲」はこの関数の戻り値そのもの。
+ * 読み手 (guardedBlocksOf) と数え手 (countUnreadableElements) が同じ定義を
+ * 共有できるよう、エコシステムの照合を 1 か所に置く (§6 DRY)。
+ * 手で書き写すと、照合規則を変えたときに「読む場所」と「数える場所」がずれる。
+ */
+function ecosystemBlocksOf(config: DependabotConfig, ecosystem: string): Record<string, unknown>[] {
+  // updates 直下から、オブジェクトとして読める要素だけを取り出してエコシステムで絞る
+  return objectElementsOf(config.updates).filter(
+    (entry) => entry["package-ecosystem"] === ecosystem,
+  );
+}
+
+/**
  * 設定の中に「読めない形のリスト要素」がいくつあるかを数える。
  *
  * 読み飛ばしを握り潰さないための検査。**数える範囲は「この検査が実際に読む場所」に
@@ -264,24 +299,33 @@ function countUnreadableElements(
   ecosystem: string,
   directory: string,
 ): number {
+  // (0) リストであるべきキーがリストでない形も数える。
+  //     `updates: {...}` や `directories: "/"` のように**キーごと別の形へ**書き換えると、
+  //     asArray が空配列に均すので「要素の数え上げ」では 0 のまま素通りしてしまう。
+  //     結果は directory を消したときと同じで、担当ブロックが 0 件になって
+  //     期限判定ごと skip され、検出網が静かに止まる
+  let unreadable = countNonListKey(config as Record<string, unknown>, "updates");
   // (1) updates 直下: 元の要素数から、オブジェクトとして読めた数を引く
   const blocks = objectElementsOf(config.updates);
-  let unreadable = asArray(config.updates).length - blocks.length;
+  unreadable += asArray(config.updates).length - blocks.length;
   // (2) directory / directories: coversDirectory が呼ばれるのはエコシステムが一致した
   //     ブロックだけ (guardedBlocksOf の `&&` が短絡するため)。読む範囲に合わせて絞る
-  for (const block of blocks.filter((entry) => entry["package-ecosystem"] === ecosystem)) {
+  for (const block of ecosystemBlocksOf(config, ecosystem)) {
     // 単数形の `directory` は「キーはあるのに文字列でない」形が書ける
     // (`directory:` と値を消す等)。coversDirectory は黙って不一致にするため、
     // 担当ブロックが 0 件になり **期限判定ごと skip されて検出網が静かに止まる**。
     // 値の消えた `directory` はここで数えて落とす
     if ("directory" in block && typeof block["directory"] !== "string") unreadable += 1;
-    // 複数形の `directories` は要素ごとに文字列以外が捨てられる
+    // 複数形の `directories` は、キーごとリストでない形も要素単位の壊れも数える
+    unreadable += countNonListKey(block, "directories");
     unreadable += asArray(block["directories"]).filter(
       (value) => typeof value !== "string",
     ).length;
   }
   // (3)(4) ignore 直下: 実際に読むのは担当ブロックだけなので、同じ絞り込みを通してから数える
   for (const block of guardedBlocksOf(config, ecosystem, directory)) {
+    // ignore もキーごとリストでない形を先に数える
+    unreadable += countNonListKey(block, "ignore");
     // ignore のうちオブジェクトとして読めたエントリ
     const entries = objectElementsOf(block["ignore"]);
     // (3) オブジェクトですらない要素 (空要素 `-` など) は元の要素数との差で数える
@@ -356,6 +400,22 @@ function directoryPatternCovers(pattern: string, directory: string): boolean {
   return new RegExp(`^${escaped}$`).test(directory);
 }
 
+/**
+ * 値の「形」だけを短い日本語で表す (失敗文言に埋め込む用)。
+ *
+ * 値そのものを文字列化しないのは、JSON.stringify が循環参照で例外を投げるうえ
+ * (YAML のアンカーで自己参照する配列が書ける)、大きな値だと文言が読めなくなるため。
+ * ここで返すのは固定長の短い語句だけなので、どんな入力でも安全に使える。
+ */
+function describeShape(value: unknown): string {
+  // null は typeof が "object" になるので先に分ける
+  if (value === null) return "null";
+  // 配列も typeof が "object" なので個別に名前を付ける
+  if (Array.isArray(value)) return "配列";
+  // それ以外は型名だけを返す (string / number / boolean / undefined / object)
+  return typeof value;
+}
+
 // 1 つの入力ファイルを読んだ結果 (解釈できた値と、読めなかったときの原因)
 interface ReadResult {
   // パースできた値 (読めなければ null)
@@ -396,12 +456,16 @@ function readParsed(path: string, parse: (text: string) => unknown): ReadResult 
   // 3 つの入力はいずれもトップレベルがオブジェクトである前提なので、そうでなければ
   // 読めなかったものとして扱う (fail-closed)
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    // 何が入っていたかを添えて原因を作る (空ファイルなら null と表示される)
+    // 何が入っていたかを添えて原因を作る。**値そのものは埋め込まない** —
+    // JSON.stringify は循環参照 (YAML のアンカーで自己参照配列が書ける。実測) で
+    // 例外を投げ、しかもこの行は catch の外なので、収集時エラーになって
+    // この関数の存在意義 (例外を投げない) が崩れる。巨大な値の丸ごと出力も避ける
     return {
       value: null,
       error: new Error(
-        `トップレベルがオブジェクトではありません (${JSON.stringify(value) ?? "undefined"})。` +
-          `空ファイル・全体のコメントアウト・別の形への書き換えが疑われます。`,
+        // 末尾に句点を置かない — 呼び出し側が原因を文中へ差し込むときに句点を足すため
+        `トップレベルがオブジェクトではありません (${describeShape(value)})。` +
+          `空ファイル・全体のコメントアウト・別の形への書き換えが疑われます`,
       ),
     };
   }
@@ -422,11 +486,11 @@ function guardedBlocksOf(
   ecosystem: string,
   directory: string,
 ): Record<string, unknown>[] {
-  // updates 直下から、オブジェクトとして読める要素だけを取り出して絞り込む。
+  // エコシステムの照合は共通ヘルパーに任せ、ここではディレクトリだけを見る。
   // エコシステムだけで最初の 1 件を採ると、npm のブロックが複数ある構成 (モノレポ等) で
   // 別ディレクトリのブロックに書かれた ignore を、このプロジェクトに効いていると読み違える
-  return objectElementsOf(config.updates).filter(
-    (entry) => entry["package-ecosystem"] === ecosystem && coversDirectory(entry, directory),
+  return ecosystemBlocksOf(config, ecosystem).filter((entry) =>
+    coversDirectory(entry, directory),
   );
 }
 
@@ -702,11 +766,12 @@ describe("dependabot.yml の ESLint major 保留", () => {
   // 読めなかったファイルだけを、原因付きで集める (下の専用テストが報告する)。
   // 表示名はパス定数から導く — 文字列で書き写すと、定数を変えたときに
   // 「読んでいるファイル」と「文言が名指しするファイル」がずれる (§6 一元管理)
-  const unreadableSources = [
+  const inputSources = [
     { path: DEPENDABOT_PATH, error: dependabotRead.error },
     { path: PACKAGE_JSON_PATH, error: packageJsonRead.error },
     { path: PACKAGE_LOCK_PATH, error: packageLockRead.error },
-  ]
+  ];
+  const unreadableSources = inputSources
     // 読めたものは報告対象から外す
     .filter((source) => source.error !== null)
     // 失敗文言に載せるため、repo ルートからの相対パスと原因を組み立てる
@@ -751,7 +816,9 @@ describe("dependabot.yml の ESLint major 保留", () => {
   // 次の major をまだ許していない上流 (= 保留の理由として残っているもの)
   const blockingPeers = upstreamPeers.filter((peer) => !satisfies(nextMajorVersion, peer.range));
 
-  it("検査に使う 3 つの入力ファイルが読めて、構造として解釈できる", () => {
+  // 件数もファイル名も定数側から導く — テスト名に書き写すと、入力を増減したときや
+  // パス定数を変えたときに、CI の出力だけが実態と食い違ったまま残る (§6 一元管理)
+  it(`検査に使う ${inputSources.length} つの入力ファイルが読めて、構造として解釈できる`, () => {
     // 読み取り・パースで例外が出ていないこと。落ちる代表例は
     // ファイルごと削除・改名された (ENOENT) か、キーの重複やマージ事故で
     // 壊れている (YAMLParseError / SyntaxError) 場合。
@@ -775,8 +842,12 @@ describe("dependabot.yml の ESLint major 保留", () => {
   // 「読めない要素は 0 個」と**中身の無いファイルに対して緑**になり、
   // 直前のテストが赤いのに「設定は健全」と読める出力が並んでしまう。
   // 評価できないことは skip で示し、原因の報告は直前のテストに任せる
-  it.skipIf(unreadableSources.length > 0)(
-    ".github/dependabot.yml に読めない形のリスト要素が無い",
+  // **判定はこのファイルが読めたかどうかだけを見る。** unreadableSources 全体で
+  // 判定すると、無関係な package-lock.json の破損だけでこの検査が止まり、
+  // 同時に混入した dependabot.yml の壊れが 1 つも報告されなくなる
+  // (objectElementsOf が黙って読み飛ばすので他の検査は緑のまま通る)
+  it.skipIf(dependabotRead.error !== null)(
+    `${relative(REPO_ROOT, DEPENDABOT_PATH)} に読めない形のリスト要素が無い`,
     () => {
       // 空要素 `-` (ブロックをコメントアウトした残り) が混ざっていないかを見る。
       // この検査が無いと、正しいエントリの**隣**に空要素が増えたケースで
