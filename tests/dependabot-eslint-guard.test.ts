@@ -213,15 +213,29 @@ function objectElementsOf(value: unknown): Record<string, unknown>[] {
  * 読み飛ばしを握り潰さないための検査。**数える範囲は「この検査が実際に読む場所」に
  * 揃える** — 読まない場所の壊れを数えても、この保留の正しさとは関係が無いのに
  * eslint の保留を守る検査が無関係なエコシステムの設定まで咎めることになる。
- * 該当するのは次の 3 か所で、どれも読み手が黙って要素を捨てる:
+ * 該当するのは次の 4 か所で、どれも読み手が黙って要素を捨てる。
+ * **どこまでが「読む場所」かは読み手の絞り込みと厳密に一致させる**:
  *
  *   1. `updates` 直下 … objectElementsOf がオブジェクト以外を捨てる。
  *      全ブロックが担当判定の対象なので、全要素が読む対象。
- *   2. 各ブロックの `directories` 直下 … coversDirectory が文字列以外を捨てる。
- *      担当ブロックを決める照合で全ブロックを見るため、ここも全ブロックが対象。
+ *   2. **エコシステムが一致するブロックの** `directories` 直下 …
+ *      coversDirectory が文字列以外を捨てる。guardedBlocksOf の絞り込みは
+ *      `エコシステム一致 && coversDirectory(...)` で、`&&` は短絡するため
+ *      **coversDirectory が呼ばれるのはエコシステムが一致したブロックだけ**。
+ *      全ブロックを数えると、読みもしない docker ブロックの空要素を
+ *      eslint の保留を守る検査が咎めることになる。
  *   3. **担当ブロックの** `ignore` 直下 … objectElementsOf がオブジェクト以外を捨てる。
  *      ignore を読むのは担当ブロック (エコシステム＋ディレクトリが一致) だけなので、
- *      ここだけは全ブロックではなく担当分に絞る。
+ *      ここは担当分に絞る。
+ *   4. **担当ブロックの** `ignore` のうち `dependency-name` が文字列でないもの …
+ *      ignoreNameMatches が文字列以外を「当たらない」として捨てる。
+ *      `dependency-name: ["eslint"]` のように書き崩れたエントリが、
+ *      正しいエントリの隣にあると件数が変わらず素通りする。
+ *
+ * 各読み手の受け入れ条件をこちら側から組み立て直す形なので、**読み手を増やしたら
+ * ここにも足す**必要がある (読み手自身に「何を捨てたか」を報告させる設計なら
+ * 足し忘れは起きないが、既存の 4 つの読み手すべての戻り値を変える改修になるため、
+ * ここでは列挙を保ち、対応関係を上のとおり明記しておく)。
  *
  * これを検査しないと、空要素 `-` が正しいエントリの隣に増えたときに件数が変わらず、
  * 壊れた設定のまま緑になる。**Dependabot がこの形の設定をどう扱うかは
@@ -236,17 +250,25 @@ function countUnreadableElements(
   // (1) updates 直下: 元の要素数から、オブジェクトとして読めた数を引く
   const blocks = objectElementsOf(config.updates);
   let unreadable = asArray(config.updates).length - blocks.length;
-  // (2) directories 直下: 照合は全ブロックに対して走るので、全ブロックぶんを見る
-  for (const block of blocks) {
+  // (2) directories 直下: coversDirectory が呼ばれるのはエコシステムが一致したブロックだけ
+  //     (guardedBlocksOf の `&&` が短絡するため)。読む範囲に合わせて同じ条件で絞る
+  for (const block of blocks.filter((entry) => entry["package-ecosystem"] === ecosystem)) {
     // coversDirectory が採用するのは文字列だけなので、それ以外は捨てられている
     unreadable += asArray(block["directories"]).filter(
       (value) => typeof value !== "string",
     ).length;
   }
-  // (3) ignore 直下: 実際に読むのは担当ブロックだけなので、同じ絞り込みを通してから数える
+  // (3)(4) ignore 直下: 実際に読むのは担当ブロックだけなので、同じ絞り込みを通してから数える
   for (const block of guardedBlocksOf(config, ecosystem, directory)) {
-    // ignore の元の要素数から、読めた要素数を引いた分が捨てられている箇所
-    unreadable += asArray(block["ignore"]).length - objectElementsOf(block["ignore"]).length;
+    // ignore のうちオブジェクトとして読めたエントリ
+    const entries = objectElementsOf(block["ignore"]);
+    // (3) オブジェクトですらない要素 (空要素 `-` など) は元の要素数との差で数える
+    unreadable += asArray(block["ignore"]).length - entries.length;
+    // (4) オブジェクトではあるが dependency-name が文字列でないものも読み飛ばされる
+    //     (ignoreNameMatches が文字列以外を「当たらない」として捨てるため)
+    unreadable += entries.filter(
+      (entry) => typeof entry["dependency-name"] !== "string",
+    ).length;
   }
   // 合計を返す (0 なら「読む場所」に読めない要素は無い)
   return unreadable;
@@ -312,6 +334,39 @@ function directoryPatternCovers(pattern: string, directory: string): boolean {
   return new RegExp(`^${escaped}$`).test(directory);
 }
 
+// 1 つの入力ファイルを読んだ結果 (解釈できた値と、読めなかったときの原因)
+interface ReadResult {
+  // パースできた値 (読めなければ null)
+  value: unknown;
+  // 読み取り・パースで投げられた例外 (問題なければ null)
+  error: unknown;
+}
+
+/**
+ * ファイルを読んで解釈し、**例外を投げずに** 結果か原因のどちらかを返す。
+ *
+ * 3 つの入力 (dependabot.yml / package.json / package-lock.json) はいずれも
+ * describe のトップレベルで読まれる。そこで例外が投げられると、このファイルの検査は
+ * すべて「収集時エラー」になり、丁寧に書いた日本語の失敗文言が 1 つも出ない。
+ * 実際に起こりうるのは、ファイルの削除・改名 (ENOENT)、マージ事故による破損
+ * (SyntaxError / YAMLParseError) など。とくに dependabot.yml の削除は検出対象 (b)
+ * 「保留の消失」そのもので、ロックファイルの破損は
+ * 「上流プラグインがすべて読み取れる」検査の対象そのものなので、
+ * **そこで案内が消えるとこのファイルの存在意義が失われる**。
+ *
+ * 例外は握り潰さず ReadResult に載せ、専用のテストが原因付きで報告する
+ * (CLAUDE.md §6 エラーを握り潰さない)。
+ */
+function readParsed(path: string, parse: (text: string) => unknown): ReadResult {
+  try {
+    // 読めた場合は解釈した値を返す (原因は無し)
+    return { value: parse(readFileSync(path, "utf8")), error: null };
+  } catch (error) {
+    // 読めなかった場合は値を持たず、原因だけを返す
+    return { value: null, error };
+  }
+}
+
 /**
  * この検査が「担当する」update ブロック (エコシステムとディレクトリの両方が一致) を返す。
  *
@@ -350,10 +405,8 @@ function collectIgnoreEntries(
   directory: string,
   dependencyName: string,
 ): DependabotIgnoreEntry[] {
-  // updates 直下から「エコシステムとディレクトリの両方が一致する」ブロックを集める。
-  // エコシステムだけで最初の 1 件を採ると、npm のブロックが複数ある構成 (モノレポ等) で
-  // 別ディレクトリのブロックに書かれた ignore を、このプロジェクトに効いていると読み違える
   // 担当ブロック (エコシステムとディレクトリの両方が一致するもの) を共通ヘルパーで得る
+  // (絞り込みの理由は guardedBlocksOf 側に書いてある)
   const blocks = guardedBlocksOf(config, ecosystem, directory);
   // 該当ブロックの ignore から対象パッケージに当たるエントリをすべて集めて返す
   // (完全一致だけでなく `*` / `eslint*` のようなワイルドカードも拾う)。
@@ -593,33 +646,32 @@ function readDevDependencyRange(json: unknown, dependencyName: string): unknown 
 }
 
 describe("dependabot.yml の ESLint major 保留", () => {
-  // Dependabot 設定を構造として読む (コメントはパーサが落とすので検査に混ざらない)。
-  //
-  // **読み取りとパースは例外を投げうる。** ファイルごと消えれば ENOENT、キーが重複すれば
-  // YAMLParseError になる (どちらも実測済み)。describe のトップレベルで投げると
-  // 全検査が収集時エラーとして落ち、このファイルの日本語文言が一切出ない —
-  // ファイル削除はまさに検出対象 (b)「保留の消失」なので、そこで案内が消えるのは困る。
-  // そこで例外は捨てずに捕まえておき、下の専用テストが原因付きで報告する
-  // (§6 エラーを握り潰さない)。
-  let dependabotReadError: unknown = null;
-  // パース結果の受け皿 (読めなければ null のまま)
-  let parsedDependabot: unknown = null;
-  try {
-    // ファイルを読んで YAML として構造化する
-    parsedDependabot = parseYaml(readFileSync(DEPENDABOT_PATH, "utf8"));
-  } catch (error) {
-    // 例外はここで握らず、専用テストへ渡すために保持する
-    dependabotReadError = error;
-  }
+  // 3 つの入力を、例外を投げない形で読む (理由は readParsed の docstring)。
+  // Dependabot 設定は構造として読む (コメントはパーサが落とすので検査に混ざらない)
+  const dependabotRead = readParsed(DEPENDABOT_PATH, parseYaml);
+  // package.json (eslint のバージョン範囲の宣言もと)
+  const packageJsonRead = readParsed(PACKAGE_JSON_PATH, JSON.parse);
+  // ロックファイル (上流プラグイン群の peer 範囲を読むため)
+  const packageLockRead = readParsed(PACKAGE_LOCK_PATH, JSON.parse);
+  // 読めなかったファイルだけを、原因付きで集める (下の専用テストが報告する)
+  const unreadableSources = [
+    { label: ".github/dependabot.yml", error: dependabotRead.error },
+    { label: "package.json", error: packageJsonRead.error },
+    { label: "package-lock.json", error: packageLockRead.error },
+  ]
+    // 読めたものは報告対象から外す
+    .filter((source) => source.error !== null)
+    // 失敗文言に載せるため、原因を文字列へ直す
+    .map((source) => `${source.label}: ${String(source.error)}`);
   // **パース結果は null にもなる** — 空ファイルや、全体をコメントアウトしたファイルが該当する
-  // (どちらも実測済み)。null のまま枝を読むとやはり TypeError で全検査が収集時エラーになる。
+  // (どちらも実測済み)。null のまま枝を読むと TypeError で全検査が収集時エラーになる。
   // asRecord でオブジェクトへ均しておけば、updates が空として扱われ、
   // 「ignore がちょうど 1 件」の検査が本来の文言で落ちる (fail-closed)
-  const dependabotConfig: DependabotConfig = asRecord(parsedDependabot);
-  // package.json も同様に unknown で受けてから絞る
-  const packageJson: unknown = JSON.parse(readFileSync(PACKAGE_JSON_PATH, "utf8"));
-  // ロックファイル (上流プラグイン群の peer 範囲を読むため)
-  const packageLock: unknown = JSON.parse(readFileSync(PACKAGE_LOCK_PATH, "utf8"));
+  const dependabotConfig: DependabotConfig = asRecord(dependabotRead.value);
+  // package.json は unknown で受けてから必要な枝だけ絞る
+  const packageJson: unknown = packageJsonRead.value;
+  // ロックファイルも同様
+  const packageLock: unknown = packageLockRead.value;
   // devDependencies に書かれている eslint のバージョン範囲 (無ければ undefined)
   const declaredRange = readDevDependencyRange(packageJson, GUARDED_DEPENDENCY);
   // 許容している最小 major (解釈できなければ null)
@@ -651,17 +703,21 @@ describe("dependabot.yml の ESLint major 保留", () => {
   // 次の major をまだ許していない上流 (= 保留の理由として残っているもの)
   const blockingPeers = upstreamPeers.filter((peer) => !satisfies(nextMajorVersion, peer.range));
 
-  it(".github/dependabot.yml が読めて、YAML として解釈できる", () => {
-    // 読み取り・パースで例外が出ていないこと。ここが落ちる代表例は
-    // ファイルごと削除された (= 検出対象 (b)「保留の消失」の最も極端な形) か、
-    // キーの重複などで YAML として壊れている場合。
+  it("検査に使う 3 つの入力ファイルが読めて、構造として解釈できる", () => {
+    // 読み取り・パースで例外が出ていないこと。落ちる代表例は
+    // ファイルごと削除・改名された (ENOENT) か、キーの重複やマージ事故で
+    // 壊れている (YAMLParseError / SyntaxError) 場合。
+    // 複数が同時に壊れることもあるので、1 件ずつではなくまとめて報告する。
     // 例外の内容をそのまま文言に載せて、原因の切り分けを読み手に渡す
     expect(
-      dependabotReadError === null ? null : String(dependabotReadError),
-      `.github/dependabot.yml を読めませんでした。` +
-        `ファイルが削除・改名されていないか、YAML として壊れていないかを確認してください` +
-        `(ファイルごと消えている場合、eslint の major 保留も一緒に消えています)。`,
-    ).toBeNull();
+      unreadableSources,
+      `検査に使う入力ファイルを読めませんでした: ${unreadableSources.join(" / ")}。` +
+        `削除・改名されていないか、YAML / JSON として壊れていないかを確認してください。` +
+        `.github/dependabot.yml が消えている場合は eslint の major 保留も一緒に消えており、` +
+        `package-lock.json が読めない場合は上流プラグインの peer 範囲を評価できません` +
+        `(どちらもこのファイルの検査対象そのものなので、ここで止めて他の検査に` +
+        `誤った前提で判断させないようにしています)。`,
+    ).toEqual([]);
   });
 
   it(".github/dependabot.yml に読めない形のリスト要素が無い", () => {
@@ -672,11 +728,13 @@ describe("dependabot.yml の ESLint major 保留", () => {
     // 「意図して書いた形か」は独立した検査で担保する
     expect(
       unreadableElementCount,
-      `.github/dependabot.yml のうち、この検査が実際に読む 3 か所` +
-        `(updates 直下 / 各ブロックの directories 直下 / ` +
-        `${GUARDED_ECOSYSTEM}・${GUARDED_DIRECTORY} ブロックの ignore 直下) に、` +
+      `.github/dependabot.yml のうち、この検査が実際に読む 4 か所` +
+        `(updates 直下 / ${GUARDED_ECOSYSTEM} ブロックの directories 直下 / ` +
+        `${GUARDED_ECOSYSTEM}・${GUARDED_DIRECTORY} ブロックの ignore 直下と、` +
+        `その dependency-name が文字列であること) に、` +
         `想定した形で書かれていないリスト要素が ${unreadableElementCount} 個あります。` +
-        `ブロックをコメントアウトしたときに残った空要素 \`-\` が典型です。` +
+        `ブロックをコメントアウトしたときに残った空要素 \`-\` や、` +
+        `\`dependency-name: ["eslint"]\` のような書き崩れが典型です。` +
         `この検査はそれを読み飛ばすので、放置すると設定が壊れたまま他の検査が緑になります。` +
         `不要な \`-\` を削除してください` +
         `(Dependabot 側がこの形をどう扱うかはこの環境から裏取りできていないため、` +
