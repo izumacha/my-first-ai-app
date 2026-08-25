@@ -254,7 +254,7 @@ function ecosystemBlocksOf(
  * 読み飛ばしを握り潰さないための検査。**数える範囲は「この検査が実際に読む場所」に
  * 揃える** — 読まない場所の壊れを数えても、この保留の正しさとは関係が無いのに
  * eslint の保留を守る検査が無関係なエコシステムの設定まで咎めることになる。
- * 該当するのは次の 6 通りで、どれも読み手が黙って要素・値を捨てる。
+ * 該当するのは次の 7 通りで、どれも読み手が黙って要素・値を捨てる。
  *
  * **範囲は「読み手が読みうる場所」を覆う向きに合わせる (厳密な一致ではなく過剰側)。**
  * 読み手には短絡があるため、ある実行で実際に触れる要素だけを厳密に写すことはできない
@@ -361,17 +361,18 @@ function countUnreadableElements(
       // coversDirectory は false になり、そのブロックの ignore は**丸ごと読まれない**。
       // そこに `dependency-name: "*"` (update-types 無し = 全バージョン無視) が
       // 書かれていても全検査が緑のまま通ってしまう。
-      // 上の分岐と else で分けるのは、`directories: "/"` 単独のときに
-      // 「どこも指していない」と二重に数えて件数が実際の 2 倍になるのを避けるため
+      // 上の分岐と else で分けるのは、`directories: "/"` や `directories: [-]` 単独の
+      // ときに「どこも指していない」と重ねて数え、件数が実際の 2 倍になるのを避けるため
       unreadable += countNonListKey(block, "directories");
+      // 指す先はあるが、リストに紛れた文字列以外の要素も読み手が黙って捨てるので数える
+      // (`directories: ["/", null]` のような形。これも else 側に置いて二重計上を避ける)
+      unreadable += asArray(block["directories"]).filter(
+        (value) => typeof value !== "string",
+      ).length;
     }
-    // 複数形のリストに紛れた文字列以外の要素も、読み手が黙って捨てるので数える
-    unreadable += asArray(block["directories"]).filter(
-      (value) => typeof value !== "string",
-    ).length;
   }
   // (3)(4) ignore 直下: 実際に読むのは担当ブロックだけなので、同じ絞り込みを通してから数える
-  for (const block of guardedBlocksOf(blocks, ecosystem, directory)) {
+  for (const block of guardedBlocksOf(ecosystemBlocks, directory)) {
     // ignore もキーごとリストでない形を先に数える
     unreadable += countNonListKey(block, "ignore");
     // ignore のうちオブジェクトとして読めたエントリ
@@ -555,16 +556,16 @@ function readParsed(path: string, parse: (text: string) => unknown): ReadResult 
  * 「壊れを数えている場所」がずれ、読み飛ばしの検査に穴が空く。
  */
 function guardedBlocksOf(
-  blocks: readonly Record<string, unknown>[],
-  ecosystem: string,
+  ecosystemBlocks: readonly Record<string, unknown>[],
   directory: string,
 ): Record<string, unknown>[] {
-  // エコシステムの照合は共通ヘルパーに任せ、ここではディレクトリだけを見る。
-  // エコシステムだけで最初の 1 件を採ると、npm のブロックが複数ある構成 (モノレポ等) で
-  // 別ディレクトリのブロックに書かれた ignore を、このプロジェクトに効いていると読み違える
-  return ecosystemBlocksOf(blocks, ecosystem).filter((entry) =>
-    coversDirectory(entry, directory),
-  );
+  // **エコシステムで絞った後の配列を受け取る。** 中で絞り直すと、呼び出し側が
+  // すでに同じ絞り込みを持っている場合 (countUnreadableElements) に同じ配列を
+  // 2 度走査することになる。受け取る形にすれば重複が構造的に起きない。
+  // ディレクトリで絞るのは、npm のブロックが複数ある構成 (モノレポ等) で
+  // 別ディレクトリのブロックに書かれた ignore を、このプロジェクトに効いていると
+  // 読み違えないため
+  return ecosystemBlocks.filter((entry) => coversDirectory(entry, directory));
 }
 
 /**
@@ -586,7 +587,10 @@ function collectIgnoreEntries(
 ): DependabotIgnoreEntry[] {
   // 担当ブロック (エコシステムとディレクトリの両方が一致するもの) を共通ヘルパーで得る
   // (絞り込みの理由は guardedBlocksOf 側に書いてある)
-  const blocks = guardedBlocksOf(objectElementsOf(config.updates), ecosystem, directory);
+  const blocks = guardedBlocksOf(
+    ecosystemBlocksOf(objectElementsOf(config.updates), ecosystem),
+    directory,
+  );
   // 該当ブロックの ignore から対象パッケージに当たるエントリをすべて集めて返す
   // (完全一致だけでなく `*` / `eslint*` のようなワイルドカードも拾う)。
   // ignore 側のリストにも空要素は書けるので、同じヘルパーで振るう
