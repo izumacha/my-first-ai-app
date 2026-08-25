@@ -48,7 +48,12 @@
 import { describe, expect, it } from "vitest";
 // 設定ファイルを読むため (Node 標準の同期 API で十分)
 import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { dirname, relative, resolve } from "node:path";
+// このファイル自身の場所を ESM の標準的な方法で求めるため。
+// `__dirname` は CommonJS の変数で、いまは Vitest の互換シムのおかげで動いているだけ。
+// このファイルが素の ESM として読まれた時点で ReferenceError になるので、
+// 同じ用途で REPO_ROOT を組み立てている scripts/capture-*.mjs と同じ書き方に揃える
+import { fileURLToPath } from "node:url";
 // dependabot.yml を構造として読むため
 import { parse as parseYaml } from "yaml";
 // peer 範囲が特定のバージョンを許すかを正しく判定するため。
@@ -58,8 +63,9 @@ import { parse as parseYaml } from "yaml";
 // 専用ライブラリに任せる (§9 自前実装しない)
 import { satisfies } from "semver";
 
-// リポジトリのルート (このテストファイルは tests/ 直下にある)
-const REPO_ROOT = resolve(__dirname, "..");
+// リポジトリのルート (このテストファイルは tests/ 直下にあるので 1 つ上が repo のルート)。
+// import.meta.url は「このファイルの URL」なので、それをパスへ直してから親ディレクトリを取る
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // 検査対象 1: Dependabot の設定ファイル
 const DEPENDABOT_PATH = resolve(REPO_ROOT, ".github/dependabot.yml");
 // 検査対象 2: eslint のバージョン範囲を宣言している場所
@@ -176,6 +182,214 @@ function asArray(value: unknown): unknown[] {
 }
 
 /**
+ * 配列のうち「オブジェクトとして書かれた要素」だけを返す (配列そのものは除く)。
+ *
+ * YAML のリストは、ブロックをコメントアウトした残りとして空要素 `-` を書けてしまう。
+ * それをパースすると要素が `null` になるので、素直にキーを読むと
+ * `TypeError: Cannot read properties of null` になり、**describe のトップレベルで
+ * 評価されるこのファイルは全検査が収集時エラーとして落ちる**。CI は赤くなるものの、
+ * このファイルが掲げている「何を直せばよいか分かる日本語の失敗文言」が一切出ない。
+ *
+ * そこで読めない形の要素はここで落とし、「そのエントリは無かった」ものとして扱う。
+ *
+ * **ただし「落とした」こと自体は握り潰さない。** 落とすだけだと、正しいエントリの
+ * *隣* に空要素が増えたケース (`[{...}, null]`) で件数が変わらず、設定が壊れている
+ * のに全検査が緑になる — 直前まで収集時エラーで赤かったものが静かに通るので、
+ * 修正がかえって検出網を緩めてしまう。下の countUnreadableElements で数を突き合わせ、
+ * 読めない要素が 1 つでもあれば専用の検査が落ちるようにしてある。
+ */
+function objectElementsOf(value: unknown): Record<string, unknown>[] {
+  // 配列でなければ空配列 (= 要素なし) にしてから、要素を 1 つずつ振るう
+  return asArray(value).filter(
+    // null と配列を除いたオブジェクトだけを残す (typeof は null も配列も "object" と答えるため)
+    (entry): entry is Record<string, unknown> =>
+      typeof entry === "object" && entry !== null && !Array.isArray(entry),
+  );
+}
+
+/**
+ * 「書かなくてよいが、書くならリストであるべきキー」がリストでないなら 1 を返す。
+ *
+ * 呼び出し元は countUnreadableElements の `ignore` と `directories` の 2 か所。
+ * どちらも省略できるので「無い」は壊れではないが、`ignore: {}` や
+ * `directories: "/"` のようにリスト以外へ書き換えると asArray が空配列へ均すため、
+ * **要素を数える方式では 0 のまま素通りする**。この 1 を足すことで
+ * 「書いたのに読まれていない」を捉える。
+ *
+ * `updates` がここを通らないのは、省略できないので「無い」も壊れであり、
+ * countUnreadableElements 側で `Array.isArray(...)` 1 つに畳んであるため
+ * (キーの有無で場合分けする必要がない)。
+ *
+ * なお `directories` については、これとは別に「使える値が 1 つでもあるか」も見る
+ * (`directories: []` はリストなのでここでは 0 だが、値が無いので担当から外れる)。
+ */
+function countNonListKey(container: Record<string, unknown>, key: string): number {
+  // キーが無いのは「書いていない」だけなので壊れではない
+  if (!(key in container)) return 0;
+  // キーがあるのに配列でなければ、asArray が空へ均して読み飛ばす形なので 1 つ数える
+  return Array.isArray(container[key]) ? 0 : 1;
+}
+
+/**
+ * 指定エコシステムの update ブロックを返す (ディレクトリでは絞らない)。
+ *
+ * guardedBlocksOf はこの関数の戻り値に対してだけ coversDirectory を掛けるので、
+ * **coversDirectory が呼ばれるのはここを通ったブロックだけ**。
+ * つまり「directory / directories が読まれる範囲」はこの関数の戻り値そのもの。
+ * 読み手 (guardedBlocksOf) と数え手 (countUnreadableElements) が同じ定義を
+ * 共有できるよう、エコシステムの照合を 1 か所に置く (§6 DRY)。
+ * 手で書き写すと、照合規則を変えたときに「読む場所」と「数える場所」がずれる。
+ */
+function ecosystemBlocksOf(
+  blocks: readonly Record<string, unknown>[],
+  ecosystem: string,
+): Record<string, unknown>[] {
+  // 読み込み済みのブロック配列をエコシステムで絞る
+  return blocks.filter((entry) => entry["package-ecosystem"] === ecosystem);
+}
+
+/**
+ * 設定の中に「読めない形のリスト要素」がいくつあるかを数える。
+ *
+ * 読み飛ばしを握り潰さないための検査。**数える範囲は「この検査が実際に読む場所」に
+ * 揃える** — 読まない場所の壊れを数えても、この保留の正しさとは関係が無いのに
+ * eslint の保留を守る検査が無関係なエコシステムの設定まで咎めることになる。
+ * 該当するのは次の 7 通りで、どれも読み手が黙って要素・値を捨てる。
+ *
+ * **範囲は「読み手が読みうる場所」を覆う向きに合わせる (厳密な一致ではなく過剰側)。**
+ * 読み手には短絡があるため、ある実行で実際に触れる要素だけを厳密に写すことはできない
+ * — 例えば coversDirectory は単数形の `directory` が一致した時点で true を返し、
+ * `directories` を読まずに終わる。それでも `directories` は数える: 過剰に数えると
+ * 「壊れていないのに落ちる」だけ (fail-closed) だが、取りこぼすと「壊れているのに緑」
+ * になり、この検査の存在理由そのものが失われるため。
+ * 一方で**エコシステムが違うブロックのように、どう転んでも読まない場所は数えない** —
+ * eslint の保留を守る検査が無関係な設定を咎めても直し方の案内にならないので、
+ * そこは絞る:
+ *
+ *   0. `updates` そのもの … 無い / 配列でない場合。asArray が空へ均すので
+ *      「ブロックが 1 つも無い設定」として黙って読み進んでしまう。
+ *   1. `updates` 直下 … objectElementsOf がオブジェクト以外を捨てる。
+ *      全ブロックが担当判定の対象なので、全要素が読む対象。
+ *   1'. 全ブロックの `package-ecosystem` … 文字列でない場合。ecosystemBlocksOf は
+ *      `=== ecosystem` で比べるだけなので、値が消えるとそのブロックが静かに脱落する。
+ *      この値は全ブロックについて読むので、エコシステムで絞らず全ブロックを見る。
+ *   2. **エコシステムが一致するブロックの** `directories` 直下 …
+ *      coversDirectory が文字列以外を捨てる。guardedBlocksOf の絞り込みは
+ *      ecosystemBlocksOf の戻り値にだけ coversDirectory を掛けるため
+ *      **coversDirectory が呼ばれるのはエコシステムが一致したブロックだけ**。
+ *      全ブロックを数えると、読みもしない docker ブロックの空要素を
+ *      eslint の保留を守る検査が咎めることになる。
+ *      **判定は単数形・複数形をまとめて「空でない文字列を 1 つでも持つか」で行う。**
+ *      `directory:` と値を消す・`directory: ""`・`directories: []` はどれも
+ *      「どこも指していない」ブロックになり、coversDirectory が黙って不一致にする。
+ *      すると担当ブロックが 0 件になり、(3)(4) が何も数えられなくなるうえ
+ *      **保留の期限判定ごと skip され、検出網が静かに止まる**（このとき唯一赤くなる
+ *      ignore 件数の検査は「別のブロックへ移された」と案内するので、原因からも遠ざかる）。
+ *      逆に**どこかを指してさえいれば単数形の形は問わない** — `directory:` を消しても
+ *      `directories: ["/"]` があれば読めるので、それは壊れではない。
+ *   2'. **指す先はあるが `directories` だけがリストでない形** (`directories: "/"`)。
+ *      `directory` が担当ディレクトリと違えば (`directory: "/app"`) そのブロックの
+ *      ignore は丸ごと読まれず、`dependency-name: "*"` が潜んでいても緑で通る。
+ *      2 と排他にして、同じキーの壊れを二重に数えないようにしている。
+ *   3. **担当ブロックの** `ignore` 直下 … objectElementsOf がオブジェクト以外を捨てる。
+ *      ignore を読むのは担当ブロック (エコシステム＋ディレクトリが一致) だけなので、
+ *      ここは担当分に絞る。
+ *   4. **担当ブロックの** `ignore` のうち `dependency-name` が文字列でないもの …
+ *      ignoreNameMatches が文字列以外を「当たらない」として捨てる。
+ *      `dependency-name: ["eslint"]` のように書き崩れたエントリが、
+ *      正しいエントリの隣にあると件数が変わらず素通りする。
+ *
+ * 各読み手の受け入れ条件をこちら側から組み立て直す形なので、**読み手を増やしたら
+ * ここにも足す**必要がある (読み手自身に「何を捨てたか」を報告させる設計なら
+ * 足し忘れは起きないが、既存の 4 つの読み手すべての戻り値を変える改修になるため、
+ * ここでは列挙を保ち、対応関係を上のとおり明記しておく)。
+ *
+ * これを検査しないと、空要素 `-` が正しいエントリの隣に増えたときに件数が変わらず、
+ * 壊れた設定のまま緑になる。**Dependabot がこの形の設定をどう扱うかは
+ * docs.github.com へ到達できず裏取りできていない**ので、「無害だから通してよい」とは
+ * 判断せず、意図して書いた形でない時点で落とす (fail-closed)。
+ */
+function countUnreadableElements(
+  config: DependabotConfig,
+  ecosystem: string,
+  directory: string,
+): number {
+  // (0) リストであるべきキーがリストでない形も数える。
+  //     `updates: {...}` や `directories: "/"` のように**キーごと別の形へ**書き換えると、
+  //     asArray が空配列に均すので「要素の数え上げ」では 0 のまま素通りしてしまう。
+  //     結果は directory を消したときと同じで、担当ブロックが 0 件になって
+  //     期限判定ごと skip され、検出網が静かに止まる
+  // `updates` は「無い」も「リストでない」も同じ結末 (空として読み飛ばす) なので、
+  // キーの有無で場合分けせず「配列であること」だけを求める
+  let unreadable = Array.isArray(config.updates) ? 0 : 1;
+  // (1) updates 直下: 元の要素数から、オブジェクトとして読めた数を引く
+  const blocks = objectElementsOf(config.updates);
+  unreadable += asArray(config.updates).length - blocks.length;
+  // (1') package-ecosystem が文字列でないブロックを数える。ecosystemBlocksOf は
+  //      値を `=== ecosystem` で比べるだけなので、値を消すと**全ブロックが静かに脱落**し、
+  //      担当ブロックが 0 件 → 期限判定ごと skip という同じ結末になる。
+  //      この値は全ブロックについて読むので、絞らず全ブロックを見る
+  unreadable += blocks.filter(
+    (block) => typeof block["package-ecosystem"] !== "string",
+  ).length;
+  // (2) directory / directories: coversDirectory が呼ばれるのはエコシステムが一致した
+  //     ブロックだけ (guardedBlocksOf が ecosystemBlocksOf の戻り値にだけ
+  //     coversDirectory を掛けるため)。読む範囲に合わせて同じ絞り込みを使う。
+  //     **同じ blocks 配列を渡す**ので、読み手と数え手が同じ要素集合を見ることが
+  //     引数の受け渡しで保証される (走査し直すと同一性を目視で確かめる羽目になる)
+  const ecosystemBlocks = ecosystemBlocksOf(blocks, ecosystem);
+  for (const block of ecosystemBlocks) {
+    // **「キーがあるか」ではなく「使える値が 1 つでもあるか」で見る。**
+    // キーの有無や形だけを個別に数えると、`directories: []`(空リスト) や
+    // `directory: ""` のように**キーはあるが値が無い**形を取りこぼす。どれも
+    // coversDirectory が黙って不一致にするので、担当ブロックが 0 件になり
+    // **期限判定ごと skip されて検出網が静かに止まる**という同じ結末になる
+    // (しかも唯一赤くなる ignore 件数の検査は「別のブロックへ移された」と案内し、
+    //  原因から遠ざかる)。単数形・複数形をまとめて 1 つの条件で見る
+    const declaredDirectories = [block["directory"], ...asArray(block["directories"])];
+    // 空でない文字列が 1 つでもあれば、このブロックはどこかを指している
+    const pointsSomewhere = declaredDirectories.some(
+      (value) => typeof value === "string" && value !== "",
+    );
+    if (!pointsSomewhere) {
+      // どこも指していない = 壊れているので 1 つ数える
+      unreadable += 1;
+    } else {
+      // 指す先はあるが、`directories` だけがリストでない形 (`directories: "/"` 等) の場合。
+      // **「使える directory があるなら害は無い」は成り立たない** — `directory` が
+      // 空でない文字列でも、それが担当ディレクトリと違えば (`directory: "/app"`)
+      // coversDirectory は false になり、そのブロックの ignore は**丸ごと読まれない**。
+      // そこに `dependency-name: "*"` (update-types 無し = 全バージョン無視) が
+      // 書かれていても全検査が緑のまま通ってしまう。
+      // 上の分岐と else で分けるのは、`directories: "/"` や `directories: [-]` 単独の
+      // ときに「どこも指していない」と重ねて数え、件数が実際の 2 倍になるのを避けるため
+      unreadable += countNonListKey(block, "directories");
+      // 指す先はあるが、リストに紛れた文字列以外の要素も読み手が黙って捨てるので数える
+      // (`directories: ["/", null]` のような形。これも else 側に置いて二重計上を避ける)
+      unreadable += asArray(block["directories"]).filter(
+        (value) => typeof value !== "string",
+      ).length;
+    }
+  }
+  // (3)(4) ignore 直下: 実際に読むのは担当ブロックだけなので、同じ絞り込みを通してから数える
+  for (const block of guardedBlocksOf(ecosystemBlocks, directory)) {
+    // ignore もキーごとリストでない形を先に数える
+    unreadable += countNonListKey(block, "ignore");
+    // ignore のうちオブジェクトとして読めたエントリ
+    const entries = objectElementsOf(block["ignore"]);
+    // (3) オブジェクトですらない要素 (空要素 `-` など) は元の要素数との差で数える
+    unreadable += asArray(block["ignore"]).length - entries.length;
+    // (4) オブジェクトではあるが dependency-name が文字列でないものも読み飛ばされる
+    //     (ignoreNameMatches が文字列以外を「当たらない」として捨てるため)
+    unreadable += entries.filter(
+      (entry) => typeof entry["dependency-name"] !== "string",
+    ).length;
+  }
+  // 合計を返す (0 なら「読む場所」に読めない要素は無い)
+  return unreadable;
+}
+
+/**
  * ignore エントリの `dependency-name` が、対象パッケージに当たるかを判定する。
  *
  * Dependabot の `dependency-name` は `*` をワイルドカードとして解釈するため、
@@ -236,6 +450,125 @@ function directoryPatternCovers(pattern: string, directory: string): boolean {
 }
 
 /**
+ * 入力ファイルの表示名 (repo ルートからの相対パス) を返す。
+ *
+ * 失敗文言とテスト名で同じ名前を何度も使うので、導き方を 1 か所に置く (§6 DRY)。
+ * 表示の仕方を変えたくなったとき、書き換える場所が 1 つで済むようにする。
+ */
+function displayPath(path: string): string {
+  // repo ルートからの相対パスにすると、環境ごとの絶対パスが文言に混ざらない
+  return relative(REPO_ROOT, path);
+}
+
+/**
+ * 読み取り例外を、環境ごとの絶対パスを含まない形の文字列にする。
+ *
+ * 例外メッセージには絶対パスがそのまま入る (ENOENT は
+ * `open '/home/<誰か>/my-first-ai-app/package-lock.json'` の形)。displayPath で
+ * ファイル名だけ相対化しても、隣に貼る原因文字列から絶対パスが漏れては同じこと
+ * — CI の出力が実行機ごとに変わり、手元と突き合わせづらくなる。
+ * repo ルートの接頭辞だけを畳んで、相対パスとして読めるようにする。
+ */
+function describeReadError(error: unknown, root: string): string {
+  // 例外を文字列にしてから、repo ルートの接頭辞をすべて取り除く
+  return String(error).split(`${root}/`).join("");
+}
+
+/**
+ * 値の「形」だけを短い日本語で表す (失敗文言に埋め込む用)。
+ *
+ * 値そのものを文字列化しないのは、JSON.stringify が循環参照で例外を投げるうえ
+ * (YAML のアンカーで自己参照する配列が書ける)、大きな値だと文言が読めなくなるため。
+ * ここで返すのは固定長の短い語句だけなので、どんな入力でも安全に使える。
+ */
+function describeShape(value: unknown): string {
+  // null は typeof が "object" になるので先に分ける
+  if (value === null) return "null";
+  // 配列も typeof が "object" なので個別に名前を付ける
+  if (Array.isArray(value)) return "配列";
+  // それ以外は型名だけを返す (string / number / boolean / undefined / object)
+  return typeof value;
+}
+
+// 1 つの入力ファイルを読んだ結果 (解釈できた値と、読めなかったときの原因)
+interface ReadResult {
+  // パースできた値 (読めなければ null)
+  value: unknown;
+  // 読み取り・パースで投げられた例外 (問題なければ null)
+  error: unknown;
+}
+
+/**
+ * ファイルを読んで解釈し、**例外を投げずに** 結果か原因のどちらかを返す。
+ *
+ * 3 つの入力 (dependabot.yml / package.json / package-lock.json) はいずれも
+ * describe のトップレベルで読まれる。そこで例外が投げられると、このファイルの検査は
+ * すべて「収集時エラー」になり、丁寧に書いた日本語の失敗文言が 1 つも出ない。
+ * 実際に起こりうるのは、ファイルの削除・改名 (ENOENT)、マージ事故による破損
+ * (SyntaxError / YAMLParseError) など。とくに dependabot.yml の削除は検出対象 (b)
+ * 「保留の消失」そのもので、ロックファイルの破損は
+ * 「上流プラグインがすべて読み取れる」検査の対象そのものなので、
+ * **そこで案内が消えるとこのファイルの存在意義が失われる**。
+ *
+ * 例外は握り潰さず ReadResult に載せ、専用のテストが原因付きで報告する
+ * (CLAUDE.md §6 エラーを握り潰さない)。
+ */
+function readParsed(path: string, parse: (text: string) => unknown): ReadResult {
+  // 読み取りとパースの結果を受ける入れ物
+  let value: unknown;
+  try {
+    // ファイルを読んで解釈する
+    value = parse(readFileSync(path, "utf8"));
+  } catch (error) {
+    // 読めなかった場合は値を持たず、原因だけを返す
+    return { value: null, error };
+  }
+  // **例外が出なくても「構造として解釈できた」とは限らない。**
+  // 空ファイルや全体をコメントアウトしたファイルは parseYaml が null を返す (実測)。
+  // これを素通りさせると、「構造として解釈できる」と名乗るテストが
+  // 中身の無いファイルに対して緑になり、読み手に誤った安心を与える。
+  // 3 つの入力はいずれもトップレベルがオブジェクトである前提なので、そうでなければ
+  // 読めなかったものとして扱う (fail-closed)
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    // 何が入っていたかを添えて原因を作る。**値そのものは埋め込まない** —
+    // JSON.stringify は循環参照 (YAML のアンカーで自己参照配列が書ける。実測) で
+    // 例外を投げ、しかもこの行は catch の外なので、収集時エラーになって
+    // この関数の存在意義 (例外を投げない) が崩れる。巨大な値の丸ごと出力も避ける
+    return {
+      value: null,
+      error: new Error(
+        // 末尾に句点を置かない — 呼び出し側が原因を文中へ差し込むときに句点を足すため
+        `トップレベルがオブジェクトではありません (${describeShape(value)})。` +
+          `空ファイル・全体のコメントアウト・別の形への書き換えが疑われます`,
+      ),
+    };
+  }
+  // ここまで来れば構造として読めている
+  return { value, error: null };
+}
+
+/**
+ * この検査が「担当する」update ブロック (エコシステムとディレクトリの両方が一致) を返す。
+ *
+ * 絞り込みを 1 か所に集約するためのヘルパー (§6 DRY)。ignore を実際に読む
+ * collectIgnoreEntries と、その読み飛ばしを数える countUnreadableElements が
+ * **同じ条件**で動く必要がある。片方だけ条件が変わると「読んでいる場所」と
+ * 「壊れを数えている場所」がずれ、読み飛ばしの検査に穴が空く。
+ */
+function guardedBlocksOf(
+  ecosystemBlocks: readonly Record<string, unknown>[],
+  directory: string,
+): Record<string, unknown>[] {
+  // **エコシステムで絞った後の配列を受け取る。** 中で絞り直すと、呼び出し側が
+  // すでに同じ絞り込みを持っている場合 (countUnreadableElements) に同じ配列を
+  // 2 度走査することになる。受け取る形にすれば重複が構造的に起きない。
+  // ディレクトリで絞るのは、npm のブロックが複数ある構成 (モノレポ等) で
+  // 別ディレクトリのブロックに書かれた ignore を、このプロジェクトに効いていると
+  // 読み違えないため
+  return ecosystemBlocks.filter((entry) => coversDirectory(entry, directory));
+}
+
+/**
  * 指定したエコシステムの ignore から、対象パッケージのエントリを**すべて**集める。
  *
  * 1 件目だけを取らないのは、Dependabot が同じパッケージに対する複数のエントリを
@@ -252,20 +585,19 @@ function collectIgnoreEntries(
   directory: string,
   dependencyName: string,
 ): DependabotIgnoreEntry[] {
-  // updates 直下から「エコシステムとディレクトリの両方が一致する」ブロックを集める。
-  // エコシステムだけで最初の 1 件を採ると、npm のブロックが複数ある構成 (モノレポ等) で
-  // 別ディレクトリのブロックに書かれた ignore を、このプロジェクトに効いていると読み違える
-  const blocks = asArray(config.updates)
-    .map((entry) => entry as DependabotUpdateEntry)
-    .filter(
-      (entry) => entry["package-ecosystem"] === ecosystem && coversDirectory(entry, directory),
-    );
+  // 担当ブロック (エコシステムとディレクトリの両方が一致するもの) を共通ヘルパーで得る
+  // (絞り込みの理由は guardedBlocksOf 側に書いてある)
+  const blocks = guardedBlocksOf(
+    ecosystemBlocksOf(objectElementsOf(config.updates), ecosystem),
+    directory,
+  );
   // 該当ブロックの ignore から対象パッケージに当たるエントリをすべて集めて返す
-  // (完全一致だけでなく `*` / `eslint*` のようなワイルドカードも拾う)
+  // (完全一致だけでなく `*` / `eslint*` のようなワイルドカードも拾う)。
+  // ignore 側のリストにも空要素は書けるので、同じヘルパーで振るう
   return blocks.flatMap((block) =>
-    asArray(block.ignore)
-      .map((entry) => entry as DependabotIgnoreEntry)
-      .filter((entry) => ignoreNameMatches(entry["dependency-name"], dependencyName)),
+    objectElementsOf(block.ignore).filter((entry) =>
+      ignoreNameMatches(entry["dependency-name"], dependencyName),
+    ),
   );
 }
 
@@ -443,11 +775,21 @@ function asRecord(value: unknown): Record<string, unknown> {
  * ignore エントリに書かれているキーを並べ替えて返す。
  *
  * 想定外のキー (`versions` など) が増えていないかを比較するために使う。
- * オブジェクトでなければ空配列を返し、呼び出し側の比較を落とす方向へ倒す。
+ *
+ * **要素がオブジェクトであることは呼び出し側が保証している。** 渡ってくるのは
+ * collectIgnoreEntries の戻り値の要素だけで、そこは objectElementsOf を通しているため
+ * null や非オブジェクトは既に振るい落とされている。ここで同じ判定を重ねても
+ * 決して真にならない分岐が増えるだけなので置かない (CLAUDE.md §6 デッドコードを残さない)。
+ *
+ * **「要素がオブジェクトであること」と「その要素が存在すること」は別の話で、
+ * 保証の強さが違うので扱いも変える。** 前者は objectElementsOf という*構築*が
+ * 型のレベルで保証しており、崩す方法が無いので分岐を置かない (§6)。後者
+ * (空配列への添字アクセスが undefined になること) を防いでいるのは
+ * 「直前の toHaveLength(1) が先に throw する」という**文の並び順だけ**で、
+ * 検査を分割・並べ替えれば簡単に崩れる。だから呼び出し側は `?? {}` を残している。
+ * 一方だけ残っているのは書き忘れではなく、この差による意図的な非対称。
  */
 function sortedKeysOf(entry: DependabotIgnoreEntry): string[] {
-  // オブジェクトでなければキーを数えようがない
-  if (typeof entry !== "object" || entry === null) return [];
   // キーを取り出して並べ替える (比較しやすくするため)
   return Object.keys(entry).sort();
 }
@@ -491,16 +833,48 @@ function readDevDependencyRange(json: unknown, dependencyName: string): unknown 
 }
 
 describe("dependabot.yml の ESLint major 保留", () => {
-  // Dependabot 設定を構造として読む (コメントはパーサが落とすので検査に混ざらない)
-  const dependabotConfig = parseYaml(readFileSync(DEPENDABOT_PATH, "utf8")) as DependabotConfig;
-  // package.json も同様に unknown で受けてから絞る
-  const packageJson: unknown = JSON.parse(readFileSync(PACKAGE_JSON_PATH, "utf8"));
+  // 3 つの入力を、例外を投げない形で読む (理由は readParsed の docstring)。
+  // Dependabot 設定は構造として読む (コメントはパーサが落とすので検査に混ざらない)
+  const dependabotRead = readParsed(DEPENDABOT_PATH, parseYaml);
+  // package.json (eslint のバージョン範囲の宣言もと)
+  const packageJsonRead = readParsed(PACKAGE_JSON_PATH, JSON.parse);
   // ロックファイル (上流プラグイン群の peer 範囲を読むため)
-  const packageLock: unknown = JSON.parse(readFileSync(PACKAGE_LOCK_PATH, "utf8"));
+  const packageLockRead = readParsed(PACKAGE_LOCK_PATH, JSON.parse);
+  // 読めなかったファイルだけを、原因付きで集める (下の専用テストが報告する)。
+  // 表示名はパス定数から導く — 文字列で書き写すと、定数を変えたときに
+  // 「読んでいるファイル」と「文言が名指しするファイル」がずれる (§6 一元管理)
+  const inputSources = [
+    { path: DEPENDABOT_PATH, error: dependabotRead.error },
+    { path: PACKAGE_JSON_PATH, error: packageJsonRead.error },
+    { path: PACKAGE_LOCK_PATH, error: packageLockRead.error },
+  ];
+  const unreadableSources = inputSources
+    // 読めたものは報告対象から外す
+    .filter((source) => source.error !== null)
+    // 失敗文言に載せるため、repo ルートからの相対パスと原因を組み立てる
+    .map(
+      (source) => `${displayPath(source.path)}: ${describeReadError(source.error, REPO_ROOT)}`,
+    );
+  // **パース結果は null にもなる** — 空ファイルや、全体をコメントアウトしたファイルが該当する
+  // (どちらも実測済み)。null のまま枝を読むと TypeError で全検査が収集時エラーになる。
+  // asRecord でオブジェクトへ均しておけば、updates が空として扱われ、
+  // 「ignore がちょうど 1 件」の検査が本来の文言で落ちる (fail-closed)
+  const dependabotConfig: DependabotConfig = asRecord(dependabotRead.value);
+  // package.json は unknown で受けてから必要な枝だけ絞る
+  const packageJson: unknown = packageJsonRead.value;
+  // ロックファイルも同様
+  const packageLock: unknown = packageLockRead.value;
   // devDependencies に書かれている eslint のバージョン範囲 (無ければ undefined)
   const declaredRange = readDevDependencyRange(packageJson, GUARDED_DEPENDENCY);
   // 許容している最小 major (解釈できなければ null)
   const allowedMajor = parseAllowedMajor(declaredRange);
+  // この検査が実際に読む場所に、読めないリスト要素がいくつあるか (0 が正常)。
+  // 絞り込み条件は collectIgnoreEntries と同じものを渡す
+  const unreadableElementCount = countUnreadableElements(
+    dependabotConfig,
+    GUARDED_ECOSYSTEM,
+    GUARDED_DIRECTORY,
+  );
   // npm エコシステムの ignore にある eslint のエントリ (複数書かれていればすべて)
   const ignoreEntries = collectIgnoreEntries(
     dependabotConfig,
@@ -509,10 +883,30 @@ describe("dependabot.yml の ESLint major 保留", () => {
     GUARDED_DEPENDENCY,
   );
 
+  // ロックファイルが「この検査に使える構造」を持っているか。
+  // **例外が出ないことだけでは足りない。** lockfileVersion 1 形式 (packages 枝が無く
+  // dependencies だけ)、設定パッケージのエントリが null、その `dependencies` 枝が
+  // 無い、といった形はいずれも readParsed から見れば「トップレベルはオブジェクト」で
+  // error が立たない。その状態で規則照合を走らせると deriveExpectedPlugins が
+  // [] を返し、「一覧を合わせてください」→ 一覧を空にする → 期限判定が un-skip →
+  // 「ignore を削除してください」という、lint を壊す助言の連鎖に入ってしまう。
+  //
+  // **判定は「規則から 1 つでも導けたか」で行う。** 「エントリが undefined でないか」
+  // のような手前の条件で代用すると、deriveExpectedPlugins が実際に要求する前提
+  // (null でないオブジェクトで、かつ dependencies が読める) との差から漏れが出る。
+  // 使う側と同じ結果を見れば、前提が増えても判定が自動で追随する
+  const derivedFromRule = deriveExpectedPlugins(packageLock);
+  // ロックに依存する検査を走らせてよいか = 規則から 1 つでも導けたか。
+  // **読めなかった場合もこの 1 つで足りる** — readParsed は失敗時に必ず value: null を
+  // 返すので、deriveExpectedPlugins(null) は [] になりここが false になる。
+  // `packageLockRead.error === null` を並べても判定を変えないため置かない
+  // (§6 デッドコードを残さない)。名前も 1 つに保ち、
+  // 「構造の検査」と「それを根拠に skip する検査」が同じ述語を見ていることを明らかにする
+  const lockUsable = derivedFromRule.length > 0;
   // ロックファイルに記録されている上流プラグイン群の peer 範囲
   const upstreamPeers = collectUpstreamPeers(packageLock);
   // 規則 (設定パッケージの直接依存 ＋ repo 固有分) から導いた「見張るべき一覧」
-  const derivedPlusLocal = [...deriveExpectedPlugins(packageLock), ...LOCALLY_ADDED_LINT_PLUGINS];
+  const derivedPlusLocal = [...derivedFromRule, ...LOCALLY_ADDED_LINT_PLUGINS];
   // 一覧が規則どおりか。ずれているなら「見張るべきなのに見張れていない」ものが居る。
   // 下の規則照合テストと同じ正規化 (sortedNames) を通すので、判定が食い違わない
   const pluginListMatchesRule = sameNameSet(derivedPlusLocal, REQUIRED_UPSTREAM_PLUGINS);
@@ -521,67 +915,190 @@ describe("dependabot.yml の ESLint major 保留", () => {
   // 次の major をまだ許していない上流 (= 保留の理由として残っているもの)
   const blockingPeers = upstreamPeers.filter((peer) => !satisfies(nextMajorVersion, peer.range));
 
-  it("package.json の eslint バージョン範囲が、このテストで解釈できる形で書かれている", () => {
-    // ここが落ちると、下の構造検査とダウングレード検査が skip され、
-    // ignore の削除・重複を捕まえる網まで黙って無効になる。何を直せばよいかを明示する
+  // 件数もファイル名も定数側から導く — テスト名に書き写すと、入力を増減したときや
+  // パス定数を変えたときに、CI の出力だけが実態と食い違ったまま残る (§6 一元管理)
+  it(`検査に使う ${inputSources.length} つの入力ファイルが読めて、構造として解釈できる`, () => {
+    // 読み取り・パースで例外が出ていないこと。落ちる代表例は
+    // ファイルごと削除・改名された (ENOENT) か、キーの重複やマージ事故で
+    // 壊れている (YAMLParseError / SyntaxError) 場合。
+    // 複数が同時に壊れることもあるので、1 件ずつではなくまとめて報告する。
+    // 例外の内容をそのまま文言に載せて、原因の切り分けを読み手に渡す
     expect(
-      allowedMajor,
-      `package.json の devDependencies.${GUARDED_DEPENDENCY} を、` +
-        `\`^9.39.4\` のような「先頭に ^ か ~ が 1 つ、あとは数字とドット」の形で書いてください` +
-        `(現在の値: ${JSON.stringify(declaredRange)})。` +
-        `dependencies へ移した・キーごと消した場合もここで落ちます。` +
-        `この検査が落ちている間は ignore の削除・重複を見張る検査が skip され、` +
-        `検出網が無効になります。`,
-    ).not.toBeNull();
+      unreadableSources,
+      `検査に使う入力ファイルを読めませんでした: ${unreadableSources.join(" / ")}。` +
+        `削除・改名されていないか、YAML / JSON として壊れていないかを確認してください。` +
+        `${displayPath(DEPENDABOT_PATH)} が消えている場合は ` +
+        `${GUARDED_DEPENDENCY} の major 保留も一緒に消えており、` +
+        `${displayPath(PACKAGE_LOCK_PATH)} が読めない場合は ` +
+        `上流プラグインの peer 範囲を評価できません` +
+        `(どちらもこのファイルの検査対象そのものなので、ここで止めて他の検査に` +
+        `誤った前提で判断させないようにしています)。`,
+    ).toEqual([]);
   });
 
-  it("REQUIRED_UPSTREAM_PLUGINS が規則から導いた一覧と一致する", () => {
-    // 規則 (eslint-config-next の直接依存のうち eslint に peer 依存を宣言しているもの) を
-    // ロックファイルから実際に導く
-    // 規則から導いた一覧が「正」。手書きの REQUIRED_UPSTREAM_PLUGINS を received 側に
-    // 置くことで、Vitest の差分が「期待 = 規則 / 実際 = 手書き」の向きで表示される
-    // (逆にすると、古い手書きの一覧が正であるかのように読めてしまう)
-    const expected = sortedNames(derivedPlusLocal);
-    // 並び順は意味を持たないので、両方を並べ替えてから比較する
-    expect(
-      sortedNames(REQUIRED_UPSTREAM_PLUGINS),
-      `REQUIRED_UPSTREAM_PLUGINS が規則からずれています。` +
-        `規則は「${UPSTREAM_CONFIG_PACKAGE} の直接依存のうち ${GUARDED_DEPENDENCY} に ` +
-        `peer 依存を宣言しているもの全部 ＋ LOCALLY_ADDED_LINT_PLUGINS」で、` +
-        `規則から導けるのは [${expected.join(", ") || "なし"}]、` +
-        `一覧に書かれているのは [${sortedNames(REQUIRED_UPSTREAM_PLUGINS).join(", ")}]。` +
-        `**一覧に足りないものがあるなら、そのパッケージは lint 実行に載るのに ` +
-        `見張られていません** — 9 系に留まったまま他が 10 対応すると、期限判定が誤って ` +
-        `保留解除を促します(そのため一覧がずれている間、期限判定は skip されます)。` +
-        `上流の依存構成が変わったなら REQUIRED_UPSTREAM_PLUGINS を合わせてください。` +
-        `${UPSTREAM_CONFIG_PACKAGE} の依存ではなく eslint.config.mjs へ直接載せた ` +
-        `プラグインなら、REQUIRED_UPSTREAM_PLUGINS と LOCALLY_ADDED_LINT_PLUGINS の ` +
-        `両方へ足すと一致します。` +
-        `**一覧の増減は .github/dependabot.yml と CLAUDE.md §3 の説明にも反映してください** ` +
-        `(そちらは機械検査が無いので、直さないとコードと説明が食い違ったまま残ります)。`,
-    ).toEqual(expected);
-  });
+  // ロックファイル自体が読めていないときは対象外 (直前のテストが原因を報告する)
+  it.skipIf(packageLockRead.error !== null)(
+    `${displayPath(PACKAGE_LOCK_PATH)} が、この検査の使う構造を持っている`,
+    () => {
+      // JSON として読めても、この検査が辿る枝が無ければ peer 範囲を評価できない。
+      // 下のロック依存の検査はこの状態だと skip されるので、**なぜ skip されたのか**を
+      // 示す役割をこのテストが持つ (黙って評価されないまま緑にしない)
+      expect(
+        lockUsable,
+        `${displayPath(PACKAGE_LOCK_PATH)} から、規則 (${UPSTREAM_CONFIG_PACKAGE} の直接依存の` +
+          `うち ${GUARDED_DEPENDENCY} に peer 依存を宣言しているもの) が 1 つも導けません。` +
+          `packages 枝を持たない lockfileVersion 1 形式への差し替え、` +
+          `node_modules/${UPSTREAM_CONFIG_PACKAGE} エントリの欠落や null、` +
+          `その dependencies 枝の欠落が疑われます。` +
+          `この状態では上流プラグインの peer 範囲を評価できないため、` +
+          `規則照合と期限判定は skip しています` +
+          `(走らせると「監視対象は 1 つも無い」と読める文言が出て、` +
+          `一覧を空にし ignore を削除する方向へ誤って誘導するため)。` +
+          `npm install で再生成するか、依存構成の変更なら保留の前提ごと見直してください。`,
+      ).toBe(true);
+    },
+  );
+
+  // 入力そのものが読めていないときは対象外 (skip として CI の出力にも現れる)。
+  // 空ファイルや削除で dependabotConfig が {} に均された状態でこの検査を走らせると、
+  // 「読めない要素は 0 個」と**中身の無いファイルに対して緑**になり、
+  // 直前のテストが赤いのに「設定は健全」と読める出力が並んでしまう。
+  // 評価できないことは skip で示し、原因の報告は直前のテストに任せる
+  // **判定はこのファイルが読めたかどうかだけを見る。** unreadableSources 全体で
+  // 判定すると、無関係な package-lock.json の破損だけでこの検査が止まり、
+  // 同時に混入した dependabot.yml の壊れが 1 つも報告されなくなる
+  // (objectElementsOf が黙って読み飛ばすので他の検査は緑のまま通る)
+  it.skipIf(dependabotRead.error !== null)(
+    `${displayPath(DEPENDABOT_PATH)} に読めない形のリスト要素が無い`,
+    () => {
+      // 空要素 `-` (ブロックをコメントアウトした残り) が混ざっていないかを見る。
+      // この検査が無いと、正しいエントリの**隣**に空要素が増えたケースで
+      // ignore の件数が変わらず、壊れた設定のまま全検査が緑になる。
+      // 読み手側 (このテスト) が黙って読み飛ばすようになった分、
+      // 「意図して書いた形か」は独立した検査で担保する
+      expect(
+        unreadableElementCount,
+        `${displayPath(DEPENDABOT_PATH)} のうち、この検査が実際に読む場所に、` +
+          `想定した形で書かれていない箇所が ${unreadableElementCount} 個あります。` +
+          `読む場所と典型的な壊れ方は次のとおりです — ` +
+          `(a) updates そのもの: キーが無い / リストでない。` +
+          `(b) updates 直下: ブロックをコメントアウトしたときに残った空要素 \`-\`。` +
+          `(c) **全ブロックの** package-ecosystem: 値が消えている ` +
+          `(${GUARDED_ECOSYSTEM} 以外のブロックも対象。値で担当を選ぶため全部読みます)。` +
+          `(d) ${GUARDED_ECOSYSTEM} ブロックの directory / directories: ` +
+          `どこも指していない (\`directory:\` と値を消す・\`directories: []\`) か、` +
+          `directories がリストでない (\`directories: "/"\`)。` +
+          `(e) ${GUARDED_ECOSYSTEM}・${GUARDED_DIRECTORY} ブロックの ignore: ` +
+          `キーがリストでない・空要素 \`-\`・` +
+          `\`dependency-name: ["eslint"]\` のように名前が文字列でない。` +
+          `この検査はそれを読み飛ばすので、放置すると設定が壊れたまま他の検査が緑になります` +
+          `(とくに \`directory\` が読めないと担当ブロックが 0 件になり、` +
+          `保留の期限判定ごと skip されて検出網が静かに止まります)。` +
+          `(Dependabot 側がこの形をどう扱うかはこの環境から裏取りできていないため、` +
+          `無害と決めつけず意図した形でない時点で落としています)。`,
+      ).toBe(0);
+    },
+  );
+
+  // package.json そのものが読めていないときは対象外 (skip として CI の出力にも現れる)。
+  // 走らせると「`^9.39.4` の形で書いてください(現在の値: undefined)。dependencies へ
+  // 移した・キーごと消した場合もここで落ちます」と、**どれも当てはまらない原因**だけを
+  // 名指ししてしまい、実際の欠損・破損へ辿り着けない。原因の報告は入力ファイルの検査に任せる
+  it.skipIf(packageJsonRead.error !== null)(
+    `${displayPath(PACKAGE_JSON_PATH)} の ${GUARDED_DEPENDENCY} バージョン範囲が、` +
+      `このテストで解釈できる形で書かれている`,
+    () => {
+      // ここが落ちると、下の構造検査とダウングレード検査が skip され、
+      // ignore の削除・重複を捕まえる網まで黙って無効になる。何を直せばよいかを明示する
+      expect(
+        allowedMajor,
+        `${displayPath(PACKAGE_JSON_PATH)} の devDependencies.${GUARDED_DEPENDENCY} を、` +
+          // 書式例の major は留め置き中の major に追随させる。ここだけ数字を直書きすると、
+          // HELD_MAJOR を新しい major へ更新し直したときに例だけ古い数字のまま残り、
+          // 「^11 と書いてあるのに ^9 にしろと言われた」という誤解を生む
+          `\`^${HELD_MAJOR}.39.4\` のような` +
+          `「先頭に ^ か ~ が 1 つ、あとは数字とドット」の形で書いてください` +
+          `(現在の値: ${JSON.stringify(declaredRange)})。` +
+          `dependencies へ移した・キーごと消した場合もここで落ちます。` +
+          `この検査が落ちている間は ignore の削除・重複を見張る検査が skip され、` +
+          `検出網が無効になります。`,
+      ).not.toBeNull();
+    },
+  );
+
+  // ロックファイルが読めていないときは対象外 (skip として CI の出力にも現れる)。
+  // **ここを走らせると助言そのものが有害になる。** 読めないと deriveExpectedPlugins は
+  // [] を返すので「規則から導けるのは [なし]」と出て「一覧を合わせてください」と促すが、
+  // 従って一覧を空にすると件数一致と規則一致が両方成立し、期限判定が un-skip されて
+  // 「すべて eslint 10 を許すようになりました…ignore を削除してください」まで進む。
+  // 削除すると eslint 10 が入り lint が壊れる。原因の報告は入力ファイルの検査に任せる
+  it.skipIf(!lockUsable)(
+    "REQUIRED_UPSTREAM_PLUGINS が規則から導いた一覧と一致する",
+    () => {
+      // 規則 (eslint-config-next の直接依存のうち eslint に peer 依存を宣言しているもの) を
+      // ロックファイルから実際に導く
+      // 規則から導いた一覧が「正」。手書きの REQUIRED_UPSTREAM_PLUGINS を received 側に
+      // 置くことで、Vitest の差分が「期待 = 規則 / 実際 = 手書き」の向きで表示される
+      // (逆にすると、古い手書きの一覧が正であるかのように読めてしまう)
+      const expected = sortedNames(derivedPlusLocal);
+      // 並び順は意味を持たないので、両方を並べ替えてから比較する
+      expect(
+        sortedNames(REQUIRED_UPSTREAM_PLUGINS),
+        `REQUIRED_UPSTREAM_PLUGINS が規則からずれています。` +
+          `規則は「${UPSTREAM_CONFIG_PACKAGE} の直接依存のうち ${GUARDED_DEPENDENCY} に ` +
+          `peer 依存を宣言しているもの全部 ＋ LOCALLY_ADDED_LINT_PLUGINS」で、` +
+          `規則から導けるのは [${expected.join(", ") || "なし"}]、` +
+          `一覧に書かれているのは [${sortedNames(REQUIRED_UPSTREAM_PLUGINS).join(", ")}]。` +
+          `**一覧に足りないものがあるなら、そのパッケージは lint 実行に載るのに ` +
+          `見張られていません** — ${HELD_MAJOR} 系に留まったまま他が ${HELD_MAJOR + 1} ` +
+          `対応すると、期限判定が誤って ` +
+          `保留解除を促します(そのため一覧がずれている間、期限判定は skip されます)。` +
+          `上流の依存構成が変わったなら REQUIRED_UPSTREAM_PLUGINS を合わせてください。` +
+          `${UPSTREAM_CONFIG_PACKAGE} の依存ではなく eslint.config.mjs へ直接載せた ` +
+          `プラグインなら、REQUIRED_UPSTREAM_PLUGINS と LOCALLY_ADDED_LINT_PLUGINS の ` +
+          `両方へ足すと一致します。` +
+          `**一覧の増減は ${displayPath(DEPENDABOT_PATH)} と CLAUDE.md §3 の説明にも ` +
+          `反映してください** ` +
+          `(そちらは機械検査が無いので、直さないとコードと説明が食い違ったまま残ります)。`,
+      ).toEqual(expected);
+    },
+  );
 
   // 上の規則照合と重なる部分はあるが、独立した意味がある:
   //   - LOCALLY_ADDED_LINT_PLUGINS の分は規則からは導けないので、そちらが
   //     ロックファイルから読めなくなったことはこの検査でしか分からない。
   //   - 期限判定の skip 条件 (件数一致) が拠り所にしているのはこの検査の文言なので、
   //     「なぜ skip されたか」を専用のメッセージで示す役割も持つ。
-  it("保留の理由になっている上流プラグインが、すべてロックファイルから読み取れる", () => {
-    // 走査で拾えたパッケージ名の一覧
-    const found = upstreamPeers.map((peer) => peer.name);
-    // 実際に eslint を制限しているプラグインが 1 つでも走査から外れると、
-    // 残った緩い peer だけを見て「全員が次の major を許した」と誤読しうる。
-    // 上流の依存構成が変わったなら、保留の前提ごと見直す合図として落とす
-    for (const plugin of REQUIRED_UPSTREAM_PLUGINS) {
+  // ロックファイルが「この検査に使える形」でないときは対象外
+  // (skip として CI の出力にも現れる)。**該当するのは 2 通り** — 読めない場合と、
+  // 読めても規則から 1 つも導けない場合 (設定パッケージのエントリが無い・null など)。
+  // どちらでも「読み取れない」のは事実だが、原因はロックファイル側であって
+  // 上流の依存構成が変わったことではない。ここで「依存構成が変わったなら
+  // REQUIRED_UPSTREAM_PLUGINS と保留の前提を見直してください」と促すと、
+  // 一覧を空にする方向へ誘導し、最終的に ignore の削除まで進んでしまう。
+  // 原因の報告は入力ファイルの検査とロック構造の検査に任せる
+  it.skipIf(!lockUsable)(
+    "保留の理由になっている上流プラグインが、すべてロックファイルから読み取れる",
+    () => {
+      // 走査で拾えたパッケージ名の一覧
+      const found = upstreamPeers.map((peer) => peer.name);
+      // 一覧に挙げたのに走査から漏れたものを**全部**集める。
+      // 1 件ずつ expect すると最初の 1 件で例外が飛び、残りは出力に現れない。
+      // 「複数が同時に消えること」こそこの検査が警戒している前提崩れなので、
+      // 差集合を 1 回だけ比較して全件を一度に見せる (1 件ずつ直して再実行させない)
+      const missing = REQUIRED_UPSTREAM_PLUGINS.filter((plugin) => !found.includes(plugin));
+      // 実際に eslint を制限しているプラグインが 1 つでも走査から外れると、
+      // 残った緩い peer だけを見て「全員が次の major を許した」と誤読しうる。
+      // 上流の依存構成が変わったなら、保留の前提ごと見直す合図として落とす
       expect(
-        found,
-        `${plugin} が ${UPSTREAM_CONFIG_PACKAGE} 配下の eslint peer 依存として見つかりません` +
+        missing,
+        `${UPSTREAM_CONFIG_PACKAGE} 配下の eslint peer 依存として見つからないものがあります: ` +
+          `[${missing.join(", ")}]` +
           `(見つかったのは ${found.join(", ") || "なし"})。依存構成が変わったなら、` +
           `REQUIRED_UPSTREAM_PLUGINS と保留の前提を見直してください。`,
-      ).toContain(plugin);
-    }
-  });
+      ).toEqual([]);
+    },
+  );
 
   // 次のどちらかなら、この検査は対象外 (skip として CI の出力にも現れる):
   //   - 保留そのものが無い … 上流が出揃って ignore を消したあと、このテストだけが
@@ -648,7 +1165,8 @@ describe("dependabot.yml の ESLint major 保留", () => {
             .join(", ")})。` +
           `peer 依存を宣言していないプラグイン(@next/eslint-plugin-next 等)は` +
           `この判定に含まれていないので、削除前に別途確認してください。` +
-          `.github/dependabot.yml の ignore とこのテストを削除し、eslint の major 更新を` +
+          `${displayPath(DEPENDABOT_PATH)} の ignore とこのテストを削除し、` +
+          `${GUARDED_DEPENDENCY} の major 更新を` +
           `取り込んでください。`,
       ).not.toHaveLength(0);
     },
@@ -669,7 +1187,7 @@ describe("dependabot.yml の ESLint major 保留", () => {
           `${GUARDED_DEPENDENCY} の ignore がちょうど 1 件ある状態を保ってください。` +
           `0 件なら削除されたか、別エコシステム(docker 等)・別ディレクトリのブロックへ` +
           `移されています。2 件以上なら Dependabot が両方を適用し、意図より広く止まります。` +
-          `この保留が要る理由は .github/dependabot.yml のコメントと CLAUDE.md `+
+          `この保留が要る理由は ${displayPath(DEPENDABOT_PATH)} のコメントと CLAUDE.md ` +
           `§3「テスト」節の eslint 留め置きの項を参照 (消すと lint が ` +
           `contextOrFilename.getFilename is not a function で落ちます)。`,
       ).toHaveLength(1);
@@ -682,7 +1200,12 @@ describe("dependabot.yml の ESLint major 保留", () => {
       expect(ignoreEntries[0]?.["update-types"]).toEqual([MAJOR_UPDATE_TYPE]);
       // 書かれているキーがちょうど想定どおりであること。`versions` のような
       // 別の絞り込みが足されると、update-types が正しくても効き方が変わってしまう
-      expect(sortedKeysOf(ignoreEntries[0])).toEqual([...ALLOWED_IGNORE_KEYS].sort());
+      // 直前の件数検査が通っていれば [0] は必ずあるが、上の 2 行と同じく
+      // 添字アクセスを無防備に置かない (検査の順序を入れ替えたときに
+      // Object.keys(undefined) の TypeError で日本語文言が消えるのを防ぐ)。
+      // sortedKeysOf 側が保証しているのは「要素がオブジェクトであること」だけで、
+      // 「要素が存在すること」はここで埋める必要がある (同関数の docstring 参照)
+      expect(sortedKeysOf(ignoreEntries[0] ?? {})).toEqual([...ALLOWED_IGNORE_KEYS].sort());
     },
   );
 
@@ -702,7 +1225,7 @@ describe("dependabot.yml の ESLint major 保留", () => {
         `eslint が major ${HELD_MAJOR} から ${allowedMajor} へ動いています。` +
           `保留が不要になったなら ignore とこのテストを削除し、` +
           `新しい major で留め置き直すなら HELD_MAJOR を ${allowedMajor} へ更新してください。` +
-          `後者を選ぶ場合、major の数字を書いている散文 — .github/dependabot.yml の` +
+          `後者を選ぶ場合、major の数字を書いている散文 — ${displayPath(DEPENDABOT_PATH)} の` +
           `ignore コメントと CLAUDE.md の該当節 — も同じ変更に含めてください` +
           `(機械検査が無いので、直さないとコードと説明が食い違ったまま残ります)。`,
       ).toHaveLength(0);
