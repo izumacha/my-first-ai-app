@@ -854,6 +854,17 @@ describe("dependabot.yml の ESLint major 保留", () => {
   );
 
   // ロックファイルに記録されている上流プラグイン群の peer 範囲
+  // ロックファイルが「この検査に使える構造」を持っているか。
+  // **例外が出ないことだけでは足りない。** lockfileVersion 1 形式 (packages 枝が無く
+  // dependencies だけ) へ差し替わった場合や、設定パッケージのエントリが消えた場合も
+  // readParsed から見れば「トップレベルはオブジェクト」なので error は立たない。
+  // その状態で規則照合を走らせると deriveExpectedPlugins が [] を返し、
+  // 「一覧を合わせてください」→ 一覧を空にする → 期限判定が un-skip →
+  // 「ignore を削除してください」という、lint を壊す助言の連鎖に入ってしまう
+  const lockConfigEntryFound =
+    readLockPackages(packageLock)[`node_modules/${UPSTREAM_CONFIG_PACKAGE}`] !== undefined;
+  // ロックに依存する検査を走らせてよいか (読めていて、かつ構造も期待どおり)
+  const lockUsable = packageLockRead.error === null && lockConfigEntryFound;
   const upstreamPeers = collectUpstreamPeers(packageLock);
   // 規則 (設定パッケージの直接依存 ＋ repo 固有分) から導いた「見張るべき一覧」
   const derivedPlusLocal = [...deriveExpectedPlugins(packageLock), ...LOCALLY_ADDED_LINT_PLUGINS];
@@ -885,6 +896,28 @@ describe("dependabot.yml の ESLint major 保留", () => {
         `誤った前提で判断させないようにしています)。`,
     ).toEqual([]);
   });
+
+  // ロックファイル自体が読めていないときは対象外 (直前のテストが原因を報告する)
+  it.skipIf(packageLockRead.error !== null)(
+    `${displayPath(PACKAGE_LOCK_PATH)} が、この検査の使う構造を持っている`,
+    () => {
+      // JSON として読めても、この検査が辿る枝が無ければ peer 範囲を評価できない。
+      // 下のロック依存の検査はこの状態だと skip されるので、**なぜ skip されたのか**を
+      // 示す役割をこのテストが持つ (黙って評価されないまま緑にしない)
+      expect(
+        lockConfigEntryFound,
+        `${displayPath(PACKAGE_LOCK_PATH)} の packages 枝に ` +
+          `node_modules/${UPSTREAM_CONFIG_PACKAGE} が見つかりません。` +
+          `lockfileVersion 1 形式 (packages 枝を持たない) への差し替えや、` +
+          `${UPSTREAM_CONFIG_PACKAGE} の依存関係からの削除が疑われます。` +
+          `この状態では上流プラグインの peer 範囲を評価できないため、` +
+          `規則照合と期限判定は skip しています` +
+          `(走らせると「監視対象は 1 つも無い」と読める文言が出て、` +
+          `一覧を空にし ignore を削除する方向へ誤って誘導するため)。` +
+          `npm install で再生成するか、依存構成の変更なら保留の前提ごと見直してください。`,
+      ).toBe(true);
+    },
+  );
 
   // 入力そのものが読めていないときは対象外 (skip として CI の出力にも現れる)。
   // 空ファイルや削除で dependabotConfig が {} に均された状態でこの検査を走らせると、
@@ -921,22 +954,31 @@ describe("dependabot.yml の ESLint major 保留", () => {
     },
   );
 
-  it("package.json の eslint バージョン範囲が、このテストで解釈できる形で書かれている", () => {
-    // ここが落ちると、下の構造検査とダウングレード検査が skip され、
-    // ignore の削除・重複を捕まえる網まで黙って無効になる。何を直せばよいかを明示する
-    expect(
-      allowedMajor,
-      `package.json の devDependencies.${GUARDED_DEPENDENCY} を、` +
-        // 書式例の major は留め置き中の major に追随させる。ここだけ数字を直書きすると、
-        // HELD_MAJOR を新しい major へ更新し直したときに例だけ古い数字のまま残り、
-        // 「^11 と書いてあるのに ^9 にしろと言われた」という誤解を生む
-        `\`^${HELD_MAJOR}.39.4\` のような「先頭に ^ か ~ が 1 つ、あとは数字とドット」の形で書いてください` +
-        `(現在の値: ${JSON.stringify(declaredRange)})。` +
-        `dependencies へ移した・キーごと消した場合もここで落ちます。` +
-        `この検査が落ちている間は ignore の削除・重複を見張る検査が skip され、` +
-        `検出網が無効になります。`,
-    ).not.toBeNull();
-  });
+  // package.json そのものが読めていないときは対象外 (skip として CI の出力にも現れる)。
+  // 走らせると「`^9.39.4` の形で書いてください(現在の値: undefined)。dependencies へ
+  // 移した・キーごと消した場合もここで落ちます」と、**どれも当てはまらない原因**だけを
+  // 名指ししてしまい、実際の欠損・破損へ辿り着けない。原因の報告は入力ファイルの検査に任せる
+  it.skipIf(packageJsonRead.error !== null)(
+    `${displayPath(PACKAGE_JSON_PATH)} の ${GUARDED_DEPENDENCY} バージョン範囲が、` +
+      `このテストで解釈できる形で書かれている`,
+    () => {
+      // ここが落ちると、下の構造検査とダウングレード検査が skip され、
+      // ignore の削除・重複を捕まえる網まで黙って無効になる。何を直せばよいかを明示する
+      expect(
+        allowedMajor,
+        `${displayPath(PACKAGE_JSON_PATH)} の devDependencies.${GUARDED_DEPENDENCY} を、` +
+          // 書式例の major は留め置き中の major に追随させる。ここだけ数字を直書きすると、
+          // HELD_MAJOR を新しい major へ更新し直したときに例だけ古い数字のまま残り、
+          // 「^11 と書いてあるのに ^9 にしろと言われた」という誤解を生む
+          `\`^${HELD_MAJOR}.39.4\` のような` +
+          `「先頭に ^ か ~ が 1 つ、あとは数字とドット」の形で書いてください` +
+          `(現在の値: ${JSON.stringify(declaredRange)})。` +
+          `dependencies へ移した・キーごと消した場合もここで落ちます。` +
+          `この検査が落ちている間は ignore の削除・重複を見張る検査が skip され、` +
+          `検出網が無効になります。`,
+      ).not.toBeNull();
+    },
+  );
 
   // ロックファイルが読めていないときは対象外 (skip として CI の出力にも現れる)。
   // **ここを走らせると助言そのものが有害になる。** 読めないと deriveExpectedPlugins は
@@ -944,7 +986,7 @@ describe("dependabot.yml の ESLint major 保留", () => {
   // 従って一覧を空にすると件数一致と規則一致が両方成立し、期限判定が un-skip されて
   // 「すべて eslint 10 を許すようになりました…ignore を削除してください」まで進む。
   // 削除すると eslint 10 が入り lint が壊れる。原因の報告は入力ファイルの検査に任せる
-  it.skipIf(packageLockRead.error !== null)(
+  it.skipIf(!lockUsable)(
     "REQUIRED_UPSTREAM_PLUGINS が規則から導いた一覧と一致する",
     () => {
       // 規則 (eslint-config-next の直接依存のうち eslint に peer 依存を宣言しているもの) を
@@ -962,7 +1004,8 @@ describe("dependabot.yml の ESLint major 保留", () => {
           `規則から導けるのは [${expected.join(", ") || "なし"}]、` +
           `一覧に書かれているのは [${sortedNames(REQUIRED_UPSTREAM_PLUGINS).join(", ")}]。` +
           `**一覧に足りないものがあるなら、そのパッケージは lint 実行に載るのに ` +
-          `見張られていません** — 9 系に留まったまま他が 10 対応すると、期限判定が誤って ` +
+          `見張られていません** — ${HELD_MAJOR} 系に留まったまま他が ${HELD_MAJOR + 1} ` +
+          `対応すると、期限判定が誤って ` +
           `保留解除を促します(そのため一覧がずれている間、期限判定は skip されます)。` +
           `上流の依存構成が変わったなら REQUIRED_UPSTREAM_PLUGINS を合わせてください。` +
           `${UPSTREAM_CONFIG_PACKAGE} の依存ではなく eslint.config.mjs へ直接載せた ` +
@@ -985,7 +1028,7 @@ describe("dependabot.yml の ESLint major 保留", () => {
   // 上流の依存構成が変わったことではない。ここで「依存構成が変わったなら
   // REQUIRED_UPSTREAM_PLUGINS と保留の前提を見直してください」と促すと、
   // 一覧を空にする方向へ誘導し、最終的に ignore の削除まで進んでしまう
-  it.skipIf(packageLockRead.error !== null)(
+  it.skipIf(!lockUsable)(
     "保留の理由になっている上流プラグインが、すべてロックファイルから読み取れる",
     () => {
       // 走査で拾えたパッケージ名の一覧
@@ -1073,7 +1116,8 @@ describe("dependabot.yml の ESLint major 保留", () => {
             .join(", ")})。` +
           `peer 依存を宣言していないプラグイン(@next/eslint-plugin-next 等)は` +
           `この判定に含まれていないので、削除前に別途確認してください。` +
-          `.github/dependabot.yml の ignore とこのテストを削除し、eslint の major 更新を` +
+          `${displayPath(DEPENDABOT_PATH)} の ignore とこのテストを削除し、` +
+          `${GUARDED_DEPENDENCY} の major 更新を` +
           `取り込んでください。`,
       ).not.toHaveLength(0);
     },
@@ -1094,7 +1138,7 @@ describe("dependabot.yml の ESLint major 保留", () => {
           `${GUARDED_DEPENDENCY} の ignore がちょうど 1 件ある状態を保ってください。` +
           `0 件なら削除されたか、別エコシステム(docker 等)・別ディレクトリのブロックへ` +
           `移されています。2 件以上なら Dependabot が両方を適用し、意図より広く止まります。` +
-          `この保留が要る理由は .github/dependabot.yml のコメントと CLAUDE.md `+
+          `この保留が要る理由は ${displayPath(DEPENDABOT_PATH)} のコメントと CLAUDE.md ` +
           `§3「テスト」節の eslint 留め置きの項を参照 (消すと lint が ` +
           `contextOrFilename.getFilename is not a function で落ちます)。`,
       ).toHaveLength(1);
