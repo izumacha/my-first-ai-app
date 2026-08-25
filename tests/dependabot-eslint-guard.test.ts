@@ -208,15 +208,18 @@ function objectElementsOf(value: unknown): Record<string, unknown>[] {
 }
 
 /**
- * 「リストであるべきキーが、リストでない形で書かれている」なら 1 を返す。
+ * 「書かなくてよいが、書くならリストであるべきキー」がリストでないなら 1 を返す。
  *
- * `updates: {...}` や `directories: "/"` のようにキーごと別の形へ書き換えると、
- * asArray が空配列へ均すため**要素を数える方式では 0 のまま素通りする**。
- * 結果は値を消した `directory` と同じで、担当ブロックが 0 件になって
- * 保留の期限判定ごと skip され、検出網が静かに止まる。
+ * **現在の呼び出し元は `ignore` の 1 か所だけ** (countUnreadableElements)。
+ * ignore は省略できるので「無い」は壊れではないが、`ignore: {}` のように
+ * リスト以外へ書き換えると asArray が空配列へ均すため、**要素を数える方式では
+ * 0 のまま素通りする**。この 1 を足すことで「書いたのに読まれていない」を捉える。
  *
- * キーが無い場合は数えない — 書いていないことは壊れではなく、
- * Dependabot 側の既定に従うだけだから (`directories` 未指定で `directory` を使う等)。
+ * 他のキーがここを通らないのは、必要な判定が違うため:
+ *   - `updates` … 省略できないので「無い」も壊れ。countUnreadableElements 側で
+ *     `Array.isArray(...)` 1 つに畳んである (キーの有無で場合分けしない)。
+ *   - `directory` / `directories` … キーの有無や形ではなく「使える値が 1 つでも
+ *     あるか」で見る必要がある (`directories: []` はリストだが値が無い)。
  */
 function countNonListKey(container: Record<string, unknown>, key: string): number {
   // キーが無いのは「書いていない」だけなので壊れではない
@@ -224,7 +227,6 @@ function countNonListKey(container: Record<string, unknown>, key: string): numbe
   // キーがあるのに配列でなければ、asArray が空へ均して読み飛ばす形なので 1 つ数える
   return Array.isArray(container[key]) ? 0 : 1;
 }
-
 
 /**
  * 指定エコシステムの update ブロックを返す (ディレクトリでは絞らない)。
@@ -850,14 +852,13 @@ describe("dependabot.yml の ESLint major 保留", () => {
   // (null でないオブジェクトで、かつ dependencies が読める) との差から漏れが出る。
   // 使う側と同じ結果を見れば、前提が増えても判定が自動で追随する
   const derivedFromRule = deriveExpectedPlugins(packageLock);
-  // 規則から 1 つも導けないなら、この検査に使える形になっていない
-  const lockRuleDerivable = derivedFromRule.length > 0;
-  // ロックに依存する検査を走らせてよいか。
-  // **読めなかった場合もこれ 1 つで足りる** — readParsed は失敗時に必ず value: null を
-  // 返すので、deriveExpectedPlugins(null) は [] になり lockRuleDerivable が false に
-  // なる。`packageLockRead.error === null` を並べても判定を変えることがないため置かない
-  // (§6 デッドコードを残さない)
-  const lockUsable = lockRuleDerivable;
+  // ロックに依存する検査を走らせてよいか = 規則から 1 つでも導けたか。
+  // **読めなかった場合もこの 1 つで足りる** — readParsed は失敗時に必ず value: null を
+  // 返すので、deriveExpectedPlugins(null) は [] になりここが false になる。
+  // `packageLockRead.error === null` を並べても判定を変えないため置かない
+  // (§6 デッドコードを残さない)。名前も 1 つに保ち、
+  // 「構造の検査」と「それを根拠に skip する検査」が同じ述語を見ていることを明らかにする
+  const lockUsable = derivedFromRule.length > 0;
   // ロックファイルに記録されている上流プラグイン群の peer 範囲
   const upstreamPeers = collectUpstreamPeers(packageLock);
   // 規則 (設定パッケージの直接依存 ＋ repo 固有分) から導いた「見張るべき一覧」
@@ -899,7 +900,7 @@ describe("dependabot.yml の ESLint major 保留", () => {
       // 下のロック依存の検査はこの状態だと skip されるので、**なぜ skip されたのか**を
       // 示す役割をこのテストが持つ (黙って評価されないまま緑にしない)
       expect(
-        lockRuleDerivable,
+        lockUsable,
         `${displayPath(PACKAGE_LOCK_PATH)} から、規則 (${UPSTREAM_CONFIG_PACKAGE} の直接依存の` +
           `うち ${GUARDED_DEPENDENCY} に peer 依存を宣言しているもの) が 1 つも導けません。` +
           `packages 枝を持たない lockfileVersion 1 形式への差し替え、` +
