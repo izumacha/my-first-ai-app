@@ -236,6 +236,11 @@ function objectElementsOf(value: unknown): Record<string, unknown>[] {
  *      なお同じブロックでも、単数形の `directory` が一致していれば
  *      `directories` は実際には読まれない (上記の過剰側に倒す方針どおり数える。
  *      `directory` の書き方が変われば読まれるようになるため)。
+ *      **単数形の `directory` 自体も、キーがあるのに文字列でない形 (`directory:` と
+ *      値を消す等) を数える。** coversDirectory が黙って不一致にすると担当ブロックが
+ *      0 件になり、(3)(4) が何も数えられなくなるうえ**保留の期限判定ごと skip され、
+ *      検出網が静かに止まる**（このとき唯一赤くなる ignore 件数の検査は
+ *      「別のブロックへ移された」と案内するので、原因からも遠ざかる）。
  *   3. **担当ブロックの** `ignore` 直下 … objectElementsOf がオブジェクト以外を捨てる。
  *      ignore を読むのは担当ブロック (エコシステム＋ディレクトリが一致) だけなので、
  *      ここは担当分に絞る。
@@ -262,10 +267,15 @@ function countUnreadableElements(
   // (1) updates 直下: 元の要素数から、オブジェクトとして読めた数を引く
   const blocks = objectElementsOf(config.updates);
   let unreadable = asArray(config.updates).length - blocks.length;
-  // (2) directories 直下: coversDirectory が呼ばれるのはエコシステムが一致したブロックだけ
-  //     (guardedBlocksOf の `&&` が短絡するため)。読む範囲に合わせて同じ条件で絞る
+  // (2) directory / directories: coversDirectory が呼ばれるのはエコシステムが一致した
+  //     ブロックだけ (guardedBlocksOf の `&&` が短絡するため)。読む範囲に合わせて絞る
   for (const block of blocks.filter((entry) => entry["package-ecosystem"] === ecosystem)) {
-    // coversDirectory が採用するのは文字列だけなので、それ以外は捨てられている
+    // 単数形の `directory` は「キーはあるのに文字列でない」形が書ける
+    // (`directory:` と値を消す等)。coversDirectory は黙って不一致にするため、
+    // 担当ブロックが 0 件になり **期限判定ごと skip されて検出網が静かに止まる**。
+    // 値の消えた `directory` はここで数えて落とす
+    if ("directory" in block && typeof block["directory"] !== "string") unreadable += 1;
+    // 複数形の `directories` は要素ごとに文字列以外が捨てられる
     unreadable += asArray(block["directories"]).filter(
       (value) => typeof value !== "string",
     ).length;
@@ -370,13 +380,33 @@ interface ReadResult {
  * (CLAUDE.md §6 エラーを握り潰さない)。
  */
 function readParsed(path: string, parse: (text: string) => unknown): ReadResult {
+  // 読み取りとパースの結果を受ける入れ物
+  let value: unknown;
   try {
-    // 読めた場合は解釈した値を返す (原因は無し)
-    return { value: parse(readFileSync(path, "utf8")), error: null };
+    // ファイルを読んで解釈する
+    value = parse(readFileSync(path, "utf8"));
   } catch (error) {
     // 読めなかった場合は値を持たず、原因だけを返す
     return { value: null, error };
   }
+  // **例外が出なくても「構造として解釈できた」とは限らない。**
+  // 空ファイルや全体をコメントアウトしたファイルは parseYaml が null を返す (実測)。
+  // これを素通りさせると、「構造として解釈できる」と名乗るテストが
+  // 中身の無いファイルに対して緑になり、読み手に誤った安心を与える。
+  // 3 つの入力はいずれもトップレベルがオブジェクトである前提なので、そうでなければ
+  // 読めなかったものとして扱う (fail-closed)
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    // 何が入っていたかを添えて原因を作る (空ファイルなら null と表示される)
+    return {
+      value: null,
+      error: new Error(
+        `トップレベルがオブジェクトではありません (${JSON.stringify(value) ?? "undefined"})。` +
+          `空ファイル・全体のコメントアウト・別の形への書き換えが疑われます。`,
+      ),
+    };
+  }
+  // ここまで来れば構造として読めている
+  return { value, error: null };
 }
 
 /**
@@ -610,9 +640,13 @@ function asRecord(value: unknown): Record<string, unknown> {
  * null や非オブジェクトは既に振るい落とされている。ここで同じ判定を重ねても
  * 決して真にならない分岐が増えるだけなので置かない (CLAUDE.md §6 デッドコードを残さない)。
  *
- * **「要素がオブジェクトであること」と「その要素が存在すること」は別の話。** 空配列への
- * 添字アクセスは undefined になり、それは objectElementsOf では防げない
- * (振るう対象がそもそも無い)。そちらは呼び出し側が `?? {}` で埋めている。
+ * **「要素がオブジェクトであること」と「その要素が存在すること」は別の話で、
+ * 保証の強さが違うので扱いも変える。** 前者は objectElementsOf という*構築*が
+ * 型のレベルで保証しており、崩す方法が無いので分岐を置かない (§6)。後者
+ * (空配列への添字アクセスが undefined になること) を防いでいるのは
+ * 「直前の toHaveLength(1) が先に throw する」という**文の並び順だけ**で、
+ * 検査を分割・並べ替えれば簡単に崩れる。だから呼び出し側は `?? {}` を残している。
+ * 一方だけ残っているのは書き忘れではなく、この差による意図的な非対称。
  */
 function sortedKeysOf(entry: DependabotIgnoreEntry): string[] {
   // キーを取り出して並べ替える (比較しやすくするため)
@@ -736,27 +770,36 @@ describe("dependabot.yml の ESLint major 保留", () => {
     ).toEqual([]);
   });
 
-  it(".github/dependabot.yml に読めない形のリスト要素が無い", () => {
-    // 空要素 `-` (ブロックをコメントアウトした残り) が混ざっていないかを見る。
-    // この検査が無いと、正しいエントリの**隣**に空要素が増えたケースで
-    // ignore の件数が変わらず、壊れた設定のまま全検査が緑になる。
-    // 読み手側 (このテスト) が黙って読み飛ばすようになった分、
-    // 「意図して書いた形か」は独立した検査で担保する
-    expect(
-      unreadableElementCount,
-      `${relative(REPO_ROOT, DEPENDABOT_PATH)} のうち、この検査が実際に読む 4 か所` +
-        `(updates 直下 / ${GUARDED_ECOSYSTEM} ブロックの directories 直下 / ` +
-        `${GUARDED_ECOSYSTEM}・${GUARDED_DIRECTORY} ブロックの ignore 直下と、` +
-        `その dependency-name が文字列であること) に、` +
-        `想定した形で書かれていないリスト要素が ${unreadableElementCount} 個あります。` +
-        `ブロックをコメントアウトしたときに残った空要素 \`-\` や、` +
-        `\`dependency-name: ["eslint"]\` のような書き崩れが典型です。` +
-        `この検査はそれを読み飛ばすので、放置すると設定が壊れたまま他の検査が緑になります。` +
-        `不要な \`-\` を削除してください` +
-        `(Dependabot 側がこの形をどう扱うかはこの環境から裏取りできていないため、` +
-        `無害と決めつけず意図した形でない時点で落としています)。`,
-    ).toBe(0);
-  });
+  // 入力そのものが読めていないときは対象外 (skip として CI の出力にも現れる)。
+  // 空ファイルや削除で dependabotConfig が {} に均された状態でこの検査を走らせると、
+  // 「読めない要素は 0 個」と**中身の無いファイルに対して緑**になり、
+  // 直前のテストが赤いのに「設定は健全」と読める出力が並んでしまう。
+  // 評価できないことは skip で示し、原因の報告は直前のテストに任せる
+  it.skipIf(unreadableSources.length > 0)(
+    ".github/dependabot.yml に読めない形のリスト要素が無い",
+    () => {
+      // 空要素 `-` (ブロックをコメントアウトした残り) が混ざっていないかを見る。
+      // この検査が無いと、正しいエントリの**隣**に空要素が増えたケースで
+      // ignore の件数が変わらず、壊れた設定のまま全検査が緑になる。
+      // 読み手側 (このテスト) が黙って読み飛ばすようになった分、
+      // 「意図して書いた形か」は独立した検査で担保する
+      expect(
+        unreadableElementCount,
+        `${relative(REPO_ROOT, DEPENDABOT_PATH)} のうち、この検査が実際に読む場所` +
+          `(updates 直下 / ${GUARDED_ECOSYSTEM} ブロックの directory・directories / ` +
+          `${GUARDED_ECOSYSTEM}・${GUARDED_DIRECTORY} ブロックの ignore 直下と、` +
+          `その dependency-name が文字列であること) に、` +
+          `想定した形で書かれていない箇所が ${unreadableElementCount} 個あります。` +
+          `ブロックをコメントアウトしたときに残った空要素 \`-\`、値を消した \`directory:\`、` +
+          `\`dependency-name: ["eslint"]\` のような書き崩れが典型です。` +
+          `この検査はそれを読み飛ばすので、放置すると設定が壊れたまま他の検査が緑になります` +
+          `(とくに \`directory\` が読めないと担当ブロックが 0 件になり、` +
+          `保留の期限判定ごと skip されて検出網が静かに止まります)。` +
+          `(Dependabot 側がこの形をどう扱うかはこの環境から裏取りできていないため、` +
+          `無害と決めつけず意図した形でない時点で落としています)。`,
+      ).toBe(0);
+    },
+  );
 
   it("package.json の eslint バージョン範囲が、このテストで解釈できる形で書かれている", () => {
     // ここが落ちると、下の構造検査とダウングレード検査が skip され、
