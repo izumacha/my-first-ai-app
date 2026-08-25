@@ -226,28 +226,25 @@ function countNonListKey(container: Record<string, unknown>, key: string): numbe
 }
 
 /**
- * 「無いと読み進めないキー」が 1 つも書かれていないなら 1 を返す。
+ * 「無いと読み進めないキー」が書かれていないなら 1 を返す。
  *
  * countNonListKey は「キーはあるが形が違う」を捉える一方、**キーごと消えた場合**は
- * 素通りする。しかし読み手にとっては同じで、`directory` も `directories` も無い
- * ブロックは coversDirectory が黙って不一致にし、担当ブロックが 0 件になって
- * 保留の期限判定ごと skip される（値を消した `directory` とまったく同じ結末）。
+ * 素通りする。読み手にとっては同じで、`updates` が無い dependabot.yml は
+ * asArray が空配列へ均すため「ブロックが 1 つも無い」設定として黙って読み進み、
+ * 担当ブロックが 0 件 → 保留の期限判定ごと skip という結末になる。
  *
- * 対象は「書かないという選択があり得ないキー」だけに絞る — update ブロックは
- * 対象ディレクトリを持たなければ何も指さないし、dependabot.yml は `updates` が
- * 無ければ設定として空。**この環境から Dependabot の必須要件を裏取りできない**ので、
- * 「無くても既定で動くのかもしれない」とは考えず、意図して書いた形でない時点で
- * 落とす（このファイル全体と同じ fail-closed の立場）。
+ * 対象は「書かないという選択があり得ないキー」だけに絞る — dependabot.yml は
+ * `updates` が無ければ設定として空。**この環境から Dependabot の必須要件を
+ * 裏取りできない**ので、「無くても既定で動くのかもしれない」とは考えず、
+ * 意図して書いた形でない時点で落とす（このファイル全体と同じ fail-closed の立場）。
  *
- * `directory` / `directories` のように「どちらか一方あればよい」形も扱えるよう、
- * キーは配列で受けて「1 つも無い」ときだけ数える。
+ * なお `directory` / `directories` は「キーがあるか」では足りない
+ * （`directories: []` のように**キーはあるが値が無い**形がある）ため、
+ * この関数ではなく「使える値が 1 つでもあるか」で判定している。
  */
-function countMissingRequiredKeys(
-  container: Record<string, unknown>,
-  keys: readonly string[],
-): number {
-  // どれか 1 つでも書かれていれば読み進められるので壊れではない
-  return keys.some((key) => key in container) ? 0 : 1;
+function countMissingRequiredKey(container: Record<string, unknown>, key: string): number {
+  // 書かれていれば読み進められるので壊れではない
+  return key in container ? 0 : 1;
 }
 
 /**
@@ -331,7 +328,7 @@ function countUnreadableElements(
   //     期限判定ごと skip され、検出網が静かに止まる
   let unreadable = countNonListKey(config as Record<string, unknown>, "updates");
   // (0') `updates` がキーごと無い設定も同じく空として読み飛ばされるので数える
-  unreadable += countMissingRequiredKeys(config as Record<string, unknown>, ["updates"]);
+  unreadable += countMissingRequiredKey(config as Record<string, unknown>, "updates");
   // (1) updates 直下: 元の要素数から、オブジェクトとして読めた数を引く
   const blocks = objectElementsOf(config.updates);
   unreadable += asArray(config.updates).length - blocks.length;
@@ -346,16 +343,19 @@ function countUnreadableElements(
   //     ブロックだけ (guardedBlocksOf が ecosystemBlocksOf の戻り値にだけ
   //     coversDirectory を掛けるため)。読む範囲に合わせて同じ絞り込みを使う
   for (const block of ecosystemBlocksOf(config, ecosystem)) {
-    // 単数形の `directory` は「キーはあるのに文字列でない」形が書ける
-    // (`directory:` と値を消す等)。coversDirectory は黙って不一致にするため、
-    // 担当ブロックが 0 件になり **期限判定ごと skip されて検出網が静かに止まる**。
-    // 値の消えた `directory` はここで数えて落とす
-    if ("directory" in block && typeof block["directory"] !== "string") unreadable += 1;
-    // どちらのキーも無いブロックは、値を消した `directory` と同じ結末になる
-    // (coversDirectory が黙って不一致 → 担当ブロック 0 件 → 期限判定ごと skip)
-    unreadable += countMissingRequiredKeys(block, ["directory", "directories"]);
-    // 複数形の `directories` は、キーごとリストでない形も要素単位の壊れも数える
-    unreadable += countNonListKey(block, "directories");
+    // **「キーがあるか」ではなく「使える値が 1 つでもあるか」で見る。**
+    // キーの有無や形だけを個別に数えると、`directories: []`(空リスト) や
+    // `directory: ""` のように**キーはあるが値が無い**形を取りこぼす。どれも
+    // coversDirectory が黙って不一致にするので、担当ブロックが 0 件になり
+    // **期限判定ごと skip されて検出網が静かに止まる**という同じ結末になる
+    // (しかも唯一赤くなる ignore 件数の検査は「別のブロックへ移された」と案内し、
+    //  原因から遠ざかる)。単数形・複数形をまとめて 1 つの条件で見る
+    const declaredDirectories = [block["directory"], ...asArray(block["directories"])];
+    // 空でない文字列が 1 つも無ければ、このブロックはどこも指していない
+    if (!declaredDirectories.some((value) => typeof value === "string" && value !== "")) {
+      unreadable += 1;
+    }
+    // 複数形のリストに紛れた文字列以外の要素も、読み手が黙って捨てるので数える
     unreadable += asArray(block["directories"]).filter(
       (value) => typeof value !== "string",
     ).length;
@@ -853,21 +853,27 @@ describe("dependabot.yml の ESLint major 保留", () => {
     GUARDED_DEPENDENCY,
   );
 
-  // ロックファイルに記録されている上流プラグイン群の peer 範囲
   // ロックファイルが「この検査に使える構造」を持っているか。
   // **例外が出ないことだけでは足りない。** lockfileVersion 1 形式 (packages 枝が無く
-  // dependencies だけ) へ差し替わった場合や、設定パッケージのエントリが消えた場合も
-  // readParsed から見れば「トップレベルはオブジェクト」なので error は立たない。
-  // その状態で規則照合を走らせると deriveExpectedPlugins が [] を返し、
-  // 「一覧を合わせてください」→ 一覧を空にする → 期限判定が un-skip →
-  // 「ignore を削除してください」という、lint を壊す助言の連鎖に入ってしまう
-  const lockConfigEntryFound =
-    readLockPackages(packageLock)[`node_modules/${UPSTREAM_CONFIG_PACKAGE}`] !== undefined;
-  // ロックに依存する検査を走らせてよいか (読めていて、かつ構造も期待どおり)
-  const lockUsable = packageLockRead.error === null && lockConfigEntryFound;
+  // dependencies だけ)、設定パッケージのエントリが null、その `dependencies` 枝が
+  // 無い、といった形はいずれも readParsed から見れば「トップレベルはオブジェクト」で
+  // error が立たない。その状態で規則照合を走らせると deriveExpectedPlugins が
+  // [] を返し、「一覧を合わせてください」→ 一覧を空にする → 期限判定が un-skip →
+  // 「ignore を削除してください」という、lint を壊す助言の連鎖に入ってしまう。
+  //
+  // **判定は「規則から 1 つでも導けたか」で行う。** 「エントリが undefined でないか」
+  // のような手前の条件で代用すると、deriveExpectedPlugins が実際に要求する前提
+  // (null でないオブジェクトで、かつ dependencies が読める) との差から漏れが出る。
+  // 使う側と同じ結果を見れば、前提が増えても判定が自動で追随する
+  const derivedFromRule = deriveExpectedPlugins(packageLock);
+  // 規則から 1 つも導けないなら、この検査に使える形になっていない
+  const lockRuleDerivable = derivedFromRule.length > 0;
+  // ロックに依存する検査を走らせてよいか (読めていて、かつ規則が導ける)
+  const lockUsable = packageLockRead.error === null && lockRuleDerivable;
+  // ロックファイルに記録されている上流プラグイン群の peer 範囲
   const upstreamPeers = collectUpstreamPeers(packageLock);
   // 規則 (設定パッケージの直接依存 ＋ repo 固有分) から導いた「見張るべき一覧」
-  const derivedPlusLocal = [...deriveExpectedPlugins(packageLock), ...LOCALLY_ADDED_LINT_PLUGINS];
+  const derivedPlusLocal = [...derivedFromRule, ...LOCALLY_ADDED_LINT_PLUGINS];
   // 一覧が規則どおりか。ずれているなら「見張るべきなのに見張れていない」ものが居る。
   // 下の規則照合テストと同じ正規化 (sortedNames) を通すので、判定が食い違わない
   const pluginListMatchesRule = sameNameSet(derivedPlusLocal, REQUIRED_UPSTREAM_PLUGINS);
@@ -905,11 +911,12 @@ describe("dependabot.yml の ESLint major 保留", () => {
       // 下のロック依存の検査はこの状態だと skip されるので、**なぜ skip されたのか**を
       // 示す役割をこのテストが持つ (黙って評価されないまま緑にしない)
       expect(
-        lockConfigEntryFound,
-        `${displayPath(PACKAGE_LOCK_PATH)} の packages 枝に ` +
-          `node_modules/${UPSTREAM_CONFIG_PACKAGE} が見つかりません。` +
-          `lockfileVersion 1 形式 (packages 枝を持たない) への差し替えや、` +
-          `${UPSTREAM_CONFIG_PACKAGE} の依存関係からの削除が疑われます。` +
+        lockRuleDerivable,
+        `${displayPath(PACKAGE_LOCK_PATH)} から、規則 (${UPSTREAM_CONFIG_PACKAGE} の直接依存の` +
+          `うち ${GUARDED_DEPENDENCY} に peer 依存を宣言しているもの) が 1 つも導けません。` +
+          `packages 枝を持たない lockfileVersion 1 形式への差し替え、` +
+          `node_modules/${UPSTREAM_CONFIG_PACKAGE} エントリの欠落や null、` +
+          `その dependencies 枝の欠落が疑われます。` +
           `この状態では上流プラグインの peer 範囲を評価できないため、` +
           `規則照合と期限判定は skip しています` +
           `(走らせると「監視対象は 1 つも無い」と読める文言が出て、` +
@@ -1176,7 +1183,7 @@ describe("dependabot.yml の ESLint major 保留", () => {
         `eslint が major ${HELD_MAJOR} から ${allowedMajor} へ動いています。` +
           `保留が不要になったなら ignore とこのテストを削除し、` +
           `新しい major で留め置き直すなら HELD_MAJOR を ${allowedMajor} へ更新してください。` +
-          `後者を選ぶ場合、major の数字を書いている散文 — .github/dependabot.yml の` +
+          `後者を選ぶ場合、major の数字を書いている散文 — ${displayPath(DEPENDABOT_PATH)} の` +
           `ignore コメントと CLAUDE.md の該当節 — も同じ変更に含めてください` +
           `(機械検査が無いので、直さないとコードと説明が食い違ったまま残ります)。`,
       ).toHaveLength(0);
