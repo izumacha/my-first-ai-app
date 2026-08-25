@@ -253,8 +253,8 @@ function countMissingRequiredKeys(
 /**
  * 指定エコシステムの update ブロックを返す (ディレクトリでは絞らない)。
  *
- * guardedBlocksOf の絞り込みは `エコシステム一致 && coversDirectory(...)` で、
- * `&&` が短絡するため **coversDirectory が呼ばれるのはここまで通ったブロックだけ**。
+ * guardedBlocksOf はこの関数の戻り値に対してだけ coversDirectory を掛けるので、
+ * **coversDirectory が呼ばれるのはここを通ったブロックだけ**。
  * つまり「directory / directories が読まれる範囲」はこの関数の戻り値そのもの。
  * 読み手 (guardedBlocksOf) と数え手 (countUnreadableElements) が同じ定義を
  * 共有できるよう、エコシステムの照合を 1 か所に置く (§6 DRY)。
@@ -289,7 +289,7 @@ function ecosystemBlocksOf(config: DependabotConfig, ecosystem: string): Record<
  *      全ブロックが担当判定の対象なので、全要素が読む対象。
  *   2. **エコシステムが一致するブロックの** `directories` 直下 …
  *      coversDirectory が文字列以外を捨てる。guardedBlocksOf の絞り込みは
- *      `エコシステム一致 && coversDirectory(...)` で、`&&` は短絡するため
+ *      ecosystemBlocksOf の戻り値にだけ coversDirectory を掛けるため
  *      **coversDirectory が呼ばれるのはエコシステムが一致したブロックだけ**。
  *      全ブロックを数えると、読みもしない docker ブロックの空要素を
  *      eslint の保留を守る検査が咎めることになる。
@@ -335,8 +335,16 @@ function countUnreadableElements(
   // (1) updates 直下: 元の要素数から、オブジェクトとして読めた数を引く
   const blocks = objectElementsOf(config.updates);
   unreadable += asArray(config.updates).length - blocks.length;
+  // (1') package-ecosystem が文字列でないブロックを数える。ecosystemBlocksOf は
+  //      値を `=== ecosystem` で比べるだけなので、値を消すと**全ブロックが静かに脱落**し、
+  //      担当ブロックが 0 件 → 期限判定ごと skip という同じ結末になる。
+  //      この値は全ブロックについて読むので、絞らず全ブロックを見る
+  unreadable += blocks.filter(
+    (block) => typeof block["package-ecosystem"] !== "string",
+  ).length;
   // (2) directory / directories: coversDirectory が呼ばれるのはエコシステムが一致した
-  //     ブロックだけ (guardedBlocksOf の `&&` が短絡するため)。読む範囲に合わせて絞る
+  //     ブロックだけ (guardedBlocksOf が ecosystemBlocksOf の戻り値にだけ
+  //     coversDirectory を掛けるため)。読む範囲に合わせて同じ絞り込みを使う
   for (const block of ecosystemBlocksOf(config, ecosystem)) {
     // 単数形の `directory` は「キーはあるのに文字列でない」形が書ける
     // (`directory:` と値を消す等)。coversDirectory は黙って不一致にするため、
@@ -428,6 +436,17 @@ function directoryPatternCovers(pattern: string, directory: string): boolean {
     .join(".*");
   // 前後を固定して全体一致で判定する
   return new RegExp(`^${escaped}$`).test(directory);
+}
+
+/**
+ * 入力ファイルの表示名 (repo ルートからの相対パス) を返す。
+ *
+ * 失敗文言とテスト名で同じ名前を何度も使うので、導き方を 1 か所に置く (§6 DRY)。
+ * 表示の仕方を変えたくなったとき、書き換える場所が 1 つで済むようにする。
+ */
+function displayPath(path: string): string {
+  // repo ルートからの相対パスにすると、環境ごとの絶対パスが文言に混ざらない
+  return relative(REPO_ROOT, path);
 }
 
 /**
@@ -805,7 +824,7 @@ describe("dependabot.yml の ESLint major 保留", () => {
     // 読めたものは報告対象から外す
     .filter((source) => source.error !== null)
     // 失敗文言に載せるため、repo ルートからの相対パスと原因を組み立てる
-    .map((source) => `${relative(REPO_ROOT, source.path)}: ${String(source.error)}`);
+    .map((source) => `${displayPath(source.path)}: ${String(source.error)}`);
   // **パース結果は null にもなる** — 空ファイルや、全体をコメントアウトしたファイルが該当する
   // (どちらも実測済み)。null のまま枝を読むと TypeError で全検査が収集時エラーになる。
   // asRecord でオブジェクトへ均しておけば、updates が空として扱われ、
@@ -858,9 +877,9 @@ describe("dependabot.yml の ESLint major 保留", () => {
       unreadableSources,
       `検査に使う入力ファイルを読めませんでした: ${unreadableSources.join(" / ")}。` +
         `削除・改名されていないか、YAML / JSON として壊れていないかを確認してください。` +
-        `${relative(REPO_ROOT, DEPENDABOT_PATH)} が消えている場合は ` +
+        `${displayPath(DEPENDABOT_PATH)} が消えている場合は ` +
         `${GUARDED_DEPENDENCY} の major 保留も一緒に消えており、` +
-        `${relative(REPO_ROOT, PACKAGE_LOCK_PATH)} が読めない場合は ` +
+        `${displayPath(PACKAGE_LOCK_PATH)} が読めない場合は ` +
         `上流プラグインの peer 範囲を評価できません` +
         `(どちらもこのファイルの検査対象そのものなので、ここで止めて他の検査に` +
         `誤った前提で判断させないようにしています)。`,
@@ -877,7 +896,7 @@ describe("dependabot.yml の ESLint major 保留", () => {
   // 同時に混入した dependabot.yml の壊れが 1 つも報告されなくなる
   // (objectElementsOf が黙って読み飛ばすので他の検査は緑のまま通る)
   it.skipIf(dependabotRead.error !== null)(
-    `${relative(REPO_ROOT, DEPENDABOT_PATH)} に読めない形のリスト要素が無い`,
+    `${displayPath(DEPENDABOT_PATH)} に読めない形のリスト要素が無い`,
     () => {
       // 空要素 `-` (ブロックをコメントアウトした残り) が混ざっていないかを見る。
       // この検査が無いと、正しいエントリの**隣**に空要素が増えたケースで
@@ -886,7 +905,7 @@ describe("dependabot.yml の ESLint major 保留", () => {
       // 「意図して書いた形か」は独立した検査で担保する
       expect(
         unreadableElementCount,
-        `${relative(REPO_ROOT, DEPENDABOT_PATH)} のうち、この検査が実際に読む場所` +
+        `${displayPath(DEPENDABOT_PATH)} のうち、この検査が実際に読む場所` +
           `(updates 直下 / ${GUARDED_ECOSYSTEM} ブロックの directory・directories / ` +
           `${GUARDED_ECOSYSTEM}・${GUARDED_DIRECTORY} ブロックの ignore 直下と、` +
           `その dependency-name が文字列であること) に、` +
@@ -919,57 +938,75 @@ describe("dependabot.yml の ESLint major 保留", () => {
     ).not.toBeNull();
   });
 
-  it("REQUIRED_UPSTREAM_PLUGINS が規則から導いた一覧と一致する", () => {
-    // 規則 (eslint-config-next の直接依存のうち eslint に peer 依存を宣言しているもの) を
-    // ロックファイルから実際に導く
-    // 規則から導いた一覧が「正」。手書きの REQUIRED_UPSTREAM_PLUGINS を received 側に
-    // 置くことで、Vitest の差分が「期待 = 規則 / 実際 = 手書き」の向きで表示される
-    // (逆にすると、古い手書きの一覧が正であるかのように読めてしまう)
-    const expected = sortedNames(derivedPlusLocal);
-    // 並び順は意味を持たないので、両方を並べ替えてから比較する
-    expect(
-      sortedNames(REQUIRED_UPSTREAM_PLUGINS),
-      `REQUIRED_UPSTREAM_PLUGINS が規則からずれています。` +
-        `規則は「${UPSTREAM_CONFIG_PACKAGE} の直接依存のうち ${GUARDED_DEPENDENCY} に ` +
-        `peer 依存を宣言しているもの全部 ＋ LOCALLY_ADDED_LINT_PLUGINS」で、` +
-        `規則から導けるのは [${expected.join(", ") || "なし"}]、` +
-        `一覧に書かれているのは [${sortedNames(REQUIRED_UPSTREAM_PLUGINS).join(", ")}]。` +
-        `**一覧に足りないものがあるなら、そのパッケージは lint 実行に載るのに ` +
-        `見張られていません** — 9 系に留まったまま他が 10 対応すると、期限判定が誤って ` +
-        `保留解除を促します(そのため一覧がずれている間、期限判定は skip されます)。` +
-        `上流の依存構成が変わったなら REQUIRED_UPSTREAM_PLUGINS を合わせてください。` +
-        `${UPSTREAM_CONFIG_PACKAGE} の依存ではなく eslint.config.mjs へ直接載せた ` +
-        `プラグインなら、REQUIRED_UPSTREAM_PLUGINS と LOCALLY_ADDED_LINT_PLUGINS の ` +
-        `両方へ足すと一致します。` +
-        `**一覧の増減は .github/dependabot.yml と CLAUDE.md §3 の説明にも反映してください** ` +
-        `(そちらは機械検査が無いので、直さないとコードと説明が食い違ったまま残ります)。`,
-    ).toEqual(expected);
-  });
+  // ロックファイルが読めていないときは対象外 (skip として CI の出力にも現れる)。
+  // **ここを走らせると助言そのものが有害になる。** 読めないと deriveExpectedPlugins は
+  // [] を返すので「規則から導けるのは [なし]」と出て「一覧を合わせてください」と促すが、
+  // 従って一覧を空にすると件数一致と規則一致が両方成立し、期限判定が un-skip されて
+  // 「すべて eslint 10 を許すようになりました…ignore を削除してください」まで進む。
+  // 削除すると eslint 10 が入り lint が壊れる。原因の報告は入力ファイルの検査に任せる
+  it.skipIf(packageLockRead.error !== null)(
+    "REQUIRED_UPSTREAM_PLUGINS が規則から導いた一覧と一致する",
+    () => {
+      // 規則 (eslint-config-next の直接依存のうち eslint に peer 依存を宣言しているもの) を
+      // ロックファイルから実際に導く
+      // 規則から導いた一覧が「正」。手書きの REQUIRED_UPSTREAM_PLUGINS を received 側に
+      // 置くことで、Vitest の差分が「期待 = 規則 / 実際 = 手書き」の向きで表示される
+      // (逆にすると、古い手書きの一覧が正であるかのように読めてしまう)
+      const expected = sortedNames(derivedPlusLocal);
+      // 並び順は意味を持たないので、両方を並べ替えてから比較する
+      expect(
+        sortedNames(REQUIRED_UPSTREAM_PLUGINS),
+        `REQUIRED_UPSTREAM_PLUGINS が規則からずれています。` +
+          `規則は「${UPSTREAM_CONFIG_PACKAGE} の直接依存のうち ${GUARDED_DEPENDENCY} に ` +
+          `peer 依存を宣言しているもの全部 ＋ LOCALLY_ADDED_LINT_PLUGINS」で、` +
+          `規則から導けるのは [${expected.join(", ") || "なし"}]、` +
+          `一覧に書かれているのは [${sortedNames(REQUIRED_UPSTREAM_PLUGINS).join(", ")}]。` +
+          `**一覧に足りないものがあるなら、そのパッケージは lint 実行に載るのに ` +
+          `見張られていません** — 9 系に留まったまま他が 10 対応すると、期限判定が誤って ` +
+          `保留解除を促します(そのため一覧がずれている間、期限判定は skip されます)。` +
+          `上流の依存構成が変わったなら REQUIRED_UPSTREAM_PLUGINS を合わせてください。` +
+          `${UPSTREAM_CONFIG_PACKAGE} の依存ではなく eslint.config.mjs へ直接載せた ` +
+          `プラグインなら、REQUIRED_UPSTREAM_PLUGINS と LOCALLY_ADDED_LINT_PLUGINS の ` +
+          `両方へ足すと一致します。` +
+          `**一覧の増減は ${displayPath(DEPENDABOT_PATH)} と CLAUDE.md §3 の説明にも ` +
+          `反映してください** ` +
+          `(そちらは機械検査が無いので、直さないとコードと説明が食い違ったまま残ります)。`,
+      ).toEqual(expected);
+    },
+  );
 
   // 上の規則照合と重なる部分はあるが、独立した意味がある:
   //   - LOCALLY_ADDED_LINT_PLUGINS の分は規則からは導けないので、そちらが
   //     ロックファイルから読めなくなったことはこの検査でしか分からない。
   //   - 期限判定の skip 条件 (件数一致) が拠り所にしているのはこの検査の文言なので、
   //     「なぜ skip されたか」を専用のメッセージで示す役割も持つ。
-  it("保留の理由になっている上流プラグインが、すべてロックファイルから読み取れる", () => {
-    // 走査で拾えたパッケージ名の一覧
-    const found = upstreamPeers.map((peer) => peer.name);
-    // 一覧に挙げたのに走査から漏れたものを**全部**集める。
-    // 1 件ずつ expect すると最初の 1 件で例外が飛び、残りは出力に現れない。
-    // 「複数が同時に消えること」こそこの検査が警戒している前提崩れなので、
-    // 差集合を 1 回だけ比較して全件を一度に見せる (1 件ずつ直して再実行させない)
-    const missing = REQUIRED_UPSTREAM_PLUGINS.filter((plugin) => !found.includes(plugin));
-    // 実際に eslint を制限しているプラグインが 1 つでも走査から外れると、
-    // 残った緩い peer だけを見て「全員が次の major を許した」と誤読しうる。
-    // 上流の依存構成が変わったなら、保留の前提ごと見直す合図として落とす
-    expect(
-      missing,
-      `${UPSTREAM_CONFIG_PACKAGE} 配下の eslint peer 依存として見つからないものがあります: ` +
-        `[${missing.join(", ")}]` +
-        `(見つかったのは ${found.join(", ") || "なし"})。依存構成が変わったなら、` +
-        `REQUIRED_UPSTREAM_PLUGINS と保留の前提を見直してください。`,
-    ).toEqual([]);
-  });
+  // ロックファイル自体が読めていないときは対象外 (skip として CI の出力にも現れる)。
+  // 「読み取れない」のは事実だが、原因はロックファイルが無い/壊れていることであって
+  // 上流の依存構成が変わったことではない。ここで「依存構成が変わったなら
+  // REQUIRED_UPSTREAM_PLUGINS と保留の前提を見直してください」と促すと、
+  // 一覧を空にする方向へ誘導し、最終的に ignore の削除まで進んでしまう
+  it.skipIf(packageLockRead.error !== null)(
+    "保留の理由になっている上流プラグインが、すべてロックファイルから読み取れる",
+    () => {
+      // 走査で拾えたパッケージ名の一覧
+      const found = upstreamPeers.map((peer) => peer.name);
+      // 一覧に挙げたのに走査から漏れたものを**全部**集める。
+      // 1 件ずつ expect すると最初の 1 件で例外が飛び、残りは出力に現れない。
+      // 「複数が同時に消えること」こそこの検査が警戒している前提崩れなので、
+      // 差集合を 1 回だけ比較して全件を一度に見せる (1 件ずつ直して再実行させない)
+      const missing = REQUIRED_UPSTREAM_PLUGINS.filter((plugin) => !found.includes(plugin));
+      // 実際に eslint を制限しているプラグインが 1 つでも走査から外れると、
+      // 残った緩い peer だけを見て「全員が次の major を許した」と誤読しうる。
+      // 上流の依存構成が変わったなら、保留の前提ごと見直す合図として落とす
+      expect(
+        missing,
+        `${UPSTREAM_CONFIG_PACKAGE} 配下の eslint peer 依存として見つからないものがあります: ` +
+          `[${missing.join(", ")}]` +
+          `(見つかったのは ${found.join(", ") || "なし"})。依存構成が変わったなら、` +
+          `REQUIRED_UPSTREAM_PLUGINS と保留の前提を見直してください。`,
+      ).toEqual([]);
+    },
+  );
 
   // 次のどちらかなら、この検査は対象外 (skip として CI の出力にも現れる):
   //   - 保留そのものが無い … 上流が出揃って ignore を消したあと、このテストだけが
