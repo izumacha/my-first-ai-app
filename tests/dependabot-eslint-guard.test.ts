@@ -48,7 +48,12 @@
 import { describe, expect, it } from "vitest";
 // 設定ファイルを読むため (Node 標準の同期 API で十分)
 import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
+// このファイル自身の場所を ESM の標準的な方法で求めるため。
+// `__dirname` は CommonJS の変数で、いまは Vitest の互換シムのおかげで動いているだけ。
+// このファイルが素の ESM として読まれた時点で ReferenceError になるので、
+// 同じ用途で REPO_ROOT を組み立てている scripts/capture-*.mjs と同じ書き方に揃える
+import { fileURLToPath } from "node:url";
 // dependabot.yml を構造として読むため
 import { parse as parseYaml } from "yaml";
 // peer 範囲が特定のバージョンを許すかを正しく判定するため。
@@ -58,8 +63,9 @@ import { parse as parseYaml } from "yaml";
 // 専用ライブラリに任せる (§9 自前実装しない)
 import { satisfies } from "semver";
 
-// リポジトリのルート (このテストファイルは tests/ 直下にある)
-const REPO_ROOT = resolve(__dirname, "..");
+// リポジトリのルート (このテストファイルは tests/ 直下にあるので 1 つ上が repo のルート)。
+// import.meta.url は「このファイルの URL」なので、それをパスへ直してから親ディレクトリを取る
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // 検査対象 1: Dependabot の設定ファイル
 const DEPENDABOT_PATH = resolve(REPO_ROOT, ".github/dependabot.yml");
 // 検査対象 2: eslint のバージョン範囲を宣言している場所
@@ -176,6 +182,27 @@ function asArray(value: unknown): unknown[] {
 }
 
 /**
+ * 配列のうち「オブジェクトとして書かれた要素」だけを返す (配列そのものは除く)。
+ *
+ * YAML のリストは、ブロックをコメントアウトした残りとして空要素 `-` を書けてしまう。
+ * それをパースすると要素が `null` になるので、素直にキーを読むと
+ * `TypeError: Cannot read properties of null` になり、**describe のトップレベルで
+ * 評価されるこのファイルは全検査が収集時エラーとして落ちる**。CI は赤くなるものの、
+ * このファイルが掲げている「何を直せばよいか分かる日本語の失敗文言」が一切出ない。
+ *
+ * そこで読めない形の要素はここで落とし、「そのエントリは無かった」ものとして扱う。
+ * 数が減る方向なので、呼び出し側の件数検査は本来の文言のまま落ちる (fail-closed)。
+ */
+function objectElementsOf(value: unknown): Record<string, unknown>[] {
+  // 配列でなければ空配列 (= 要素なし) にしてから、要素を 1 つずつ振るう
+  return asArray(value).filter(
+    // null と配列を除いたオブジェクトだけを残す (typeof は null も配列も "object" と答えるため)
+    (entry): entry is Record<string, unknown> =>
+      typeof entry === "object" && entry !== null && !Array.isArray(entry),
+  );
+}
+
+/**
  * ignore エントリの `dependency-name` が、対象パッケージに当たるかを判定する。
  *
  * Dependabot の `dependency-name` は `*` をワイルドカードとして解釈するため、
@@ -255,15 +282,17 @@ function collectIgnoreEntries(
   // updates 直下から「エコシステムとディレクトリの両方が一致する」ブロックを集める。
   // エコシステムだけで最初の 1 件を採ると、npm のブロックが複数ある構成 (モノレポ等) で
   // 別ディレクトリのブロックに書かれた ignore を、このプロジェクトに効いていると読み違える
-  const blocks = asArray(config.updates)
+  // 読める形 (オブジェクト) の要素だけを見る。空要素 `-` が混ざっていても収集時エラーにしない
+  const blocks = objectElementsOf(config.updates)
     .map((entry) => entry as DependabotUpdateEntry)
     .filter(
       (entry) => entry["package-ecosystem"] === ecosystem && coversDirectory(entry, directory),
     );
   // 該当ブロックの ignore から対象パッケージに当たるエントリをすべて集めて返す
-  // (完全一致だけでなく `*` / `eslint*` のようなワイルドカードも拾う)
+  // (完全一致だけでなく `*` / `eslint*` のようなワイルドカードも拾う)。
+  // ignore 側のリストにも空要素は書けるので、同じヘルパーで振るう
   return blocks.flatMap((block) =>
-    asArray(block.ignore)
+    objectElementsOf(block.ignore)
       .map((entry) => entry as DependabotIgnoreEntry)
       .filter((entry) => ignoreNameMatches(entry["dependency-name"], dependencyName)),
   );
@@ -443,11 +472,13 @@ function asRecord(value: unknown): Record<string, unknown> {
  * ignore エントリに書かれているキーを並べ替えて返す。
  *
  * 想定外のキー (`versions` など) が増えていないかを比較するために使う。
- * オブジェクトでなければ空配列を返し、呼び出し側の比較を落とす方向へ倒す。
+ *
+ * **引数がオブジェクトであることは呼び出し側が保証している。** 渡ってくるのは
+ * collectIgnoreEntries の戻り値だけで、そこは objectElementsOf を通しているため
+ * null や非オブジェクトは既に振るい落とされている。ここで同じ判定を重ねても
+ * 決して真にならない分岐が増えるだけなので置かない (CLAUDE.md §6 デッドコードを残さない)。
  */
 function sortedKeysOf(entry: DependabotIgnoreEntry): string[] {
-  // オブジェクトでなければキーを数えようがない
-  if (typeof entry !== "object" || entry === null) return [];
   // キーを取り出して並べ替える (比較しやすくするため)
   return Object.keys(entry).sort();
 }
@@ -527,7 +558,10 @@ describe("dependabot.yml の ESLint major 保留", () => {
     expect(
       allowedMajor,
       `package.json の devDependencies.${GUARDED_DEPENDENCY} を、` +
-        `\`^9.39.4\` のような「先頭に ^ か ~ が 1 つ、あとは数字とドット」の形で書いてください` +
+        // 書式例の major は留め置き中の major に追随させる。ここだけ数字を直書きすると、
+        // HELD_MAJOR を新しい major へ更新し直したときに例だけ古い数字のまま残り、
+        // 「^11 と書いてあるのに ^9 にしろと言われた」という誤解を生む
+        `\`^${HELD_MAJOR}.39.4\` のような「先頭に ^ か ~ が 1 つ、あとは数字とドット」の形で書いてください` +
         `(現在の値: ${JSON.stringify(declaredRange)})。` +
         `dependencies へ移した・キーごと消した場合もここで落ちます。` +
         `この検査が落ちている間は ignore の削除・重複を見張る検査が skip され、` +
@@ -570,17 +604,21 @@ describe("dependabot.yml の ESLint major 保留", () => {
   it("保留の理由になっている上流プラグインが、すべてロックファイルから読み取れる", () => {
     // 走査で拾えたパッケージ名の一覧
     const found = upstreamPeers.map((peer) => peer.name);
+    // 一覧に挙げたのに走査から漏れたものを**全部**集める。
+    // 1 件ずつ expect すると最初の 1 件で例外が飛び、残りは出力に現れない。
+    // 「複数が同時に消えること」こそこの検査が警戒している前提崩れなので、
+    // 差集合を 1 回だけ比較して全件を一度に見せる (1 件ずつ直して再実行させない)
+    const missing = REQUIRED_UPSTREAM_PLUGINS.filter((plugin) => !found.includes(plugin));
     // 実際に eslint を制限しているプラグインが 1 つでも走査から外れると、
     // 残った緩い peer だけを見て「全員が次の major を許した」と誤読しうる。
     // 上流の依存構成が変わったなら、保留の前提ごと見直す合図として落とす
-    for (const plugin of REQUIRED_UPSTREAM_PLUGINS) {
-      expect(
-        found,
-        `${plugin} が ${UPSTREAM_CONFIG_PACKAGE} 配下の eslint peer 依存として見つかりません` +
-          `(見つかったのは ${found.join(", ") || "なし"})。依存構成が変わったなら、` +
-          `REQUIRED_UPSTREAM_PLUGINS と保留の前提を見直してください。`,
-      ).toContain(plugin);
-    }
+    expect(
+      missing,
+      `${UPSTREAM_CONFIG_PACKAGE} 配下の eslint peer 依存として見つからないものがあります: ` +
+        `[${missing.join(", ")}]` +
+        `(見つかったのは ${found.join(", ") || "なし"})。依存構成が変わったなら、` +
+        `REQUIRED_UPSTREAM_PLUGINS と保留の前提を見直してください。`,
+    ).toEqual([]);
   });
 
   // 次のどちらかなら、この検査は対象外 (skip として CI の出力にも現れる):
