@@ -225,27 +225,6 @@ function countNonListKey(container: Record<string, unknown>, key: string): numbe
   return Array.isArray(container[key]) ? 0 : 1;
 }
 
-/**
- * 「無いと読み進めないキー」が書かれていないなら 1 を返す。
- *
- * countNonListKey は「キーはあるが形が違う」を捉える一方、**キーごと消えた場合**は
- * 素通りする。読み手にとっては同じで、`updates` が無い dependabot.yml は
- * asArray が空配列へ均すため「ブロックが 1 つも無い」設定として黙って読み進み、
- * 担当ブロックが 0 件 → 保留の期限判定ごと skip という結末になる。
- *
- * 対象は「書かないという選択があり得ないキー」だけに絞る — dependabot.yml は
- * `updates` が無ければ設定として空。**この環境から Dependabot の必須要件を
- * 裏取りできない**ので、「無くても既定で動くのかもしれない」とは考えず、
- * 意図して書いた形でない時点で落とす（このファイル全体と同じ fail-closed の立場）。
- *
- * なお `directory` / `directories` は「キーがあるか」では足りない
- * （`directories: []` のように**キーはあるが値が無い**形がある）ため、
- * この関数ではなく「使える値が 1 つでもあるか」で判定している。
- */
-function countMissingRequiredKey(container: Record<string, unknown>, key: string): number {
-  // 書かれていれば読み進められるので壊れではない
-  return key in container ? 0 : 1;
-}
 
 /**
  * 指定エコシステムの update ブロックを返す (ディレクトリでは絞らない)。
@@ -326,9 +305,9 @@ function countUnreadableElements(
   //     asArray が空配列に均すので「要素の数え上げ」では 0 のまま素通りしてしまう。
   //     結果は directory を消したときと同じで、担当ブロックが 0 件になって
   //     期限判定ごと skip され、検出網が静かに止まる
-  let unreadable = countNonListKey(config as Record<string, unknown>, "updates");
-  // (0') `updates` がキーごと無い設定も同じく空として読み飛ばされるので数える
-  unreadable += countMissingRequiredKey(config as Record<string, unknown>, "updates");
+  // `updates` は「無い」も「リストでない」も同じ結末 (空として読み飛ばす) なので、
+  // キーの有無で場合分けせず「配列であること」だけを求める
+  let unreadable = Array.isArray(config.updates) ? 0 : 1;
   // (1) updates 直下: 元の要素数から、オブジェクトとして読めた数を引く
   const blocks = objectElementsOf(config.updates);
   unreadable += asArray(config.updates).length - blocks.length;
@@ -355,7 +334,12 @@ function countUnreadableElements(
     if (!declaredDirectories.some((value) => typeof value === "string" && value !== "")) {
       unreadable += 1;
     }
-    // 複数形のリストに紛れた文字列以外の要素も、読み手が黙って捨てるので数える
+    // 複数形のリストに紛れた文字列以外の要素も、読み手が黙って捨てるので数える。
+    // **ここは「過剰側に倒す」方針の例外が 1 つある**: 使える `directory` がある
+    // ブロックで `directories` だけがリストでない形 (`directories: "/"` 等) の場合、
+    // coversDirectory は `directory` の一致で先に true を返すため読まれず、
+    // asArray も空になるので数に現れない。担当ブロックは正しく選ばれるので
+    // 検出網が止まる心配は無く、意図して数えていない
     unreadable += asArray(block["directories"]).filter(
       (value) => typeof value !== "string",
     ).length;
@@ -868,8 +852,12 @@ describe("dependabot.yml の ESLint major 保留", () => {
   const derivedFromRule = deriveExpectedPlugins(packageLock);
   // 規則から 1 つも導けないなら、この検査に使える形になっていない
   const lockRuleDerivable = derivedFromRule.length > 0;
-  // ロックに依存する検査を走らせてよいか (読めていて、かつ規則が導ける)
-  const lockUsable = packageLockRead.error === null && lockRuleDerivable;
+  // ロックに依存する検査を走らせてよいか。
+  // **読めなかった場合もこれ 1 つで足りる** — readParsed は失敗時に必ず value: null を
+  // 返すので、deriveExpectedPlugins(null) は [] になり lockRuleDerivable が false に
+  // なる。`packageLockRead.error === null` を並べても判定を変えることがないため置かない
+  // (§6 デッドコードを残さない)
+  const lockUsable = lockRuleDerivable;
   // ロックファイルに記録されている上流プラグイン群の peer 範囲
   const upstreamPeers = collectUpstreamPeers(packageLock);
   // 規則 (設定パッケージの直接依存 ＋ repo 固有分) から導いた「見張るべき一覧」
@@ -1030,11 +1018,14 @@ describe("dependabot.yml の ESLint major 保留", () => {
   //     ロックファイルから読めなくなったことはこの検査でしか分からない。
   //   - 期限判定の skip 条件 (件数一致) が拠り所にしているのはこの検査の文言なので、
   //     「なぜ skip されたか」を専用のメッセージで示す役割も持つ。
-  // ロックファイル自体が読めていないときは対象外 (skip として CI の出力にも現れる)。
-  // 「読み取れない」のは事実だが、原因はロックファイルが無い/壊れていることであって
+  // ロックファイルが「この検査に使える形」でないときは対象外
+  // (skip として CI の出力にも現れる)。**該当するのは 2 通り** — 読めない場合と、
+  // 読めても規則から 1 つも導けない場合 (設定パッケージのエントリが無い・null など)。
+  // どちらでも「読み取れない」のは事実だが、原因はロックファイル側であって
   // 上流の依存構成が変わったことではない。ここで「依存構成が変わったなら
   // REQUIRED_UPSTREAM_PLUGINS と保留の前提を見直してください」と促すと、
-  // 一覧を空にする方向へ誘導し、最終的に ignore の削除まで進んでしまう
+  // 一覧を空にする方向へ誘導し、最終的に ignore の削除まで進んでしまう。
+  // 原因の報告は入力ファイルの検査とロック構造の検査に任せる
   it.skipIf(!lockUsable)(
     "保留の理由になっている上流プラグインが、すべてロックファイルから読み取れる",
     () => {
