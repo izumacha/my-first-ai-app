@@ -151,9 +151,11 @@ export function trimHistoryForRequest(
     // 末尾から最初に見つかる user 発言を探す
     const lastUserMessage = meaningful.findLast((m) => m.role === "user");
     // 見つからなければ送れるものが無いので空のまま返す（サーバーが弾く）。
-    // user 発言はそもそも切り詰めない（下の capAssistantContent は user を
-    // そのまま返すので、ここで呼んでも何もしない）ため、そのまま 1 件を返す
-    return lastUserMessage ? [lastUserMessage] : [];
+    // 見つかった 1 件は必ず窓の外にある過去の発言（いま打った質問なら窓の末尾に
+    // 残っているのでこの分岐には来ない）なので、本文は下と同じく上限に収める。
+    // ここだけ収めそこねると、上限を超える発言を 1 件だけ送って必ず 400 になり、
+    // この分岐が防ごうとしている「復帰できない 400」を自分で作ってしまう
+    return lastUserMessage ? [capContent(lastUserMessage)] : [];
   }
 
   // 過去の発言の本文は受付上限に収めて返す。

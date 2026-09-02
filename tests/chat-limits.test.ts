@@ -115,8 +115,13 @@ describe("trimHistoryForRequest", () => {
   it("窓に user 発言が残らなくても、空の配列は返さない", () => {
     // 直近 50 件がすべて assistant 発言になる履歴を作る。
     // 窓の先頭を user にそろえる処理で全部落ち、素朴な実装では空配列になる
+    // 拾われる 1 件は上限を超えた長文にしておく。長さを見ないと、この予備経路
+    // だけが切り詰めを通っていなくても件数とロールの確認だけで緑になってしまう
     const history: Message[] = [
-      { role: "user", content: "ずっと前の質問" },
+      {
+        role: "user",
+        content: "あ".repeat(MAX_CONTENT_LENGTH + 500),
+      },
       ...Array.from({ length: MAX_MESSAGE_COUNT + 1 }, (_, i) => ({
         role: "assistant" as const,
         content: `回答${i}`,
@@ -129,6 +134,10 @@ describe("trimHistoryForRequest", () => {
     // その状態を作ってしまう。履歴のどこかに user 発言があればそれを送る
     expect(trimmed.length).toBeGreaterThan(0);
     expect(trimmed[0].role).toBe("user");
+    // 本文も上限に収まっていることを確認する。収めそこねると、この分岐が防ごうと
+    // している「必ず 400 になり、往復が成立しないので窓からも抜けない」状態を
+    // 自分で作ってしまう（拾うのは窓の外にある過去の発言なので切り詰めてよい）
+    expect(trimmed[0].content.length).toBeLessThanOrEqual(MAX_CONTENT_LENGTH);
   });
 
   it("user 発言が 1 件も無ければ空のまま返す（送れるものが無い）", () => {
