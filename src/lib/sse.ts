@@ -90,13 +90,16 @@ export function splitSseLines(buffer: string): {
  *
  * @param reader - レスポンスボディの読み取り口
  * @param onText - 本文が伸びるたびに呼ばれるコールバック（引数は先頭からの累積）
- * @returns 受信した本文と、完了として扱ってよいか（終端の番兵を受け取り、かつ
- *          読み飛ばした差分が無い場合だけ true）
+ * @returns 完了として扱ってよいか（終端の番兵を受け取り、かつ読み飛ばした差分が
+ *          無い場合だけ true）。**本文は返さない**: 例外で終わったときは戻り値が
+ *          得られず、呼び出し元は結局 `onText` で受け取った本文を持つ必要がある。
+ *          両方から取れる形にすると、成功経路と失敗経路で別々の値を読んで
+ *          食い違う余地が生まれる
  */
 export async function readSseAnswer(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   onText: (text: string) => void
-): Promise<{ text: string; completed: boolean }> {
+): Promise<{ completed: boolean }> {
   // バイト列を文字列へ戻すデコーダーを用意する
   const decoder = new TextDecoder();
   // 受信した本文を先頭から蓄積する
@@ -141,6 +144,8 @@ export async function readSseAnswer(
         break;
       }
 
+      // 取り出した差分（解析に失敗したらこの行は読み飛ばす）
+      let delta: string;
       try {
         // JSON をパースしてテキスト差分を取得する
         const parsed = JSON.parse(data) as { text?: unknown };
@@ -150,10 +155,8 @@ export async function readSseAnswer(
         if (typeof parsed.text !== "string") {
           throw new TypeError("差分の形式が想定と異なります");
         }
-        // 蓄積テキストに差分を追加する
-        accumulated += parsed.text;
-        // 伸びた本文を呼び出し元へ渡す（画面の途中表示と、失敗時の取り出しに使う）
-        onText(accumulated);
+        // 使える差分として控える
+        delta = parsed.text;
       } catch (parseError) {
         // 壊れた差分は表示できないので飛ばすが、黙って捨てない。
         // 捨てた事実を覚えておかないと、[DONE] は普通に届くため
@@ -168,11 +171,28 @@ export async function readSseAnswer(
           console.debug("差分の解析に失敗したため読み飛ばしました:", parseError);
         }
         droppedFrame = true;
+        // この行は使えないので次の行へ進む
+        continue;
       }
+
+      // 蓄積テキストに差分を追加する
+      accumulated += delta;
+      // 伸びた本文を呼び出し元へ渡す（画面の途中表示と、失敗時の取り出しに使う）。
+      // **try の外で呼ぶ**: 中で呼ぶと、呼び出し元のコールバックが投げた例外まで
+      // 「壊れた差分」として分類され、debug ログに落ちたうえ完全な回答が
+      // 「途切れています」の印付きで確定してしまう（この関数の約束は
+      // 「例外はそのまま呼び出し元へ投げる」）
+      onText(accumulated);
     }
   }
 
-  // 本文と、完了として扱ってよいかを返す。
+  // デコーダーに残った半端なバイト列（多バイト文字の途中で切れた分）は、
+  // あえて吐き出さない。残りうるのは終端の番兵が来ないまま終わった配信だけで
+  // （番兵まで届いていれば、それ以前の文字は必ず完成している）、その配信は
+  // sawDone が false なので既に未完了として扱われる。吐き出して「欠けがある」
+  // と記録しても判定は変わらないので、条件だけが増えて何も守らないコードになる
+
+  // 完了として扱ってよいかを返す。
   // 番兵を受け取っていても読み飛ばした差分があれば「欠けのある回答」なので完了にしない
-  return { text: accumulated, completed: sawDone && !droppedFrame };
+  return { completed: sawDone && !droppedFrame };
 }

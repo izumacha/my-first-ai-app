@@ -360,6 +360,36 @@ describe("チャット画面のストリーミング処理", () => {
     }
   });
 
+  it("本文が 1 文字も無いまま完了しなかった配信は「受け取れませんでした」と言わないこと", async () => {
+    // 差分を 1 件も流さず、終端の番兵も送らずに正常終了するストリームを模す
+    // （上流が本文を出す前に途切れた場合。サーバーは番兵を送らずに閉じる）
+    const encoder = new TextEncoder();
+    const silentStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(": ping\n\n"));
+        controller.close();
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response(silentStream, { status: 200 }))
+    );
+
+    // チャット画面を描画してメッセージを送信する
+    render(<Home />);
+    sendMessage("テスト質問");
+
+    // 「回答を受け取れませんでした」だと何も送られなかったように見えるが、
+    // 実際は途中で終わっている。完了したかで文言を分ける
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "回答を最後まで受け取れませんでした"
+      );
+    });
+    // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
+    await waitForIdle();
+  });
+
   it("CRLF で区切られたストリームでも完全な回答として扱うこと", async () => {
     // 途中のプロキシが CRLF で流す場合を模す。行末の CR を落とし損ねると
     // 本文は届くのに [DONE] だけ一致せず、完全な回答に中断の印が付いてしまう

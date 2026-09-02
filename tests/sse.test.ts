@@ -10,6 +10,7 @@ import { NextRequest } from "next/server";
 import {
   formatSseFrame,
   parseSseDataLine,
+  readSseAnswer,
   splitSseLines,
   SSE_DATA_PREFIX,
   SSE_DONE_MARKER,
@@ -195,5 +196,55 @@ describe("splitSseLines", () => {
       `${SSE_DATA_PREFIX}${SSE_DONE_MARKER}\r\n\r\n`
     );
     expect(parseSseDataLine(lines[0])).toBe(SSE_DONE_MARKER);
+  });
+});
+
+describe("readSseAnswer", () => {
+  /**
+   * 指定したバイト列を順に流す読み取り口を作る。
+   * @param chunks - 流すバイト列（読み終えたら done になる）
+   * @returns readSseAnswer に渡せる読み取り口
+   */
+  function readerOf(chunks: Uint8Array[]): ReadableStreamDefaultReader<Uint8Array> {
+    // 与えられたかたまりを順に流すストリームを組み立てる
+    return new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(chunk);
+        controller.close();
+      },
+    }).getReader();
+  }
+
+  it("呼び出し元のコールバックが投げた例外はそのまま伝わる", async () => {
+    // 差分 1 件と終端の番兵を流す（本来なら完了として扱われる配信）
+    const encoder = new TextEncoder();
+    const reader = readerOf([
+      encoder.encode(formatSseFrame(JSON.stringify({ text: "こんにちは" }))),
+      encoder.encode(formatSseFrame(SSE_DONE_MARKER)),
+    ]);
+    // 表示側の不具合を模して、コールバックで例外を投げる
+    const boom = new Error("表示側の不具合");
+    // 例外が握り潰されず呼び出し元へ届くことを確認する。
+    // 中で握り潰すと「壊れた差分」として分類され、完全な回答が
+    // 「途切れています」の印付きで確定してしまう
+    await expect(
+      readSseAnswer(reader, () => {
+        throw boom;
+      })
+    ).rejects.toBe(boom);
+  });
+
+  it("終端の番兵が来ないまま終わった配信は未完了として扱う", async () => {
+    // 差分だけを流して番兵を送らずに終わる（多バイト文字の途中で切れた場合も
+    // ここに含まれる。デコーダーに残ったバイト列があっても判定は変わらない）
+    const encoder = new TextEncoder();
+    const reader = readerOf([
+      encoder.encode(formatSseFrame(JSON.stringify({ text: "途中まで" }))),
+      encoder.encode("あ").slice(0, 2),
+    ]);
+    // 読み取りを実行する
+    const answer = await readSseAnswer(reader, () => {});
+    // 番兵を受け取っていないので完了として扱わない（画面は印を付けて履歴に残す）
+    expect(answer.completed).toBe(false);
   });
 });

@@ -91,9 +91,12 @@ export default function Home() {
       // ユーザーのメッセージオブジェクトを作成する
       const userMessage: Message = { role: "user", content };
 
-      // 会話履歴にユーザーメッセージを追加する
+      // 会話履歴にユーザーメッセージを追加する。
+      // 更新は関数形式で行う: 直前の値を捕まえた配列をそのまま渡すと、再描画の前に
+      // 送信が 2 回重なったときに片方の発言が丸ごと消える（送信ボタンの無効化で
+      // today は防げているが、入力欄を経由しない送信経路が増えると効かない）
       const updatedMessages = [...messages, userMessage];
-      setMessages(updatedMessages);
+      setMessages((previous) => [...previous, userMessage]);
 
       // 応答の読み取りに入ったかどうか。外側の catch が「通信エラー」と
       // 断定してよいかの判断に使う。読み取りに入っていれば接続は成立して
@@ -165,6 +168,7 @@ export default function Home() {
           // 完了したかを控える（例外で終わった場合はここへ来ないので false のまま）
           completed = answer.completed;
 
+
           // ここへ来たのは読み取りが例外なく終わったときだけ（＝通信は成功した）。
           // それでも 1 文字も受け取れていないなら、黙って何も起きなかったように
           // 終わらせない。ローディングだけ止まって画面に何も出ないと、
@@ -172,7 +176,13 @@ export default function Home() {
           // finally 側で判定すると失敗経路でも走り、外側の catch が上書きする順序に
           // 依存した「たまたま正しい」状態になる
           if (!received.trim()) {
-            setError(MESSAGES.emptyAnswer);
+            // 1 文字も受け取れなかった理由は 2 通りある。完了していれば
+            // 「本文の無い回答が返った」、完了していなければ「途中で終わった」で、
+            // 後者に「回答を受け取れませんでした」と出すと、何も送られなかったように
+            // 見えて実際（途中で切れた）と食い違う
+            setError(
+              completed ? MESSAGES.emptyAnswer : MESSAGES.answerInterrupted
+            );
           }
         } finally {
           // 読み取りを終えた reader を必ず解放する。[DONE] を受信して読み取りを
