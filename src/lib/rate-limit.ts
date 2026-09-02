@@ -286,18 +286,22 @@ export function createRateLimiter(options: RateLimiterOptions = {}): RateLimiter
       );
 
       // リクエスト数が上限に達していたら制限超過と判定する（この回は数えない）
-      if (recentTimestamps.length >= maxRequests) {
-        return true;
+      const limited = recentTimestamps.length >= maxRequests;
+
+      // 制限内なら今回のリクエスト時刻を記録する
+      if (!limited) {
+        recentTimestamps.push(now);
       }
 
-      // 今回のリクエスト時刻を記録する
-      recentTimestamps.push(now);
-
-      // この送信元のバケットへ書き戻す
+      // この送信元のバケットへ書き戻す。**上限に達していた場合も必ず書き戻す**:
+      // 共有バケットから引き取った記録は既にそちらから取り除いてあるので、
+      // ここで書き戻さないとどこにも残らず、次のリクエストが空から数え直しになって
+      // 同じウィンドウ内で枠が丸ごと戻ってしまう（引き取りが防ごうとしている
+      // 「上限の 2 倍まで通れる」状態が、弾かれた側の経路で再発する）
       buckets.set(clientKey, recentTimestamps);
 
-      // 制限内なので false を返す
-      return false;
+      // 判定結果を返す
+      return limited;
     },
 
     get trackedClientCount(): number {
