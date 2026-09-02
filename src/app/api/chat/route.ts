@@ -15,24 +15,13 @@ import { getSystemPrompt, getMaxTokens, isCategoryId } from "@/lib/prompts";
 import { formatSseFrame, SSE_DONE_MARKER } from "@/lib/sse";
 // 入力上限はクライアントと共有する（唯一の参照元は @/lib/chat-limits）
 import { MAX_CONTENT_LENGTH, MAX_MESSAGE_COUNT } from "@/lib/chat-limits";
+// レート制限の判定ロジックと上限値（唯一の参照元は @/lib/rate-limit）
+import { createRateLimiter, RATE_LIMIT_WINDOW_MS } from "@/lib/rate-limit";
 import type { ChatErrorResponse, Message, Role } from "@/lib/types";
 
-/** レート制限用：IP ごとのリクエスト時刻を記録するマップ */
-const rateLimitMap = new Map<string, number[]>();
-
-/** レート制限の設定値 */
-const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1分間のウィンドウ
-const RATE_LIMIT_MAX_REQUESTS = 20; // ウィンドウ内の最大リクエスト数
-
-/** 追跡する送信元キーの上限数。X-Forwarded-For は送信元が偽装できるため、
- * 毎回異なる値を送ってマップを際限なく成長させるメモリ枯渇攻撃が成立してしまう。
- * 上限に達したら期限切れエントリを掃除し、それでも満杯なら新規送信元は
- * 共有バケットへまとめて計上して全体流量を頭打ちにする（fail-safe）。 */
-const MAX_TRACKED_CLIENTS = 10_000;
-
-/** 追跡テーブル満杯時に未追跡の新規送信元をまとめて数える共有バケットのキー。
- * IP アドレスに現れない文字で構成し、実クライアントのキーと衝突しないようにする。 */
-const OVERFLOW_KEY = "__overflow__";
+/** 送信元ごとのレート制限器（判定ロジックと状態は @/lib/rate-limit に集約）。
+ * モジュールスコープで 1 つだけ作り、同じインスタンス上のリクエスト間で状態を共有する。 */
+const rateLimiter = createRateLimiter();
 
 /** レート制限キーとして受け付ける最大文字数（IPv6 でも 45 文字以内。
  * 偽装ヘッダ由来の巨大文字列をそのままキーに使ってメモリを消費しないための上限）。 */
@@ -169,57 +158,6 @@ function resolveClientKey(request: NextRequest): string {
   }
   // 妥当な長さのクライアント IP をキーとして返す
   return lastHop;
-}
-
-/**
- * IP ベースの簡易レート制限チェック
- * @param clientKey - リクエスト元を識別するキー
- * @returns true ならレート制限超過
- */
-function isRateLimited(clientKey: string): boolean {
-  // 現在時刻を取得する
-  const now = Date.now();
-
-  // 追跡テーブルが上限に達していたら、期限切れの送信元エントリをまとめて掃除する
-  if (rateLimitMap.size >= MAX_TRACKED_CLIENTS) {
-    // すべてのエントリを確認して、ウィンドウ外のものだけを削除する
-    for (const [key, timestamps] of rateLimitMap) {
-      // 最後のリクエストがウィンドウ外なら、この送信元の記録は不要なので削除する
-      if (timestamps.every((t) => now - t >= RATE_LIMIT_WINDOW_MS)) {
-        rateLimitMap.delete(key);
-      }
-    }
-  }
-
-  // 掃除後も満杯で、かつ未追跡の新規送信元なら共有バケットに振り替える。
-  // 素通しにすると偽装キーの使い捨てで制限を無効化できてしまうため、
-  // 満杯時の新規送信元はまとめて数えて全体流量を必ず頭打ちにする（fail-safe）
-  const effectiveKey =
-    rateLimitMap.size >= MAX_TRACKED_CLIENTS && !rateLimitMap.has(clientKey)
-      ? OVERFLOW_KEY
-      : clientKey;
-
-  // この送信元の過去のリクエスト時刻一覧を取得する（なければ空配列）
-  const timestamps = rateLimitMap.get(effectiveKey) ?? [];
-
-  // ウィンドウ内のリクエストだけを残すようフィルタリングする
-  const recentTimestamps = timestamps.filter(
-    (t) => now - t < RATE_LIMIT_WINDOW_MS
-  );
-
-  // リクエスト数が上限に達していたら制限超過と判定する
-  if (recentTimestamps.length >= RATE_LIMIT_MAX_REQUESTS) {
-    return true;
-  }
-
-  // 今回のリクエスト時刻を記録する
-  recentTimestamps.push(now);
-
-  // マップを更新する
-  rateLimitMap.set(effectiveKey, recentTimestamps);
-
-  // 制限内なので false を返す
-  return false;
 }
 
 /**
@@ -494,7 +432,7 @@ export async function POST(
     const clientKey = resolveClientKey(request);
 
     // レート制限チェックを行う
-    if (isRateLimited(clientKey)) {
+    if (rateLimiter.isRateLimited(clientKey)) {
       // 制限超過の場合は 429 を返す（Retry-After で再試行までの待機秒数を伝える）
       return rateLimitedResponse();
     }
