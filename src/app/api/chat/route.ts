@@ -288,9 +288,14 @@ type UpstreamStream = AsyncIterable<Anthropic.RawMessageStreamEvent> & {
  * 上流の Claude ストリームを、ブラウザへ返す SSE 形式の ReadableStream に変換する。
  * POST ハンドラーから切り出して「SSE への変換」という単一の責務に閉じ込める（§6 単一責務）。
  * @param stream - 上流 Claude API のイベントストリーム
+ * @param requestSignal - リクエストの中断シグナル。SDK は中断でも throw せず正常終了するため、
+ *                        ループが終わった理由（流し切った／中断された）はこれでしか区別できない
  * @returns SSE のバイト列を流す ReadableStream
  */
-function createSseStream(stream: UpstreamStream): ReadableStream<Uint8Array> {
+function createSseStream(
+  stream: UpstreamStream,
+  requestSignal: AbortSignal
+): ReadableStream<Uint8Array> {
   // 受信側が自分から切断した（cancel() が呼ばれた）かどうかを覚えておくフラグ。
   // 切断後は controller へ書けなくなるので、書き込みの前に必ずこれを確認する。
   // cancel() は controller が使えなくなるのと同時に同期的に呼ばれ、確認と書き込みの
@@ -324,6 +329,22 @@ function createSseStream(stream: UpstreamStream): ReadableStream<Uint8Array> {
         if (cancelledByConsumer) {
           return;
         }
+        // ループが例外なく終わったことは「上流が最後まで流し切った」ことを意味しない。
+        // SDK は中断でも throw せず return するので、プラットフォームの実行時間上限や
+        // ゲートウェイのアイドルタイムアウトで request.signal が中断された場合も
+        // ここへ普通に到達する。区別せず [DONE] を送ると、途中で切れた回答が
+        // 「完全な回答」としてクライアントに確定・保存され、次のターンでは
+        // 欠けたままの回答が文脈として送り返される（しかもサーバには何も残らない）
+        if (requestSignal.aborted) {
+          // 運用者が気づけるようサーバログに残す（§6 エラーを握り潰さない）
+          console.error(
+            "チャット API のストリーミングが完了前に中断されました:",
+            requestSignal.reason
+          );
+          // 受信側にも「完了していない」ことを伝える（正常完了と見分けられるようにする）
+          controller.error(new Error("ストリーミングが完了前に中断されました"));
+          return;
+        }
         // ストリーム終了を通知する（番兵の値は読み取り側と共有の定数を使う）
         controller.enqueue(sseEncoder.encode(formatSseFrame(SSE_DONE_MARKER)));
         // ストリームを閉じる
@@ -338,13 +359,15 @@ function createSseStream(stream: UpstreamStream): ReadableStream<Uint8Array> {
         // ときだけ本物の上流障害が無記録で消え、いちばんログが欲しい場面で
         // 記録が残らなくなる
 
-        // 中断由来のエラー（SDK の分類が変わった場合などの保険）は異常系ではないので
-        // 記録もエラー通知もしない
+        // 中断由来のエラー（SDK の分類が変わった場合などの保険）はサーバの障害では
+        // ないので記録しない。ただし受信側がまだ読んでいるなら、回答は途中で切れて
+        // いるので黙って閉じてはいけない。[DONE] なしで close() すると、読み手は
+        // done で抜けて「完全な回答」として確定させてしまい、正常完了と区別が付かない。
+        // error() なら終端も伝わる（宙吊りにならない）うえ、切れたことも伝わる
         if (isAbortError(error)) {
-          // 受信側がまだ読んでいるなら終端を伝える。何もせず抜けるとストリームが
-          // 完結も失敗もしないまま宙吊りになり、読み手の read() が永久に解決しない
+          // 受信側がいなければ伝える相手もいないので何もしない
           if (!cancelledByConsumer) {
-            controller.close();
+            controller.error(error);
           }
           return;
         }
@@ -534,8 +557,9 @@ export async function POST(
       }
     );
 
-    // 上流ストリームを SSE 形式の ReadableStream に変換する
-    const readableStream = createSseStream(stream);
+    // 上流ストリームを SSE へ変換する。リクエストの中断シグナルも渡し、
+    // 「上流が流し切った」のか「途中で中断された」のかを区別できるようにする
+    const readableStream = createSseStream(stream, request.signal);
 
     // SSE レスポンスを返す
     return new Response(readableStream, {

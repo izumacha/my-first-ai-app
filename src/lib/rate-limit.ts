@@ -52,15 +52,6 @@ export interface RateLimiter {
 }
 
 /**
- * 送信元ごとのレート制限器を作る。
- *
- * <p>状態（送信元ごとのリクエスト時刻）はこの関数のクロージャに閉じ込め、
- * 呼び出し側からは判定と件数だけが見えるようにする。
- *
- * @param options - 上限値の差し替え（省略時は本番用の既定値）
- * @returns レート制限器
- */
-/**
  * 上限値が正の整数であることを確かめ、そうでなければ即座に失敗させる。
  *
  * <p>`??` は null / undefined しか拾わないため、0 や負数はそのまま通ってしまう。
@@ -85,6 +76,16 @@ function requirePositiveInteger(value: number, name: string): number {
   return value;
 }
 
+/**
+ * 送信元ごとのレート制限器を作る。
+ *
+ * <p>状態（送信元ごとのリクエスト時刻）はこの関数のクロージャに閉じ込め、
+ * 呼び出し側からは判定と件数だけが見えるようにする。
+ *
+ * @param options - 上限値の差し替え（省略時は本番用の既定値）
+ * @returns レート制限器
+ * @throws {RangeError} 上限値が正の整数でない場合
+ */
 export function createRateLimiter(options: RateLimiterOptions = {}): RateLimiter {
   // ウィンドウ幅を決める（指定が無ければ既定値）
   const windowMs = requirePositiveInteger(
@@ -114,11 +115,15 @@ export function createRateLimiter(options: RateLimiterOptions = {}): RateLimiter
   function sweepExpired(now: number): void {
     // すべてのエントリを確認して、ウィンドウ外のものだけを削除する
     for (const [key, timestamps] of buckets) {
-      // 時刻は昇順に追加されるので、最後の 1 件だけ見ればウィンドウ外か判定できる
-      // （全件を走査すると表が大きいときに掃除そのものが重くなる）
-      const newest = timestamps[timestamps.length - 1];
-      // 記録が無い、または最後のリクエストがウィンドウ外ならこの送信元の記録は不要
-      if (newest === undefined || now - newest >= windowMs) {
+      // 記録がすべてウィンドウ外なら、この送信元の記録はもう不要なので削除する。
+      //
+      // 「昇順に積まれるので最後の 1 件だけ見れば足りる」と考えたくなるが、
+      // それは Date.now() が単調増加であることに依存する。NTP のステップ調整や
+      // VM のクロック同期で時刻が巻き戻ると並びが崩れ、まだ有効な記録を持つ
+      // バケットごと削除してしまう（消された送信元はその場で枠を取り戻すので
+      // fail-open）。全件を見る分のコストは、掃除自体を 1 ウィンドウに 1 回へ
+      // 絞ったことで問題にならない（1 バケットの記録は maxRequests 件で有界）
+      if (timestamps.every((t) => now - t >= windowMs)) {
         buckets.delete(key);
       }
     }

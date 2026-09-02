@@ -115,6 +115,27 @@ describe("追跡表が満杯のときの挙動", () => {
     expect(limiter.isRateLimited("a", 1600)).toBe(true);
   });
 
+  it("時刻が巻き戻っても、有効な記録を持つバケットを消さない", () => {
+    // 1 ウィンドウに 1 回だけ許可し、1 件までしか追跡できない制限器を作る
+    const limiter = createRateLimiter({
+      windowMs: 1000,
+      maxRequests: 2,
+      maxTrackedClients: 1,
+    });
+    // 送信元 a に、時刻が巻き戻ったことで昇順でなくなる 2 件の記録を作る。
+    // NTP のステップ調整や VM のクロック同期で Date.now() は巻き戻りうる
+    limiter.isRateLimited("a", 5000);
+    limiter.isRateLimited("a", 100);
+
+    // ここで掃除が走る。末尾の 1 件（100）だけを見る実装だと「ウィンドウ外」と
+    // 誤判定し、まだ有効な記録（5000）ごとバケットを削除してしまう
+    expect(limiter.isRateLimited("a", 5500)).toBe(false);
+
+    // 記録が保たれていれば、ウィンドウ内は 5000 と 5500 の 2 件になり上限に達する。
+    // 掃除でバケットが消えていると枠が戻ってしまい、ここが false になる（fail-open）
+    expect(limiter.isRateLimited("a", 5600)).toBe(true);
+  });
+
   it("掃除は 1 ウィンドウにつき 1 回だけ実行する", () => {
     // 2 件までしか追跡できず、1 ウィンドウに 1 回だけ許可する制限器を作る
     const limiter = createRateLimiter({

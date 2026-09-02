@@ -160,7 +160,8 @@ import { POST } from "@/app/api/chat/route";
 function makeRequest(
   body: unknown,
   ip?: string,
-  contentType: string | null = "application/json"
+  contentType: string | null = "application/json",
+  signal?: AbortSignal
 ): NextRequest {
   // ヘッダを組み立てる（既定では Content-Type に JSON を指定する）
   const headers: Record<string, string> = {};
@@ -177,6 +178,8 @@ function makeRequest(
     method: "POST",
     headers,
     body: typeof body === "string" ? body : JSON.stringify(body),
+    // 中断シグナルの指定があれば渡す（プラットフォーム側の中断を再現するのに使う）
+    signal,
   });
 }
 
@@ -679,6 +682,46 @@ describe("POST /api/chat の上流エラーマッピング", () => {
     }
   });
 
+  it("完了前に中断された配信を『完全な回答』として終わらせない", async () => {
+    // プラットフォームの実行時間上限やゲートウェイのタイムアウトで
+    // request.signal が中断される状況を作る
+    const aborter = new AbortController();
+    createMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        // 中断用コントローラ（この試験では使われない）
+        controller: { abort: vi.fn() },
+        // 1 件流したところで中断され、SDK と同じく throw せず終了する反復子
+        async *[Symbol.asyncIterator]() {
+          // 途中までのデルタを 1 件返す
+          yield {
+            type: "content_block_delta",
+            delta: { type: "text_delta", text: "途中まで" },
+          };
+          // ここでリクエストが中断される（プラットフォーム側の打ち切り）
+          aborter.abort();
+          // 実 SDK は中断でも throw せずに反復を終える
+        },
+      })
+    );
+    // 中断の記録が残ることを検証するためスパイを仕込む
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // 中断シグナル付きのリクエストを送る
+      const res = await POST(
+        makeRequest({ messages: validMessages }, uniqueIp(), "application/json", aborter.signal)
+      );
+      // ループが例外なく終わっても「完了」とは限らないため、
+      // 正常完了（[DONE] を送って close）で終わらせてはいけない。
+      // 完了扱いにすると、途中で切れた回答が確定版として履歴に残る
+      await expect(drainBody(res.body as ReadableStream<Uint8Array>)).rejects.toThrow();
+      // 運用者が気づけるようサーバログにも残る
+      expect(errorSpy).toHaveBeenCalled();
+    } finally {
+      // スパイを元に戻して他のテストへ影響させない
+      errorSpy.mockRestore();
+    }
+  });
+
   it("切断後に上流がまだデルタを流してきてもサーバ障害としてログに残さない", async () => {
     // 切断に上流がすぐ気づかず、デルタが続けて届く状況を作る。
     // 切断済みの controller へ書きに行くと TypeError になるため、
@@ -734,7 +777,7 @@ describe("POST /api/chat の上流エラーマッピング", () => {
     }
   });
 
-  it("中断エラーが反復中に投げられた場合もサーバ障害として扱わない（分類の保険）", async () => {
+  it("中断エラーが反復中に投げられたら、記録はせずクライアントには中断を伝える（分類の保険）", async () => {
     // 実 SDK は反復中に中断を投げないが、SDK の分類が変わった場合に備えた保険の経路。
     // 受信側は切断していないので、cancelledByConsumer ではなく isAbortError で分類される
     createMock.mockImplementationOnce(() =>
@@ -745,9 +788,10 @@ describe("POST /api/chat の上流エラーマッピング", () => {
     try {
       // 正常な形のリクエストを送る
       const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
-      // 中断は異常系ではないので、ストリームはエラーにならず静かに終わる
-      await drainBody(res.body as ReadableStream<Uint8Array>);
-      // 中断は障害ではないので記録しない
+      // 回答は途中で切れているので、正常完了として終わらせてはいけない。
+      // [DONE] なしで静かに close() すると、読み手は完全な回答として確定させてしまう
+      await expect(drainBody(res.body as ReadableStream<Uint8Array>)).rejects.toThrow();
+      // 一方これはサーバの障害ではないので、ログには残さない
       expect(errorSpy).not.toHaveBeenCalled();
     } finally {
       // スパイを元に戻して他のテストへ影響させない

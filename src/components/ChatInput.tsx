@@ -5,8 +5,6 @@
 "use client";
 
 import { useState } from "react";
-// サーバーが受け付ける 1 メッセージの最大文字数（定義元は @/lib/chat-limits）
-import { MAX_CONTENT_LENGTH } from "@/lib/chat-limits";
 
 /** ChatInput コンポーネントの Props */
 interface ChatInputProps {
@@ -48,15 +46,18 @@ export default function ChatInput({ onSend, isLoading }: ChatInputProps) {
   return (
     // フォーム全体のコンテナ
     <form onSubmit={handleSubmit} className="flex gap-2 p-4 border-t border-gray-200 dark:border-gray-700">
-      {/* テキスト入力欄。maxLength にサーバーと同じ受付上限を指定し、
-          確実に 400 になる長さの本文を送ってから初めてエラーが分かる状態を防ぐ */}
+      {/* テキスト入力欄。
+          maxLength は意図的に付けない: 上限を超えた入力を無言で削ると、ユーザーは
+          質問が途中で切れたことに気づけないまま送信してしまう。上限超過はサーバーが
+          理由付きの日本語メッセージ（「メッセージ本文が上限（4000 文字）を超えています。」）
+          で返し、画面に表示されるほうが「何が起きたか」が伝わる（§7 状態はテキストで伝える）。
+          残り文字数の表示など、削らずに伝える手段を用意できたら改めて検討する */}
       <input
         type="text"
         value={input}
         onChange={(e) => setInput(e.target.value)}
         placeholder="メッセージを入力..."
         aria-label="メッセージを入力"
-        maxLength={MAX_CONTENT_LENGTH}
         disabled={isLoading}
         className="flex-1 rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
       />
