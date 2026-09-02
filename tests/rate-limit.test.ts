@@ -164,7 +164,7 @@ describe("追跡表が満杯のときの挙動", () => {
   });
 
   it("期限切れになれば 1 間隔以内に回収する（次のウィンドウまで待たない）", () => {
-    // 掃除の最短間隔はウィンドウの 1/10 ＝ 100ms
+    // 掃除の最短間隔はウィンドウの 1/60（windowMs=1000 なら 16ms）
     const limiter = createRateLimiter({
       windowMs: 1000,
       maxRequests: 1,
@@ -246,14 +246,6 @@ describe("Retry-After の待機秒数", () => {
     expect(createRateLimiter({ windowMs: 1500 }).retryAfterSeconds).toBe(2);
     // 1 秒未満のウィンドウでも 0 ではなく 1 を返す（0 は「すぐ再試行してよい」の意味になる）
     expect(createRateLimiter({ windowMs: 200 }).retryAfterSeconds).toBe(1);
-  });
-});
-
-describe("上流の Retry-After の扱い", () => {
-  it("0 秒でも最低 1 秒は待たせる", () => {
-    // 0 を返すと「すぐ再試行してよい」の意味になり、上流に弾かれ続ける
-    // リクエストで自前のレート制限の枠まで食い潰す
-    expect(createRateLimiter({ windowMs: 1 }).retryAfterSeconds).toBe(1);
   });
 });
 

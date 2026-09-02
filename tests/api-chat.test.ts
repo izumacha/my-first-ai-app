@@ -221,6 +221,26 @@ describe("POST /api/chat の入力検証", () => {
     expect(res.status).toBe(400);
   });
 
+  it("JSON ボディが null リテラルでも 400 を返す（500 にしない）", async () => {
+    // JSON として正しくてもオブジェクトとは限らない。とくに "null" は
+    // JSON.parse が null を返すため、そのまま body.messages を読むと TypeError に
+    // なり、入力の誤りが 500 と「想定外のエラー」のサーバログに化ける
+    // （認証の無いエンドポイントなので、誰でもサーバログを増やせてしまう）。
+    // 数値・文字列・配列など他の非オブジェクトは .messages が undefined になり
+    // messages の検証で 400 になるので、ここで区別して並べる意味は無い
+    const req = new NextRequest("http://localhost/api/chat", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-forwarded-for": uniqueIp(),
+      },
+      body: "null",
+    });
+    // 入力検証の誤りとして 400 が返ることを確認する
+    const res = await POST(req);
+    expect(res.status).toBe(400);
+  });
+
   it("messages が無い場合は 400 を返す", async () => {
     // messages を含まないボディを送る
     const res = await POST(makeRequest({}, uniqueIp()));
@@ -981,6 +1001,7 @@ describe("POST /api/chat の上流エラーマッピング", () => {
     ["1e3", "指数表記の値"],
     ["5.9", "小数の値"],
     ["+5", "符号付きの値"],
+    ["10000000000000000000000000", "桁が多すぎる値"],
   ])("秒数として解釈できない Retry-After（%s）は自前の待機時間へ倒す", async (rawHeader) => {
     createMock.mockImplementationOnce(() =>
       Promise.reject(

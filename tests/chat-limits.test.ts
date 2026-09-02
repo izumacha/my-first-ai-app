@@ -300,38 +300,37 @@ describe("共有する入力上限", () => {
     expect(MAX_CONTENT_LENGTH).toBeGreaterThan(OMITTED_MESSAGE_SUFFIX.length);
   });
 
-  it("件数 × 文字数の最大ペイロードが本文サイズ上限に収まる", () => {
+  it("上限いっぱいの履歴を実際に JSON 化しても本文サイズ上限に収まる", () => {
     // 上限内の履歴を送ったのに 413 になる設定にしてはいけない。413 になると
     // 弾かれたメッセージが履歴に残り続けて窓からも抜けず、400 について
     // 塞いだのとまったく同じ「復帰できない」状態が再発する。
     //
-    // 見積もりは「日本語 1 文字 = UTF-8 で 3 バイト」ではなく、JSON 化したときの
-    // 最悪ケースで行う。JSON.stringify は制御文字（U+0000〜U+001F のうち
-    // 短縮エスケープを持たないもの）を 6 バイトのエスケープ表記へ展開するため、
-    // 3 バイト換算だと「上限内の履歴なのに 413」になる設定を見逃す
-    // （上限値を上げたときに黙って現実の問題になる）
-    const WORST_CASE_BYTES_PER_UNIT = 6;
-    const worstCaseBodyBytes =
-      MAX_MESSAGE_COUNT * MAX_CONTENT_LENGTH * WORST_CASE_BYTES_PER_UNIT;
-    // JSON の構造（キー・括弧）の分も乗るので、余裕を持って収まることを求める
-    expect(worstCaseBodyBytes).toBeLessThan(MAX_BODY_BYTES);
-  });
-
-  it("最悪ケースの見積もりが実際の JSON 化の結果を下回らない", () => {
-    // 見積もりの係数（1 符号単位あたり 6 バイト）が本当に最悪ケースかを、
-    // 実際に JSON 化して確かめる。係数を実測から切り離すと、上の検査は
-    // 「決めた数どうしの比較」になり、現実の肥大化を見張らなくなる
-    const WORST_CASE_BYTES_PER_UNIT = 6;
-    // 最も膨らむ文字（短縮エスケープを持たない制御文字）だけの本文を作る
-    const worstContent = "\u0001".repeat(100);
-    // 1 メッセージ分を JSON 化してバイト数を測る
-    const encodedLength = new TextEncoder().encode(
-      JSON.stringify(worstContent)
-    ).length;
-    // 前後の引用符 2 バイトを除いた本文の展開量が係数以内であることを確認する
-    expect(encodedLength - 2).toBeLessThanOrEqual(
-      worstContent.length * WORST_CASE_BYTES_PER_UNIT
+    // 見積もりの掛け算ではなく、**実際に送る形へ JSON 化して測る**。
+    // 掛け算だと (a) JSON の構造（キー・括弧・区切り）の分が抜け落ち、
+    // (b) 1 文字あたりのバイト数を決め打ちすることになる。どちらも
+    // 「上限内の履歴なのに 413」になる設定を通してしまう。
+    //
+    // 本文は最も膨らむ文字で埋める: JSON.stringify は短縮エスケープを持たない
+    // 制御文字を 6 バイトのエスケープ表記へ展開するため、日本語（3 バイト）より
+    // 悪い最悪ケースになる
+    const worstCaseContent = "\u0001".repeat(MAX_CONTENT_LENGTH);
+    // 上限いっぱいの件数の履歴を作る（先頭は user 発言）
+    const worstCaseHistory: Message[] = Array.from(
+      { length: MAX_MESSAGE_COUNT },
+      (_, index) => ({
+        role: index % 2 === 0 ? ("user" as const) : ("assistant" as const),
+        content: worstCaseContent,
+      })
     );
+    // 実際にサーバーへ送る形（messages ＋ category）へ組み立てて JSON 化する
+    const body = JSON.stringify({
+      messages: worstCaseHistory,
+      category: "procedures",
+    });
+    // UTF-8 のバイト数を測る（サーバーが数えるのもバイト数）
+    const bodyBytes = new TextEncoder().encode(body).length;
+    // 上限に収まることを確認する
+    expect(bodyBytes).toBeLessThan(MAX_BODY_BYTES);
   });
 
   it("履歴の最大件数は user/assistant の往復を保てる 2 件以上である", () => {

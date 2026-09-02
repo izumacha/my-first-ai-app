@@ -174,8 +174,11 @@ function upstreamRetryAfterSeconds(error: InstanceType<typeof Anthropic.APIError
   }
   // 数字だけであることが確かめられたので秒数へ変換する
   const seconds = Number(raw.trim());
-  // 桁が多すぎて有限の数値にならない値は信用せず、自前の待機時間へ倒す
-  if (!Number.isFinite(seconds)) {
+  // 桁が多すぎる値は信用せず、自前の待機時間へ倒す。
+  // 「有限かどうか」だけでは足りない: 1e21 以上の数値は String() が指数表記
+  // （"1e+25"）を返すため、数字だけを確かめて通したのに RFC 9110 の
+  // delay-seconds ではないヘッダを送り出すことになる（この関数が防ぎたい形そのもの）
+  if (!Number.isSafeInteger(seconds)) {
     return null;
   }
   // 最低でも 1 秒は待たせる。0 をそのまま伝えると「すぐ再試行してよい」の意味になり、
@@ -615,6 +618,14 @@ export async function POST(
     } catch {
       // JSON として不正なボディは 400（クライアント起因のエラー）を返す
       return jsonError(ERROR_MESSAGES.invalidJson, 400);
+    }
+
+    // JSON として正しくてもオブジェクトとは限らない（"null" / "1" / "[]" / 文字列も
+    // 正しい JSON）。null のまま次の行で body.messages を読むと TypeError になり、
+    // 入力の誤りが 500 と「想定外のエラー」のサーバログに化ける。
+    // 入力検証の誤りは 400 で返す契約なので、ここで形を確かめる
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+      return jsonError(ERROR_MESSAGES.messagesRequired, 400);
     }
 
     // メッセージ配列を検証する（件数・ロール・本文の型と長さまで確認する）
