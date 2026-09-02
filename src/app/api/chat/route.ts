@@ -18,6 +18,7 @@ import {
   CONTENT_TOO_LONG_MESSAGE,
   MAX_CONTENT_LENGTH,
   MAX_MESSAGE_COUNT,
+  TOO_MANY_MESSAGES_MESSAGE,
 } from "@/lib/chat-limits";
 // レート制限の判定ロジックと上限値（唯一の参照元は @/lib/rate-limit）
 import { createRateLimiter } from "@/lib/rate-limit";
@@ -82,6 +83,16 @@ const ERROR_MESSAGES = {
   invalidApiKey: "API キーが無効です。設定を確認してください。",
   /** 想定外のエラーで返す汎用文言 */
   internal: "サーバーエラーが発生しました。",
+  /** messages フィールドそのものが無い・配列でないときの文言 */
+  messagesRequired: "messages フィールドが必要です。",
+  /** メッセージが 1 件も入っていないときの文言 */
+  messagesEmpty: "メッセージを 1 件以上指定してください。",
+  /** 配列の要素がメッセージの形をしていないときの文言 */
+  messageShapeInvalid: "メッセージの形式が正しくありません。",
+  /** ロールが許可リストに無いときの文言 */
+  messageRoleInvalid: "メッセージのロールが正しくありません。",
+  /** 本文が文字列でない・空のときの文言 */
+  messageContentEmpty: "メッセージ本文を入力してください。",
 } as const;
 
 /** SSE のチャンクを組み立てる際に使い回すエンコーダ。
@@ -249,31 +260,31 @@ async function readBodyWithinLimit(
 function validateMessages(messages: unknown): string | null {
   // 配列でない場合は形式エラーとする
   if (!Array.isArray(messages)) {
-    return "messages フィールドが必要です。";
+    return ERROR_MESSAGES.messagesRequired;
   }
   // 空配列は Claude API 側でエラーになるため、ここで 400 として弾く
   if (messages.length === 0) {
-    return "メッセージを 1 件以上指定してください。";
+    return ERROR_MESSAGES.messagesEmpty;
   }
   // 件数上限を超える履歴は受け付けない（トークン浪費・リソース枯渇防止）
   if (messages.length > MAX_MESSAGE_COUNT) {
-    return `メッセージ数が上限（${MAX_MESSAGE_COUNT} 件）を超えています。`;
+    return TOO_MANY_MESSAGES_MESSAGE;
   }
   // 各メッセージの中身（ロール・本文）を検証する
   for (const message of messages) {
     // オブジェクトでない要素（null・文字列など）は形式エラーとする
     if (typeof message !== "object" || message === null) {
-      return "メッセージの形式が正しくありません。";
+      return ERROR_MESSAGES.messageShapeInvalid;
     }
     // 検証のためにロールと本文を取り出す（この時点では未検証の unknown として扱う）
     const { role, content } = message as { role?: unknown; content?: unknown };
     // ロールが許可リストに無い場合は弾く（"system" 等を Claude へ転送させない）
     if (!ALLOWED_ROLES.includes(role as Role)) {
-      return "メッセージのロールが正しくありません。";
+      return ERROR_MESSAGES.messageRoleInvalid;
     }
     // 本文が文字列でない・空文字列の場合は弾く
     if (typeof content !== "string" || content.trim() === "") {
-      return "メッセージ本文を入力してください。";
+      return ERROR_MESSAGES.messageContentEmpty;
     }
     // 本文が上限文字数を超える場合は弾く（巨大ボディの転送防止）
     if (content.length > MAX_CONTENT_LENGTH) {

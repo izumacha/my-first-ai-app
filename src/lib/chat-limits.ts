@@ -28,6 +28,11 @@ export const MAX_CONTENT_LENGTH = 4000;
  * これを使う。片方に書き写すと、上限値を変えたときに文言だけが古い値のまま残る。 */
 export const CONTENT_TOO_LONG_MESSAGE = `メッセージ本文が上限（${MAX_CONTENT_LENGTH} 文字）を超えています。`;
 
+/** 会話履歴の件数が上限を超えたときにユーザーへ見せる文言（§6 UI 文言は一元管理）。
+ * 上限値を本文へ埋め込む文言は、定数のすぐ隣に置かないと値だけ変えて文言が
+ * 古いまま残る。{@link CONTENT_TOO_LONG_MESSAGE} と同じ理由でここに置く。 */
+export const TOO_MANY_MESSAGES_MESSAGE = `メッセージ数が上限（${MAX_MESSAGE_COUNT} 件）を超えています。`;
+
 /** 上限を超えた assistant 発言を切り詰めたときに末尾へ付ける印。
  * 印なしで切ると、AI から見て「そこで終わった回答」と区別が付かず、
  * 続きを尋ねたときに省略された部分を踏まえない答えが返る。
@@ -120,7 +125,12 @@ function capAssistantContent(message: Message): Message {
   // 印を付けずに切ると、AI から見て「そこで終わった回答」と区別が付かない。
   // さらに、画面側が付けた「中断されました」の印は末尾にあるため、
   // 素朴に末尾から削ると真っ先に消えてしまい、印を付けた意味が無くなる
-  let end = MAX_CONTENT_LENGTH - OMITTED_ANSWER_SUFFIX.length;
+  // 0 を下回らないようにする。上限より印のほうが長い設定だと負の値になり、
+  // slice(0, 負数) は「末尾から数えた位置まで」を返すため、切り詰めたつもりが
+  // ほぼ全文を返して上限を超える（そのまま送ると復帰できない 400 になる）。
+  // そもそもそんな設定にしないことは FieldLengths 的な不変条件としてテストで固定
+  // しているが、計算そのものも反転しないようにしておく
+  let end = Math.max(0, MAX_CONTENT_LENGTH - OMITTED_ANSWER_SUFFIX.length);
   // 切り口がサロゲートペア（絵文字など 2 単位で 1 文字を表す並び）の途中なら 1 つ手前で切る。
   // 片割れだけ残すと文字として成立しない値を上流へ送ることになる
   if (isHighSurrogate(message.content.charCodeAt(end - 1))) {

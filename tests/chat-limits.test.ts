@@ -137,9 +137,8 @@ describe("本文が受付上限を超えるメッセージの扱い", () => {
     expect(trimmed[1].content).toMatch(/省略されました/);
   });
 
-  it("切り詰めても末尾の印は残る（印だけが真っ先に消えない）", () => {
-    // 画面側が付けた「中断されました」の印を含む、上限ちょうどを超える回答を用意する。
-    // 素朴に末尾から削ると、末尾にある印が最初に失われてしまう
+  it("中断済みの回答を切り詰めても、未完了であることを示す印は残る", () => {
+    // 画面側が付けた「中断されました」の印を含む、上限を超える回答を用意する
     const interrupted = `${"あ".repeat(MAX_CONTENT_LENGTH)}${TRUNCATED_ANSWER_SUFFIX}`;
     const history: Message[] = [
       { role: "user", content: "質問" },
@@ -149,8 +148,12 @@ describe("本文が受付上限を超えるメッセージの扱い", () => {
     const trimmed = trimHistoryForRequest(history);
     // 上限以内に収まっていることを確認する
     expect(trimmed[1].content.length).toBeLessThanOrEqual(MAX_CONTENT_LENGTH);
-    // 回答が完全でないことを示す印が何らかの形で残ることを確認する
-    expect(trimmed[1].content).toMatch(/省略されました|中断されました/);
+    // 末尾は必ず省略の印で終わる。
+    // 「中断されました」の印は本文の末尾にあるため切り詰めで失われるが、
+    // 代わりに省略の印が入るので「この回答は完全ではない」という情報は残る
+    // （どちらか一方でも残っていればよい、という緩い条件にすると、
+    //   印を一切付けない実装に劣化しても緑のまま通ってしまう）
+    expect(trimmed[1].content.endsWith(OMITTED_ANSWER_SUFFIX)).toBe(true);
   });
 
   it("上限を超える user 発言は切り詰めない（黙って質問を削らない）", () => {
@@ -209,6 +212,13 @@ describe("共有する入力上限", () => {
     // 履歴の切り詰めとサーバーの検証で共有するため、妥当な値であることを確認する
     expect(Number.isInteger(MAX_CONTENT_LENGTH)).toBe(true);
     expect(MAX_CONTENT_LENGTH).toBeGreaterThan(0);
+  });
+
+  it("本文の最大文字数は省略の印より長い", () => {
+    // 印のほうが長いと、切り詰めの計算（上限 − 印の長さ）が負になり、
+    // 切り詰めたつもりがほぼ全文を返して上限を超える。上限は定数なので
+    // 実行時ではなくここで固定しておけば、設定ミスは CI で必ず落ちる
+    expect(MAX_CONTENT_LENGTH).toBeGreaterThan(OMITTED_ANSWER_SUFFIX.length);
   });
 
   it("履歴の最大件数は user/assistant の往復を保てる 2 件以上である", () => {
