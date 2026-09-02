@@ -757,9 +757,9 @@ describe("POST /api/chat の上流エラーマッピング", () => {
   });
 
   it.each([
-    ["max_tokens", "長さの上限"],
-    ["model_context_window_exceeded", "文脈長の超過"],
-    ["refusal", "生成の拒否"],
+    "max_tokens",
+    "model_context_window_exceeded",
+    "refusal",
   ])("%s で打ち切られた回答を『完全な回答』として終わらせない", async (stopReason) => {
     // 上流が最後まで話し終えずに生成を止めた場合を模す。
     // 打ち切りの理由を列挙して弾く実装だと、列挙し忘れた理由が
@@ -791,7 +791,7 @@ describe("POST /api/chat の上流エラーマッピング", () => {
     expect(body).not.toContain(SSE_DONE_MARKER);
   });
 
-  it.each([["end_turn"], ["stop_sequence"]])(
+  it.each(["end_turn", "stop_sequence"])(
     "%s で終わった回答は完了として扱う",
     async (stopReason) => {
       // 最後まで話し終えた場合を模す

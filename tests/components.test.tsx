@@ -11,7 +11,11 @@ import ChatInput from "@/components/ChatInput";
 import CategoryChips from "@/components/CategoryChips";
 import ChatContainer from "@/components/ChatContainer";
 // 送信前の検証で使う上限と文言（定義元は @/lib/chat-limits）
-import { CONTENT_TOO_LONG_MESSAGE, MAX_CONTENT_LENGTH } from "@/lib/chat-limits";
+import {
+  CONTENT_EMPTY_MESSAGE,
+  CONTENT_TOO_LONG_MESSAGE,
+  MAX_CONTENT_LENGTH,
+} from "@/lib/chat-limits";
 
 describe("ChatMessage", () => {
   // ユーザーメッセージが正しく表示されることを確認する
@@ -70,9 +74,16 @@ describe("ChatInput", () => {
   });
 
   // 空文字では送信されないことを確認する
-  it("空文字では onSend が呼ばれないこと", () => {
+  it("空文字では onSend を呼ばず、理由を表示すること", () => {
     const mockOnSend = vi.fn();
-    render(<ChatInput onSend={mockOnSend} onClearError={vi.fn()} isLoading={false} />);
+    const mockClearError = vi.fn();
+    render(
+      <ChatInput
+        onSend={mockOnSend}
+        onClearError={mockClearError}
+        isLoading={false}
+      />
+    );
 
     // フォームをそのまま送信する（入力なし）
     const input = screen.getByPlaceholderText("メッセージを入力...");
@@ -80,6 +91,12 @@ describe("ChatInput", () => {
 
     // onSend が呼ばれていないことを確認する
     expect(mockOnSend).not.toHaveBeenCalled();
+    // 何も表示せずに黙って無視しないことを確認する。黙って戻ると、前回の送信の
+    // 通知（429 など）が残ったままになり、いま押した操作が無視されたことが
+    // ユーザーに伝わらない
+    expect(screen.getByRole("alert")).toHaveTextContent(CONTENT_EMPTY_MESSAGE);
+    // 前回の送信についての通知も消していることを確認する
+    expect(mockClearError).toHaveBeenCalled();
   });
 
   it("上限を超える本文は送信せず、理由を表示して入力も残すこと", () => {
