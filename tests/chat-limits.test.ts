@@ -114,6 +114,25 @@ describe("本文が受付上限を超えるメッセージの扱い", () => {
     for (const message of trimmed) {
       expect(message.content.length).toBeLessThanOrEqual(MAX_CONTENT_LENGTH);
     }
+    // 省略した事実が本文に残ることを確認する。印が無いと AI から見て
+    // 「そこで終わった回答」と区別が付かず、続きを尋ねても噛み合わない
+    expect(trimmed[1].content).toMatch(/省略されました/);
+  });
+
+  it("切り詰めても末尾の印は残る（印だけが真っ先に消えない）", () => {
+    // 画面側が付けた「中断されました」の印を含む、上限ちょうどを超える回答を用意する。
+    // 素朴に末尾から削ると、末尾にある印が最初に失われてしまう
+    const interrupted = `${"あ".repeat(MAX_CONTENT_LENGTH)}\n\n（回答はここで中断されました）`;
+    const history: Message[] = [
+      { role: "user", content: "質問" },
+      { role: "assistant", content: interrupted },
+    ];
+    // 切り詰めを適用する
+    const trimmed = trimHistoryForRequest(history);
+    // 上限以内に収まっていることを確認する
+    expect(trimmed[1].content.length).toBeLessThanOrEqual(MAX_CONTENT_LENGTH);
+    // 回答が完全でないことを示す印が何らかの形で残ることを確認する
+    expect(trimmed[1].content).toMatch(/省略されました|中断されました/);
   });
 
   it("上限を超える user 発言は切り詰めない（黙って質問を削らない）", () => {

@@ -23,6 +23,16 @@ export const MAX_MESSAGE_COUNT = 50;
  * 課金・メモリを浪費させられないようにする入力上限）。 */
 export const MAX_CONTENT_LENGTH = 4000;
 
+/** 本文が上限を超えたときにユーザーへ見せる文言（§6 UI 文言は一元管理）。
+ * サーバーの検証（`route.ts`）と、送信前に弾く入力欄（`ChatInput.tsx`）の両方が
+ * これを使う。片方に書き写すと、上限値を変えたときに文言だけが古い値のまま残る。 */
+export const CONTENT_TOO_LONG_MESSAGE = `メッセージ本文が上限（${MAX_CONTENT_LENGTH} 文字）を超えています。`;
+
+/** 上限を超えた assistant 発言を切り詰めたときに末尾へ付ける印。
+ * 印なしで切ると、AI から見て「そこで終わった回答」と区別が付かず、
+ * 続きを尋ねたときに省略された部分を踏まえない答えが返る。 */
+const OMITTED_ANSWER_SUFFIX = "\n\n（以前の回答はここで省略されました）";
+
 /**
  * 送信する会話履歴を上限件数まで切り詰める。
  *
@@ -90,16 +100,22 @@ function capAssistantContent(message: Message): Message {
     return message;
   }
 
-  // 上限の位置で切る
-  let end = MAX_CONTENT_LENGTH;
+  // 末尾に付ける印の分だけ手前で切る（印を含めて上限に収める）。
+  // 印を付けずに切ると、AI から見て「そこで終わった回答」と区別が付かない。
+  // さらに、画面側が付けた「中断されました」の印は末尾にあるため、
+  // 素朴に末尾から削ると真っ先に消えてしまい、印を付けた意味が無くなる
+  let end = MAX_CONTENT_LENGTH - OMITTED_ANSWER_SUFFIX.length;
   // 切り口がサロゲートペア（絵文字など 2 単位で 1 文字を表す並び）の途中なら 1 つ手前で切る。
   // 片割れだけ残すと文字として成立しない値を上流へ送ることになる
   if (isHighSurrogate(message.content.charCodeAt(end - 1))) {
     end -= 1;
   }
 
-  // ロールはそのままに、本文だけを切り詰めた新しいメッセージを返す
-  return { role: message.role, content: message.content.slice(0, end) };
+  // ロールはそのままに、切り詰めた本文＋省略の印を持つ新しいメッセージを返す
+  return {
+    role: message.role,
+    content: `${message.content.slice(0, end)}${OMITTED_ANSWER_SUFFIX}`,
+  };
 }
 
 /**

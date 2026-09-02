@@ -14,7 +14,11 @@ import {
 import { getSystemPrompt, getMaxTokens, isCategoryId } from "@/lib/prompts";
 import { formatSseFrame, SSE_DONE_MARKER } from "@/lib/sse";
 // 入力上限はクライアントと共有する（唯一の参照元は @/lib/chat-limits）
-import { MAX_CONTENT_LENGTH, MAX_MESSAGE_COUNT } from "@/lib/chat-limits";
+import {
+  CONTENT_TOO_LONG_MESSAGE,
+  MAX_CONTENT_LENGTH,
+  MAX_MESSAGE_COUNT,
+} from "@/lib/chat-limits";
 // レート制限の判定ロジックと上限値（唯一の参照元は @/lib/rate-limit）
 import { createRateLimiter } from "@/lib/rate-limit";
 import type { ChatErrorResponse, Message, Role } from "@/lib/types";
@@ -272,7 +276,7 @@ function validateMessages(messages: unknown): string | null {
     }
     // 本文が上限文字数を超える場合は弾く（巨大ボディの転送防止）
     if (content.length > MAX_CONTENT_LENGTH) {
-      return `メッセージ本文が上限（${MAX_CONTENT_LENGTH} 文字）を超えています。`;
+      return CONTENT_TOO_LONG_MESSAGE;
     }
   }
   // すべての検証を通過したら問題なし（null）を返す

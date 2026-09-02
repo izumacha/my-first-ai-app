@@ -10,6 +10,8 @@ import ChatMessage from "@/components/ChatMessage";
 import ChatInput from "@/components/ChatInput";
 import CategoryChips from "@/components/CategoryChips";
 import ChatContainer from "@/components/ChatContainer";
+// 送信前の検証で使う上限と文言（定義元は @/lib/chat-limits）
+import { CONTENT_TOO_LONG_MESSAGE, MAX_CONTENT_LENGTH } from "@/lib/chat-limits";
 
 describe("ChatMessage", () => {
   // ユーザーメッセージが正しく表示されることを確認する
@@ -78,6 +80,47 @@ describe("ChatInput", () => {
 
     // onSend が呼ばれていないことを確認する
     expect(mockOnSend).not.toHaveBeenCalled();
+  });
+
+  it("上限を超える本文は送信せず、理由を表示して入力も残すこと", () => {
+    // モック関数を作成する
+    const mockOnSend = vi.fn();
+    render(<ChatInput onSend={mockOnSend} isLoading={false} />);
+
+    // 上限を超える長文を入力する
+    const tooLong = "あ".repeat(MAX_CONTENT_LENGTH + 1);
+    const input = screen.getByPlaceholderText("メッセージを入力...");
+    fireEvent.change(input, { target: { value: tooLong } });
+    // フォームを送信する
+    fireEvent.submit(input.closest("form")!);
+
+    // 送信していないことを確認する。送るとサーバーは 400 を返す一方で会話履歴には
+    // 残るため、以降のすべての送信が同じ 400 になり会話を続けられなくなる
+    expect(mockOnSend).not.toHaveBeenCalled();
+    // なぜ送られなかったのかが画面に出ることを確認する（§7 状態はテキストで伝える）
+    expect(screen.getByRole("alert")).toHaveTextContent(CONTENT_TOO_LONG_MESSAGE);
+    // 入力した文章が消えていないことを確認する（消すと長文を貼った人が文章ごと失う）
+    expect(input).toHaveValue(tooLong);
+  });
+
+  it("上限を超えた後に短く直せば送信できること", () => {
+    // モック関数を作成する
+    const mockOnSend = vi.fn();
+    render(<ChatInput onSend={mockOnSend} isLoading={false} />);
+
+    // まず上限を超える長文で弾かれる状態を作る
+    const input = screen.getByPlaceholderText("メッセージを入力...");
+    fireEvent.change(input, { target: { value: "あ".repeat(MAX_CONTENT_LENGTH + 1) } });
+    fireEvent.submit(input.closest("form")!);
+
+    // 短い文章に直して送信する
+    fireEvent.change(input, { target: { value: "短い質問" } });
+    fireEvent.submit(input.closest("form")!);
+
+    // 送信できることを確認する
+    expect(mockOnSend).toHaveBeenCalledWith("短い質問");
+    // 直したら理由の表示も消えることを確認する（古い警告が残り続けない）
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 });
 
