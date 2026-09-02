@@ -8,8 +8,11 @@ import { NextRequest } from "next/server";
 // 上流エラーマッピングの試験で SDK の型付きエラーを生成するために読み込む
 import Anthropic from "@anthropic-ai/sdk";
 
-// ストリームのモックを生成する（テキストデルタを 1 件流して終了する非同期イテレータ）。
-// 実 SDK の Stream と同じく、中断用の AbortController 互換オブジェクト（controller）を持つ
+// ストリームのモックを生成する（テキストデルタを 1 件流して正常終了する非同期イテレータ）。
+// 実 SDK の Stream と同じく、中断用の AbortController 互換オブジェクト（controller）を持つ。
+// 最後に message_delta で終了理由を伝えるのは実際の上流と同じ挙動に合わせるため
+// （実ストリームは必ず終了理由を伝えて終わる）。これを省いたモックは
+// 「本文が途中で途切れたストリーム」を模していることになり、正常系の試験にならない
 function makeMockStream() {
   return {
     // クライアント切断時に route が呼ぶ中断用コントローラ（呼び出しを記録する）
@@ -20,6 +23,11 @@ function makeMockStream() {
       yield {
         type: "content_block_delta",
         delta: { type: "text_delta", text: "こんにちは" },
+      };
+      // 最後まで話し終えたことを伝えるイベントを返す
+      yield {
+        type: "message_delta",
+        delta: { stop_reason: "end_turn", stop_sequence: null },
       };
     },
   };
@@ -747,24 +755,24 @@ describe("POST /api/chat の上流エラーマッピング", () => {
     }
   );
 
-  it("旧仕様の max_tokens 打ち切りも従来どおり未完了として扱う", async () => {
-    // 上流が長さの上限で生成を止めた場合を模す（このアプリでいちばん起きやすい打ち切り理由）
+  it("終了理由が 1 度も届かないまま終わった配信を『完全な回答』として終わらせない", async () => {
+    // 上流の応答本文が message_delta を出す前に途切れた場合を模す。
+    // SDK は本文の途切れを例外にせず反復を終えるため、route からは
+    // 「終了理由なしの正常終了」として見える。ここを完了扱いにすると、
+    // 既知の打ち切り理由（max_tokens 等）は未完了として扱うのに、
+    // 理由すら届かなかったいちばん怪しい配信だけが完了に化ける
     createMock.mockImplementationOnce(() =>
       Promise.resolve({
         // 中断用コントローラ（この試験では使われない）
         controller: { abort: vi.fn() },
-        // デルタを 1 件流したあと、長さ上限で終わったことを伝えて正常終了する
+        // デルタを 1 件流したところで終了理由を伝えないまま反復を終える
         async *[Symbol.asyncIterator]() {
           // 途中までのデルタを返す
           yield {
             type: "content_block_delta",
             delta: { type: "text_delta", text: "途中まで" },
           };
-          // 生成が長さの上限で止まったことを伝えるイベントを返す
-          yield {
-            type: "message_delta",
-            delta: { stop_reason: "max_tokens", stop_sequence: null },
-          };
+          // message_delta を送らずにストリームが終わる（本文の途切れ）
         },
       })
     );

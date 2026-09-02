@@ -37,6 +37,11 @@ export const MAX_BODY_BYTES = 1_000_000;
  * これを使う。片方に書き写すと、上限値を変えたときに文言だけが古い値のまま残る。 */
 export const CONTENT_TOO_LONG_MESSAGE = `メッセージ本文が上限（${MAX_CONTENT_LENGTH} 文字）を超えています。`;
 
+/** 本文が空（空白だけを含む）のときにユーザーへ見せる文言（§6 UI 文言は一元管理）。
+ * サーバーの検証（`route.ts` の `ERROR_MESSAGES.messageContentEmpty`）と、
+ * 送信前に弾く画面側（`page.tsx`）の両方がこれを使う。 */
+export const CONTENT_EMPTY_MESSAGE = "メッセージ本文を入力してください。";
+
 /** 会話履歴の件数が上限を超えたときにユーザーへ見せる文言（§6 UI 文言は一元管理）。
  * 上限値を本文へ埋め込む文言は、定数のすぐ隣に置かないと値だけ変えて文言が
  * 古いまま残る。{@link CONTENT_TOO_LONG_MESSAGE} と同じ理由でここに置く。 */
@@ -67,7 +72,8 @@ export const TRUNCATED_ANSWER_SUFFIX = "\n\n（この回答はここで途切れ
 /**
  * 送信しようとしている本文に問題があれば、その理由を返す。
  *
- * <p>上限の規則をここに 1 つだけ置き、**表示する側（入力欄）と送る側（画面）の
+ * <p>送ってよい本文かの規則（空でないこと・上限以内であること）をここに 1 つだけ置き、
+ * **表示する側（入力欄）と送る側（画面）の
  * 両方がこれを呼ぶ**。判定を書き写すと、片方だけ直したときに「入力欄は通すのに
  * サーバーが弾く」ずれが生まれる。両者は役割が違うので、どちらも必要:
  * 入力欄は「入力を消さずに理由を見せる」ための表示、送る側は「上限を超えた本文を
@@ -78,6 +84,15 @@ export const TRUNCATED_ANSWER_SUFFIX = "\n\n（この回答はここで途切れ
  * @returns 問題があれば表示する理由、問題なければ null
  */
 export function findContentProblem(content: string): string | null {
+  // 空白だけの本文はそもそも送れない（サーバーも同じ理由で 400 を返す）。
+  // 判定を長さ側だけにしておくと、空白だけの発言が履歴に積まれたときに
+  // trimHistoryForRequest がそれを取り除き、窓に user 発言が残らない場合の
+  // 予備経路として「1 つ前の質問」を送ってしまう。ユーザーから見ると
+  // 空の送信に対して前の質問への回答が返る（何が起きたか分からない）ので、
+  // 送る前にここで止める
+  if (content.trim() === "") {
+    return CONTENT_EMPTY_MESSAGE;
+  }
   // 上限を超えていれば、その理由を返す
   if (content.length > MAX_CONTENT_LENGTH) {
     return CONTENT_TOO_LONG_MESSAGE;

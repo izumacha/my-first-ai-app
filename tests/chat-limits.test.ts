@@ -6,6 +6,9 @@
  */
 import { describe, it, expect } from "vitest";
 import {
+  CONTENT_EMPTY_MESSAGE,
+  CONTENT_TOO_LONG_MESSAGE,
+  findContentProblem,
   MAX_BODY_BYTES,
   MAX_CONTENT_LENGTH,
   MAX_MESSAGE_COUNT,
@@ -230,6 +233,28 @@ describe("本文が受付上限を超えるメッセージの扱い", () => {
     // 残っていると文字として成立しない値を上流へ送ることになる
     const lastCode = body.charCodeAt(body.length - 1);
     expect(lastCode >= 0xd800 && lastCode <= 0xdbff).toBe(false);
+  });
+});
+
+describe("findContentProblem", () => {
+  it("空白だけの本文を理由付きで弾く", () => {
+    // 空白だけの発言は trimHistoryForRequest に取り除かれるため、そのまま送ると
+    // 「窓に user 発言が残らない」予備経路に落ち、1 つ前の質問が送り直される。
+    // ユーザーから見ると空の送信に前の質問への回答が返ることになるので、送る前に止める
+    expect(findContentProblem("   \n\t ")).toBe(CONTENT_EMPTY_MESSAGE);
+  });
+
+  it("上限を超える本文を理由付きで弾く", () => {
+    // 上限ちょうど＋1 文字の本文を作る
+    const tooLong = "あ".repeat(MAX_CONTENT_LENGTH + 1);
+    // 長さの理由が返ることを確認する
+    expect(findContentProblem(tooLong)).toBe(CONTENT_TOO_LONG_MESSAGE);
+  });
+
+  it("上限ちょうどの本文は通す", () => {
+    // 境界（上限ちょうど）は弾かない。弾くとサーバーが受け付ける本文を
+    // 画面側だけが拒否する食い違いになる
+    expect(findContentProblem("あ".repeat(MAX_CONTENT_LENGTH))).toBeNull();
   });
 });
 

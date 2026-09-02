@@ -29,6 +29,13 @@ function makeMockStream() {
       for (const text of UPSTREAM_DELTAS) {
         yield { type: "content_block_delta", delta: { type: "text_delta", text } };
       }
+      // 最後まで話し終えたことを伝えるイベントを返す（実ストリームは必ず終了理由を
+      // 伝えて終わる。省くと「本文が途中で途切れたストリーム」を模すことになり、
+      // サーバーは完了の番兵を送らない＝正常系の契約テストにならない）
+      yield {
+        type: "message_delta",
+        delta: { stop_reason: "end_turn", stop_sequence: null },
+      };
     },
   };
 }

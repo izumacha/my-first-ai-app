@@ -273,6 +273,10 @@ describe("チャット画面のストリーミング処理", () => {
       vi.fn().mockResolvedValue(new Response(brokenStream, { status: 200 }))
     );
 
+    // 例外そのものがコンソールへ残ることも確かめる（握り潰すと、画面には
+    // 「通信エラー」としか出ないまま原因を追う手がかりが消える）
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
     // チャット画面を描画する
     render(<Home />);
     // メッセージを送信する
@@ -292,8 +296,12 @@ describe("チャット画面のストリーミング処理", () => {
     await waitFor(() => {
       expect(screen.getByRole("alert")).toHaveTextContent("通信エラー");
     });
+    // 捨てずにコンソールへ残していることを確認する
+    expect(errorSpy).toHaveBeenCalled();
     // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
     await waitForIdle();
+    // スパイを元に戻して他のテストへ影響させない
+    errorSpy.mockRestore();
   });
 
   it("CRLF で区切られたストリームでも完全な回答として扱うこと", async () => {

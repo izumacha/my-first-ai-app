@@ -237,9 +237,14 @@ export default function Home() {
           // ストリーミング表示を必ずクリアする（エラー時の吹き出し残留を防ぐ）
           setStreamingText("");
         }
-      } catch {
+      } catch (requestError) {
         // ネットワークエラーなどの場合にメッセージを表示する
         setError(MESSAGES.networkError);
+        // 例外そのものは握り潰さずブラウザのコンソールへ残す（§6）。
+        // ここへ来るのは通信の失敗（オフライン等）だけとは限らず、try の中の
+        // 不具合もすべて同じ「通信エラー」の文言に化ける。中身を捨てると、
+        // 画面には通信の問題としか出ないまま原因を追う手がかりが消える
+        console.error("チャットのリクエストに失敗しました:", requestError);
       } finally {
         // ローディング状態を終了する
         setIsLoading(false);

@@ -15,6 +15,7 @@ import { getSystemPrompt, getMaxTokens, isCategoryId } from "@/lib/prompts";
 import { formatSseFrame, SSE_DONE_MARKER } from "@/lib/sse";
 // 入力上限はクライアントと共有する（唯一の参照元は @/lib/chat-limits）
 import {
+  CONTENT_EMPTY_MESSAGE,
   CONTENT_TOO_LONG_MESSAGE,
   MAX_BODY_BYTES,
   MAX_CONTENT_LENGTH,
@@ -44,8 +45,14 @@ const RETRY_AFTER_SECONDS = String(rateLimiter.retryAfterSeconds);
 /** 「回答を最後まで話し終えた」ことを表す終了理由。これ以外はすべて途中終了として扱う。
  * 列挙するのを「完了の理由」側にしているのが要点で、打ち切りの理由（max_tokens /
  * model_context_window_exceeded / refusal 等）を列挙する向きにすると、
- * 上流に新しい打ち切り理由が増えたときに黙って「完全な回答」に化ける。 */
-const COMPLETE_STOP_REASONS: readonly string[] = ["end_turn", "stop_sequence"];
+ * 上流に新しい打ち切り理由が増えたときに黙って「完全な回答」に化ける。
+ * 型を `string[]` ではなく SDK の `StopReason` にしているのは、綴り違い
+ * （"end-turn" 等）を型チェックで落とすため。素の文字列だとどの理由とも
+ * 一致しなくなり、**すべての回答が「途切れています」の印付きで確定する**。 */
+const COMPLETE_STOP_REASONS: readonly Anthropic.StopReason[] = [
+  "end_turn",
+  "stop_sequence",
+];
 
 /** メッセージのロールとして受け付ける値の一覧（未知のロールを Claude へ転送しない） */
 const ALLOWED_ROLES: readonly Role[] = ["user", "assistant"];
@@ -92,8 +99,9 @@ const ERROR_MESSAGES = {
   messageShapeInvalid: "メッセージの形式が正しくありません。",
   /** ロールが許可リストに無いときの文言 */
   messageRoleInvalid: "メッセージのロールが正しくありません。",
-  /** 本文が文字列でない・空のときの文言 */
-  messageContentEmpty: "メッセージ本文を入力してください。",
+  /** 本文が文字列でない・空のときの文言（画面側の送信前検証と共有する。
+   * 書き写すと、片方だけ直したときに同じ拒否理由が 2 つの文言で現れる） */
+  messageContentEmpty: CONTENT_EMPTY_MESSAGE,
 } as const;
 
 /** SSE のチャンクを組み立てる際に使い回すエンコーダ。
@@ -359,7 +367,7 @@ function createSseStream(
       // 完了とみなす」向きで判定する。SDK の StopReason には max_tokens 以外にも
       // model_context_window_exceeded や refusal といった途中終了があり、
       // 列挙側で持つと新しい理由が増えるたびに黙って「完全な回答」に化ける
-      let finalStopReason: string | null = null;
+      let finalStopReason: Anthropic.StopReason | null = null;
       try {
         // テキストデルタイベントを順次読み出す
         for await (const event of stream) {
@@ -410,8 +418,16 @@ function createSseStream(
         // 受信側は [DONE] を受け取れなかった読み取りを「途中で切れた回答」として
         // 扱い、印を付けて履歴に残す。通信としては正常なのでエラーにはしない
         // （エラーにすると、実際には届いている回答に通信障害の警告が出てしまう）。
-        // 終了理由が届かないストリーム（古い上流・テストのモック）は完了扱いにする
-        if (finalStopReason !== null && !COMPLETE_STOP_REASONS.includes(finalStopReason)) {
+        //
+        // 終了理由が 1 度も届かなかった場合（null）も完了ではない。上流の応答本文が
+        // message_delta を出す前に途切れると、SDK は途切れを例外にせず反復を終える
+        // ため、ここには「理由なしの正常終了」として現れる。null を完了側へ倒すと、
+        // その途切れた回答だけが唯一「完全な回答」として確定してしまい、既知の
+        // 打ち切り理由に対する扱い（完了の理由だけを完了とみなす）と正反対になる
+        if (
+          finalStopReason === null ||
+          !COMPLETE_STOP_REASONS.includes(finalStopReason)
+        ) {
           controller.close();
           return;
         }
