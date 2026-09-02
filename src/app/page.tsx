@@ -16,15 +16,29 @@ import {
 } from "@/lib/chat-limits";
 import type { Message, CategoryId } from "@/lib/types";
 
+/** 画面に表示する文言（§6 UI 文言は一元管理）。
+ *
+ * <p>ここに置くのは**表示専用**の文言だけ。サーバーと値や文言を共有するもの
+ * （入力上限の超過・履歴に付ける印）は `@/lib/chat-limits` にあり、
+ * サーバーが返す文言は `route.ts` の `ERROR_MESSAGES` にある。
+ * 「誰と共有するか」で置き場所を分け、同じ種類の文言が散らばらないようにする。 */
+const MESSAGES = {
+  /** サーバーが JSON でないエラー応答を返したときの汎用文言 */
+  genericError: "エラーが発生しました。もう一度お試しください。",
+  /** レスポンスボディの読み取り口が得られなかったときの文言 */
+  streamStartFailed: "ストリーミングの開始に失敗しました。",
+  /** 通信そのものが失敗したときの文言 */
+  networkError: "通信エラーが発生しました。接続を確認してください。",
+  /** 回答を 1 文字も受け取れなかったときの文言。
+   * 上流が本文を返さずに正常終了する（長さ上限に本文なしで達した等）ことは起こりうる。 */
+  emptyAnswer: "回答を受け取れませんでした。もう一度お試しください。",
+} as const;
+
 /**
  * チャット画面のメインページコンポーネント
  * ユーザーの入力を受け取り、API にストリーミングリクエストを送信し、
  * AI の回答をリアルタイムに表示する。
  */
-/** 回答が 1 文字も受け取れなかったときに表示する文言（§6 UI 文言は一元管理）。
- * 上流が本文を返さずに正常終了する（長さ上限に本文なしで達した等）ことは起こりうる。 */
-const EMPTY_ANSWER_MESSAGE = "回答を受け取れませんでした。もう一度お試しください。";
-
 export default function Home() {
   // 会話履歴を管理する state
   const [messages, setMessages] = useState<Message[]>([]);
@@ -82,7 +96,7 @@ export default function Home() {
           setError(
             typeof errorData?.error === "string"
               ? errorData.error
-              : "エラーが発生しました。もう一度お試しください。"
+              : MESSAGES.genericError
           );
           // 早期リターンする（ローディング解除は finally が行う）
           return;
@@ -93,7 +107,7 @@ export default function Home() {
 
         // リーダーが取得できない場合はエラー
         if (!reader) {
-          setError("ストリーミングの開始に失敗しました。");
+          setError(MESSAGES.streamStartFailed);
           // 早期リターンする（ローディング解除は finally が行う）
           return;
         }
@@ -123,8 +137,11 @@ export default function Home() {
             // バイナリデータを文字列にデコードし、持ち越し分と連結する
             lineBuffer += decoder.decode(value, { stream: true });
 
-            // SSE 形式の行を分割する（最後の要素は「行の途中」の可能性がある）
-            const lines = lineBuffer.split("\n");
+            // SSE 形式の行を分割する（最後の要素は「行の途中」の可能性がある）。
+            // 区切りは LF だけでなく CRLF・CR も認められているので 3 通りを見る。
+            // LF だけで割ると、CR だけで区切るストリームでは 1 行も切り出せず、
+            // 応答全体がバッファに溜まったまま捨てられる（回答が丸ごと消える）
+            const lines = lineBuffer.split(/\r\n|\r|\n/);
             // 最後の要素は未完の行として次のチャンクへ持ち越す（完結行だけを処理する）
             lineBuffer = lines.pop() ?? "";
 
@@ -145,7 +162,13 @@ export default function Home() {
 
               try {
                 // JSON をパースしてテキスト差分を取得する
-                const parsed = JSON.parse(data) as { text: string };
+                const parsed = JSON.parse(data) as { text?: unknown };
+                // 期待した形（text が文字列）でなければ差分として使えない。
+                // 型を確かめずに足すと "undefined" や数値が本文へ紛れ込み、
+                // しかも解析は成功しているので「完全な回答」として確定してしまう
+                if (typeof parsed.text !== "string") {
+                  throw new TypeError("差分の形式が想定と異なります");
+                }
                 // 蓄積テキストに差分を追加する
                 accumulated += parsed.text;
                 // ストリーミング表示を更新する
@@ -192,19 +215,18 @@ export default function Home() {
                     : `${accumulated}${TRUNCATED_ANSWER_SUFFIX}`,
               },
             ]);
-          }
-          else {
+          } else {
             // 1 文字も受け取れなかった場合は、黙って何も起きなかったように
             // 終わらせない。ローディングだけ止まって画面に何も出ないと、
             // ユーザーは失敗に気づかず再送して上流の呼び出しを重ねる
-            setError(EMPTY_ANSWER_MESSAGE);
+            setError(MESSAGES.emptyAnswer);
           }
           // ストリーミング表示を必ずクリアする（エラー時の吹き出し残留を防ぐ）
           setStreamingText("");
         }
       } catch {
         // ネットワークエラーなどの場合にメッセージを表示する
-        setError("通信エラーが発生しました。接続を確認してください。");
+        setError(MESSAGES.networkError);
       } finally {
         // ローディング状態を終了する
         setIsLoading(false);

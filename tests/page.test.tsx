@@ -358,6 +358,67 @@ describe("チャット画面のストリーミング処理", () => {
     await waitForIdle();
   });
 
+  it("形は正しいが中身が想定外の差分も『欠け』として扱うこと", async () => {
+    // JSON としては解析できるが text が文字列でない差分を混ぜる。
+    // 型を確かめずに足すと "undefined" が本文へ紛れ込み、しかも解析は
+    // 成功しているので完全な回答として確定してしまう
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          makeStream([
+            'data: {"text":"前半"}\n\ndata: {"txt":"あ"}\n\ndata: [DONE]\n\n',
+          ]),
+          { status: 200 }
+        )
+      )
+    );
+
+    // チャット画面を描画する
+    render(<Home />);
+    // メッセージを送信する
+    sendMessage("テスト質問");
+
+    // 欠けがあるので中断の印が付くことを確認する
+    await waitFor(() => {
+      expect(screen.getByText(/中断されました/)).toBeInTheDocument();
+    });
+    // "undefined" が本文へ紛れ込んでいないことを確認する
+    expect(screen.queryByText(/undefined/)).not.toBeInTheDocument();
+    // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
+    await waitForIdle();
+  });
+
+  it("CR だけで区切られたストリームでも回答を組み立てること", async () => {
+    // 行区切りが CR だけの場合を模す。LF だけで割る実装だと 1 行も切り出せず、
+    // 応答全体がバッファに溜まったまま捨てられて回答が丸ごと消える
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValue(
+          new Response(
+            makeStream(['data: {"text":"CR 区切りの回答"}\r\rdata: [DONE]\r\r']),
+            { status: 200 }
+          )
+        )
+    );
+
+    // チャット画面を描画する
+    render(<Home />);
+    // メッセージを送信する
+    sendMessage("テスト質問");
+
+    // 回答が組み立てられることを確認する
+    await waitFor(() => {
+      expect(screen.getByText("CR 区切りの回答")).toBeInTheDocument();
+    });
+    // 完了も検出できているので中断の印は付かない
+    expect(screen.queryByText(/中断されました/)).not.toBeInTheDocument();
+    // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
+    await waitForIdle();
+  });
+
   it("回答を 1 文字も受け取れなかったときは理由を表示すること", async () => {
     // 上流が本文を返さずに正常終了した場合を模す（長さ上限に本文なしで達した等）
     vi.stubGlobal(
@@ -421,10 +482,8 @@ describe("チャット画面のストリーミング処理", () => {
     // チャット画面を描画する
     render(<Home />);
     // 上限を超える長文を送信する。
-    // 実際には入力欄側の検証で先に止まるが、ここで確かめたいのは層ではなく
-    // 「画面から長すぎる本文を送っても、リクエストも履歴も汚れない」という結果。
-    // page.tsx 側の同じ検証は、入力欄を経由しない送信経路が増えたときの
-    // 備え（履歴を守る最後の砦）で、画面操作からは到達できない
+    // 止めているのは入力欄側の検証だが、ここで確かめたいのは層ではなく
+    // 「画面から長すぎる本文を送っても、リクエストも履歴も汚れない」という結果
     sendMessage("あ".repeat(MAX_CONTENT_LENGTH + 1));
 
     // 送信していないことを確認する（サーバーの 400 を待たずに止める）
