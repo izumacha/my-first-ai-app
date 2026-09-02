@@ -161,8 +161,20 @@ export function trimHistoryForRequest(
   // その状態を作ってしまう。呼び出し側が末尾に user 発言を積む限り起きないが、
   // 前提をコメントで書くだけにせず、実装側で成り立たせる
   if (windowed.length === 0) {
-    // 末尾から最初に見つかる user 発言を探す
-    const lastUserMessage = meaningful.findLast((m) => m.role === "user");
+    // 末尾から最初に見つかる user 発言を探す。
+    // Array#findLast は ES2023 で、このモジュールはブラウザへも配られる一方
+    // tsconfig の target は ES2017（＝ TypeScript は補完コードを入れない）。
+    // 古い実行環境では TypeError になり、しかも呼び出し元の catch が
+    // 「通信エラー」として飲み込むため、実装の不具合が接続の問題に見える。
+    // 後ろから探す単純なループなら、その前提を持ち込まずに済む
+    let lastUserMessage: Message | undefined;
+    for (let index = meaningful.length - 1; index >= 0; index -= 1) {
+      // user 発言が見つかったらそれを採用して探索を終える
+      if (meaningful[index].role === "user") {
+        lastUserMessage = meaningful[index];
+        break;
+      }
+    }
     // 見つからなければ送れるものが無いので空のまま返す（サーバーが弾く）。
     // 見つかった 1 件は必ず窓の外にある過去の発言（いま打った質問なら窓の末尾に
     // 残っているのでこの分岐には来ない）なので、本文は下と同じく上限に収める。

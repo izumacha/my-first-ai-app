@@ -104,6 +104,8 @@ const ERROR_MESSAGES = {
   messageContentEmpty: CONTENT_EMPTY_MESSAGE,
   /** 会話履歴が user 発言で始まっていないときの文言 */
   messagesMustStartWithUser: "会話履歴は user の発言から始めてください。",
+  /** 会話履歴が user 発言で終わっていないときの文言 */
+  messagesMustEndWithUser: "会話履歴は user の発言で終えてください。",
 } as const;
 
 /** SSE のチャンクを組み立てる際に使い回すエンコーダ。
@@ -355,6 +357,15 @@ function validateMessages(messages: unknown): string | null {
   // 検証はこの層（入力は信用しない境界）に置く
   if ((messages[0] as Message).role !== "user") {
     return ERROR_MESSAGES.messagesMustStartWithUser;
+  }
+  // 末尾も user 発言でなければ弾く。assistant 発言で終わる履歴を送ると、上流は
+  // 「その続きを書く」ため、送り主が置いた assistant の書き出しをモデルが
+  // そのまま引き継いでしまう（カテゴリ別のシステムプロンプトによる制約より、
+  // 送り主が書いた文章のほうが強く効く形になる）。認証の無い従量課金の
+  // エンドポイントなので、この形は受け付けない。画面側は必ず末尾に今回の
+  // ユーザー入力を積むので、正規の利用では起こらない
+  if ((messages[messages.length - 1] as Message).role !== "user") {
+    return ERROR_MESSAGES.messagesMustEndWithUser;
   }
   // すべての検証を通過したら問題なし（null）を返す
   return null;
