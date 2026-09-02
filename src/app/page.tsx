@@ -33,6 +33,13 @@ const MESSAGES = {
   /** 回答を 1 文字も受け取れなかったときの文言。
    * 上流が本文を返さずに正常終了する（長さ上限に本文なしで達した等）ことは起こりうる。 */
   emptyAnswer: "回答を受け取れませんでした。もう一度お試しください。",
+  /** 途中まで届いた回答が最後まで届かなかったときの文言。
+   * サーバーは「完了前に終わった」ことを error として伝えるが、その原因は
+   * 通信障害とは限らない（プラットフォームの実行時間上限で打ち切られる等）。
+   * ここで networkError（「接続を確認してください」）を出すと、接続に問題が
+   * 無いのに無関係な確認を促すことになる（`TRUNCATED_ANSWER_SUFFIX` が
+   * 「中断」という語を避けているのと同じ理由）。 */
+  answerInterrupted: "回答を最後まで受け取れませんでした。もう一度お試しください。",
 } as const;
 
 /**
@@ -87,6 +94,11 @@ export default function Home() {
       // 会話履歴にユーザーメッセージを追加する
       const updatedMessages = [...messages, userMessage];
       setMessages(updatedMessages);
+
+      // 途中まで届いた回答を「途切れています」の印付きで画面に残したかどうか。
+      // 外側の catch が「通信エラー」と断定してよいかの判断に使う（印を出せて
+      // いるなら、原因は通信とは限らないので別の文言にする）
+      let showedPartialAnswer = false;
 
       // ローディング状態を開始する
       setIsLoading(true);
@@ -236,6 +248,8 @@ export default function Home() {
           // 空白だけの回答は残さない。残すとサーバーの検証（本文が空）で以降の
           // 送信がすべて 400 になり、往復が成立しないので窓からも抜けない
           if (accumulated.trim()) {
+            // 途切れた回答をそのことが分かる形で残せたかを覚えておく
+            showedPartialAnswer = !(sawDone && !droppedFrame);
             setMessages((prev) => [
               ...prev,
               {
@@ -257,13 +271,24 @@ export default function Home() {
           setStreamingText("");
         }
       } catch (requestError) {
-        // ネットワークエラーなどの場合にメッセージを表示する
-        setError(MESSAGES.networkError);
+        // 途中まで届いた回答を印付きで残せている場合、サーバーが「完了前に終わった」
+        // ことを error で伝えてきただけかもしれない（プラットフォームの実行時間
+        // 上限などで、接続そのものは正常）。ここで「接続を確認してください」と
+        // 出すと、問題の無い接続を疑わせることになるので文言を分ける
+        setError(
+          showedPartialAnswer ? MESSAGES.answerInterrupted : MESSAGES.networkError
+        );
         // 例外そのものは握り潰さずブラウザのコンソールへ残す（§6）。
         // ここへ来るのは通信の失敗（オフライン等）だけとは限らず、try の中の
-        // 不具合もすべて同じ「通信エラー」の文言に化ける。中身を捨てると、
-        // 画面には通信の問題としか出ないまま原因を追う手がかりが消える
-        console.error("チャットのリクエストに失敗しました:", requestError);
+        // 不具合もすべて同じ文言に化ける。中身を捨てると、画面に出る文言だけが
+        // 残って原因を追う手がかりが消える。
+        // ただし、途切れた回答を印付きで残せているケースは長い回答で日常的に
+        // 起こりうるので、障害として積み上げず debug に落とす
+        if (showedPartialAnswer) {
+          console.debug("配信が完了前に終わりました:", requestError);
+        } else {
+          console.error("チャットのリクエストに失敗しました:", requestError);
+        }
       } finally {
         // ローディング状態を終了する
         setIsLoading(false);

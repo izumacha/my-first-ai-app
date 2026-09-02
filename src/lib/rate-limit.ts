@@ -168,12 +168,16 @@ export function createRateLimiter(options: RateLimiterOptions = {}): RateLimiter
       // バケットごと削除してしまう（消された送信元はその場で枠を取り戻すので
       // fail-open）。全件を見る分のコストは、掃除自体を 1 ウィンドウに 1 回へ
       // 絞ったことで問題にならない（1 バケットの記録は maxRequests 件で有界）
-      if (timestamps.every((t) => now - t >= windowMs)) {
+      // ウィンドウ内かどうかの規則は keepWithinWindow が唯一の参照元。
+      // ここで「now - t >= windowMs」と否定形を書き写すと、判定側と掃除側で
+      // 規則が 2 か所に分かれ、片方だけ直したときに「判定はまだ数えている記録を
+      // 掃除側が捨てる」＝その送信元が枠を丸ごと取り戻す（fail-open）ずれが起きる
+      if (keepWithinWindow(timestamps, (t) => t, now).length === 0) {
         buckets.delete(key);
       }
     }
     // 共有バケットも同じ規則で空にする（表の外に持っているので個別に見る）
-    if (overflowRecords.every((record) => now - record.at >= windowMs)) {
+    if (keepWithinWindow(overflowRecords, (record) => record.at, now).length === 0) {
       overflowRecords = [];
     }
   }

@@ -276,6 +276,8 @@ describe("チャット画面のストリーミング処理", () => {
     // 例外そのものがコンソールへ残ることも確かめる（握り潰すと、画面には
     // 「通信エラー」としか出ないまま原因を追う手がかりが消える）
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    // 途切れた配信は debug に落とすので、そちらも観測できるようにする
+    const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => {});
     // 途中で失敗しても必ずスパイを戻すため try/finally で囲む。
     // 戻し忘れると console.error がモックのまま後続のテストへ漏れ、
     // それらの診断出力が黙って飲み込まれる
@@ -295,17 +297,25 @@ describe("チャット画面のストリーミング処理", () => {
       await waitFor(() => {
         expect(screen.getByText(/途切れています/)).toBeInTheDocument();
       });
-      // 通信エラーの通知も併せて表示されることを確認する
+      // 「最後まで受け取れなかった」ことを伝える通知が出ることを確認する。
+      // ここで「通信エラー…接続を確認してください」と出してはいけない:
+      // サーバーは完了前に終わったことを error で伝えるが、その原因は
+      // プラットフォームの実行時間上限などで、接続には問題が無いことがある
       await waitFor(() => {
-        expect(screen.getByRole("alert")).toHaveTextContent("通信エラー");
+        expect(screen.getByRole("alert")).toHaveTextContent(
+          "回答を最後まで受け取れませんでした"
+        );
       });
-      // 捨てずにコンソールへ残していることを確認する
-      expect(errorSpy).toHaveBeenCalled();
+      // 途切れた回答を印付きで残せているので、障害としては積み上げない
+      // （長い回答では日常的に起こる）。捨てずに debug には残す
+      expect(errorSpy).not.toHaveBeenCalled();
+      expect(debugSpy).toHaveBeenCalled();
       // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
       await waitForIdle();
     } finally {
       // スパイを元に戻して他のテストへ影響させない
       errorSpy.mockRestore();
+      debugSpy.mockRestore();
     }
   });
 

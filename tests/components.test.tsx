@@ -73,8 +73,25 @@ describe("ChatInput", () => {
     expect(mockOnSend).toHaveBeenCalledWith("こんにちは");
   });
 
-  // 空文字では送信されないことを確認する
-  it("空文字では onSend を呼ばず、理由を表示すること", () => {
+  // 空文字・空白だけの入力では、そもそも送信操作ができないことを確認する
+  it("空白だけの入力では送信ボタンが押せないこと", () => {
+    const mockOnSend = vi.fn();
+    render(<ChatInput onSend={mockOnSend} onClearError={vi.fn()} isLoading={false} />);
+
+    // 空白だけを入力する
+    const input = screen.getByPlaceholderText("メッセージを入力...");
+    fireEvent.change(input, { target: { value: "   " } });
+
+    // 送信ボタンが無効であることを確認する。実ブラウザではボタンが無効だと
+    // Enter による暗黙の送信も起きないので、これが「空の送信」に対する
+    // ユーザーから見た唯一の振る舞いになる
+    expect(screen.getByText("送信")).toBeDisabled();
+    // クリックしても何も起きないことを確認する
+    fireEvent.click(screen.getByText("送信"));
+    expect(mockOnSend).not.toHaveBeenCalled();
+  });
+
+  it("送信イベントが直接届いても、空の本文は理由を表示して止めること", () => {
     const mockOnSend = vi.fn();
     const mockClearError = vi.fn();
     render(
@@ -85,15 +102,17 @@ describe("ChatInput", () => {
       />
     );
 
-    // フォームをそのまま送信する（入力なし）
+    // 送信ボタンを介さずフォームの submit を直接起こす。実ブラウザではボタンが
+    // 無効なのでこの経路には来ないが、無効化を外した／別の送信手段が増えた
+    // ときに「空の本文が黙って無視される」状態へ戻らないよう固定しておく
+    // （判定は共有の規則 findContentProblem が持つ。手前で早期 return すると
+    //   その規則の「空の本文」の分岐がこの層から到達不能になる）
     const input = screen.getByPlaceholderText("メッセージを入力...");
     fireEvent.submit(input.closest("form")!);
 
     // onSend が呼ばれていないことを確認する
     expect(mockOnSend).not.toHaveBeenCalled();
-    // 何も表示せずに黙って無視しないことを確認する。黙って戻ると、前回の送信の
-    // 通知（429 など）が残ったままになり、いま押した操作が無視されたことが
-    // ユーザーに伝わらない
+    // 何も表示せずに黙って無視しないことを確認する
     expect(screen.getByRole("alert")).toHaveTextContent(CONTENT_EMPTY_MESSAGE);
     // 前回の送信についての通知も消していることを確認する
     expect(mockClearError).toHaveBeenCalled();
