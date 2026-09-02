@@ -35,10 +35,17 @@ export function formatSseFrame(payload: string): string {
  * @returns データ部分の文字列。データ行でなければ null
  */
 export function parseSseDataLine(line: string): string | null {
+  // 行末の復帰文字（CR）を落としてから判定する。
+  // SSE の行区切りは LF だけでなく CRLF・CR も認められており、途中の
+  // プロキシや CDN が CRLF で流してくることがある。CR を残したままだと
+  // 本文の末尾に \r が付き、終端の番兵と文字列比較したときに一致しない。
+  // JSON としては CR は空白なので解析は通ってしまい、「本文は届くのに
+  // 完了だけ検出できない」＝完全な回答が毎回「中断された」と誤判定される
+  const withoutCarriageReturn = line.endsWith("\r") ? line.slice(0, -1) : line;
   // データ行でなければ取り出すものが無いので null を返す
-  if (!line.startsWith(SSE_DATA_PREFIX)) {
+  if (!withoutCarriageReturn.startsWith(SSE_DATA_PREFIX)) {
     return null;
   }
   // プレフィックスの長さ分だけ読み飛ばして本文を取り出す（長さは定数から導く）
-  return line.slice(SSE_DATA_PREFIX.length);
+  return withoutCarriageReturn.slice(SSE_DATA_PREFIX.length);
 }

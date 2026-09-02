@@ -11,8 +11,6 @@ import CategoryChips from "@/components/CategoryChips";
 import { parseSseDataLine, SSE_DONE_MARKER } from "@/lib/sse";
 // 送信する会話履歴をサーバーの受付上限まで切り詰めるヘルパー（上限の定義元は @/lib/chat-limits）
 import {
-  CONTENT_TOO_LONG_MESSAGE,
-  MAX_CONTENT_LENGTH,
   TRUNCATED_ANSWER_SUFFIX,
   trimHistoryForRequest,
 } from "@/lib/chat-limits";
@@ -23,6 +21,10 @@ import type { Message, CategoryId } from "@/lib/types";
  * ユーザーの入力を受け取り、API にストリーミングリクエストを送信し、
  * AI の回答をリアルタイムに表示する。
  */
+/** 回答が 1 文字も受け取れなかったときに表示する文言（§6 UI 文言は一元管理）。
+ * 上流が本文を返さずに正常終了する（長さ上限に本文なしで達した等）ことは起こりうる。 */
+const EMPTY_ANSWER_MESSAGE = "回答を受け取れませんでした。もう一度お試しください。";
+
 export default function Home() {
   // 会話履歴を管理する state
   const [messages, setMessages] = useState<Message[]>([]);
@@ -43,16 +45,6 @@ export default function Home() {
     async (content: string) => {
       // エラー表示をクリアする
       setError(null);
-
-      // 上限を超える本文は履歴に積まない。積むとサーバーが 400 を返す一方で
-      // 履歴には残り続け、以降のすべての送信が同じ 400 になって復帰できなくなる。
-      // 入力欄側でも同じ検証をしているが、そこは「入力を消さずに理由を見せる」
-      // ための表示の都合であって、履歴を守る責任はこの層にある
-      // （送信経路が増えたときに、この防御だけは必ず通る）
-      if (content.length > MAX_CONTENT_LENGTH) {
-        setError(CONTENT_TOO_LONG_MESSAGE);
-        return;
-      }
 
       // ユーザーのメッセージオブジェクトを作成する
       const userMessage: Message = { role: "user", content };
@@ -116,6 +108,8 @@ export default function Home() {
         let lineBuffer = "";
         // 終了マーカー [DONE] を受信したかどうかのフラグ（外側の読み取りループも止めるため）
         let sawDone = false;
+        // 解析できずに読み飛ばした差分があったかどうか（回答に欠けがある印）
+        let droppedFrame = false;
 
         try {
           // ストリームからデータを順次読み取るループ
@@ -156,8 +150,13 @@ export default function Home() {
                 accumulated += parsed.text;
                 // ストリーミング表示を更新する
                 setStreamingText(accumulated);
-              } catch {
-                // JSON パースに失敗した行は無視する
+              } catch (parseError) {
+                // 壊れた差分は表示できないので飛ばすが、黙って捨てない。
+                // 捨てた事実を覚えておかないと、[DONE] は普通に届くため
+                // 「欠けのある回答」が完全な回答として履歴に確定してしまう
+                // （未完了の回答には必ず印を付ける、という約束が崩れる）
+                droppedFrame = true;
+                console.debug("差分の解析に失敗したため読み飛ばしました:", parseError);
               }
             }
           }
@@ -187,11 +186,18 @@ export default function Home() {
                 // [DONE] を受け取れていれば完了。sawDone は読み取りループの
                 // 制御にも使っている同じ事実なので、別の変数へ写し取らない
                 // （2 つに分けると片方だけ変わって静かに食い違う）
-                content: sawDone
-                  ? accumulated
-                  : `${accumulated}${TRUNCATED_ANSWER_SUFFIX}`,
+                content:
+                  sawDone && !droppedFrame
+                    ? accumulated
+                    : `${accumulated}${TRUNCATED_ANSWER_SUFFIX}`,
               },
             ]);
+          }
+          else {
+            // 1 文字も受け取れなかった場合は、黙って何も起きなかったように
+            // 終わらせない。ローディングだけ止まって画面に何も出ないと、
+            // ユーザーは失敗に気づかず再送して上流の呼び出しを重ねる
+            setError(EMPTY_ANSWER_MESSAGE);
           }
           // ストリーミング表示を必ずクリアする（エラー時の吹き出し残留を防ぐ）
           setStreamingText("");

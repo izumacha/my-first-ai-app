@@ -6,6 +6,7 @@
  */
 import { describe, it, expect } from "vitest";
 import {
+  MAX_BODY_BYTES,
   MAX_CONTENT_LENGTH,
   MAX_MESSAGE_COUNT,
   OMITTED_ANSWER_SUFFIX,
@@ -219,6 +220,18 @@ describe("共有する入力上限", () => {
     // 切り詰めたつもりがほぼ全文を返して上限を超える。上限は定数なので
     // 実行時ではなくここで固定しておけば、設定ミスは CI で必ず落ちる
     expect(MAX_CONTENT_LENGTH).toBeGreaterThan(OMITTED_ANSWER_SUFFIX.length);
+  });
+
+  it("件数 × 文字数の最大ペイロードが本文サイズ上限に収まる", () => {
+    // 上限内の履歴を送ったのに 413 になる設定にしてはいけない。413 になると
+    // 弾かれたメッセージが履歴に残り続けて窓からも抜けず、400 について
+    // 塞いだのとまったく同じ「復帰できない」状態が再発する。
+    // 日本語は UTF-8 で 1 文字 3 バイトなので、最悪ケースをその換算で見積もる
+    const BYTES_PER_CHARACTER = 3;
+    const worstCaseBodyBytes =
+      MAX_MESSAGE_COUNT * MAX_CONTENT_LENGTH * BYTES_PER_CHARACTER;
+    // JSON の構造（キー・括弧・エスケープ）の分も乗るので、余裕を持って収まることを求める
+    expect(worstCaseBodyBytes).toBeLessThan(MAX_BODY_BYTES);
   });
 
   it("履歴の最大件数は user/assistant の往復を保てる 2 件以上である", () => {

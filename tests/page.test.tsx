@@ -296,6 +296,93 @@ describe("チャット画面のストリーミング処理", () => {
     await waitForIdle();
   });
 
+  it("CRLF で区切られたストリームでも完全な回答として扱うこと", async () => {
+    // 途中のプロキシが CRLF で流す場合を模す。行末の CR を落とし損ねると
+    // 本文は届くのに [DONE] だけ一致せず、完全な回答に中断の印が付いてしまう
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValue(
+          new Response(
+            makeStream(['data: {"text":"完全な回答"}\r\n\r\ndata: [DONE]\r\n\r\n']),
+            { status: 200 }
+          )
+        )
+    );
+
+    // チャット画面を描画する
+    render(<Home />);
+    // メッセージを送信する
+    sendMessage("テスト質問");
+
+    // 回答が確定するまで待つ
+    await waitFor(() => {
+      expect(screen.getByText("完全な回答")).toBeInTheDocument();
+    });
+    // 中断の印が付いていないことを確認する
+    expect(screen.queryByText(/中断されました/)).not.toBeInTheDocument();
+    // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
+    await waitForIdle();
+  });
+
+  it("解析できない差分があった回答には中断の印を付けること", async () => {
+    // 壊れた差分が 1 件混じるが [DONE] は普通に届く場合を模す。
+    // 読み飛ばした事実を覚えていないと、欠けのある回答が完全な回答として確定する
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          makeStream([
+            'data: {"text":"前半"}\n\ndata: {壊れた\n\ndata: [DONE]\n\n',
+          ]),
+          { status: 200 }
+        )
+      )
+    );
+
+    // チャット画面を描画する
+    render(<Home />);
+    // メッセージを送信する
+    sendMessage("テスト質問");
+
+    // 受け取れた分が表示されることを確認する
+    await waitFor(() => {
+      expect(screen.getByText(/前半/)).toBeInTheDocument();
+    });
+    // 欠けがあるので中断の印が付くことを確認する
+    await waitFor(() => {
+      expect(screen.getByText(/中断されました/)).toBeInTheDocument();
+    });
+    // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
+    await waitForIdle();
+  });
+
+  it("回答を 1 文字も受け取れなかったときは理由を表示すること", async () => {
+    // 上流が本文を返さずに正常終了した場合を模す（長さ上限に本文なしで達した等）
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValue(
+          new Response(makeStream(["data: [DONE]\n\n"]), { status: 200 })
+        )
+    );
+
+    // チャット画面を描画する
+    render(<Home />);
+    // メッセージを送信する
+    sendMessage("テスト質問");
+
+    // 何も起きなかったように終わらせず、理由が表示されることを確認する。
+    // 黙って終わると、ユーザーは失敗に気づかず再送して上流の呼び出しを重ねる
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent("回答を受け取れませんでした");
+    });
+    // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
+    await waitForIdle();
+  });
+
   it("最後まで届いた回答には中断の印を付けないこと", async () => {
     // 差分と [DONE] を正常に流すストリームを返す
     vi.stubGlobal(

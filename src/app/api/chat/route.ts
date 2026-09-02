@@ -16,6 +16,7 @@ import { formatSseFrame, SSE_DONE_MARKER } from "@/lib/sse";
 // 入力上限はクライアントと共有する（唯一の参照元は @/lib/chat-limits）
 import {
   CONTENT_TOO_LONG_MESSAGE,
+  MAX_BODY_BYTES,
   MAX_CONTENT_LENGTH,
   MAX_MESSAGE_COUNT,
   TOO_MANY_MESSAGES_MESSAGE,
@@ -31,12 +32,6 @@ const rateLimiter = createRateLimiter();
 /** レート制限キーとして受け付ける最大文字数（IPv6 でも 45 文字以内。
  * 偽装ヘッダ由来の巨大文字列をそのままキーに使ってメモリを消費しないための上限）。 */
 const MAX_CLIENT_KEY_LENGTH = 64;
-
-/** リクエストボディの最大バイト数（本文上限 4000 文字 × 50 件 ＋ JSON 構造の余裕分）。
- * Content-Length ヘッダは自己申告に過ぎず、チャンク転送ではそもそも付かないため、
- * ヘッダ検査（速い前段の目安）に加えて実際の読み取りバイト数でも同じ上限を強制する
- * （readBodyWithinLimit）。これにより検証前の巨大ボディでメモリを消費させられない。 */
-const MAX_BODY_BYTES = 1_000_000;
 
 /** 429 応答の Retry-After ヘッダに載せる待機秒数。
  * クライアントが正しくバックオフできるよう、いつ再試行してよいかを明示する。
