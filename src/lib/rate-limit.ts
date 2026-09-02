@@ -131,7 +131,8 @@ export function createRateLimiter(options: RateLimiterOptions = {}): RateLimiter
   );
 
   // 掃除を行う最短間隔（ミリ秒）。ウィンドウ幅から導く。
-  // 走査の頻度をリクエスト数から切り離しつつ、回収の遅れをウィンドウの 1 割に抑える
+  // 走査の頻度をリクエスト数から切り離しつつ、回収の遅れを抑える
+  // （何分の 1 にするかと、その理由は SWEEP_INTERVALS_PER_WINDOW を参照）
   const sweepIntervalMs = Math.max(
     1,
     Math.floor(windowMs / SWEEP_INTERVALS_PER_WINDOW)

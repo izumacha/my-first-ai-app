@@ -132,10 +132,12 @@ export function trimHistoryForRequest(
   // その状態を作ってしまう。呼び出し側が末尾に user 発言を積む限り起きないが、
   // 前提をコメントで書くだけにせず、実装側で成り立たせる
   if (windowed.length === 0) {
-    // 後ろから最初に見つかる user 発言を探す
-    const lastUserMessage = [...meaningful].reverse().find((m) => m.role === "user");
-    // 見つからなければ送れるものが無いので空のまま返す（サーバーが弾く）
-    return lastUserMessage ? [capAssistantContent(lastUserMessage)] : [];
+    // 末尾から最初に見つかる user 発言を探す
+    const lastUserMessage = meaningful.findLast((m) => m.role === "user");
+    // 見つからなければ送れるものが無いので空のまま返す（サーバーが弾く）。
+    // user 発言はそもそも切り詰めない（下の capAssistantContent は user を
+    // そのまま返すので、ここで呼んでも何もしない）ため、そのまま 1 件を返す
+    return lastUserMessage ? [lastUserMessage] : [];
   }
 
   // assistant 発言の本文は受付上限に収めて返す
