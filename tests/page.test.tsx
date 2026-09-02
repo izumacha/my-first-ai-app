@@ -276,32 +276,37 @@ describe("チャット画面のストリーミング処理", () => {
     // 例外そのものがコンソールへ残ることも確かめる（握り潰すと、画面には
     // 「通信エラー」としか出ないまま原因を追う手がかりが消える）
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    // 途中で失敗しても必ずスパイを戻すため try/finally で囲む。
+    // 戻し忘れると console.error がモックのまま後続のテストへ漏れ、
+    // それらの診断出力が黙って飲み込まれる
+    try {
+      // チャット画面を描画する
+      render(<Home />);
+      // メッセージを送信する
+      sendMessage("テスト質問");
 
-    // チャット画面を描画する
-    render(<Home />);
-    // メッセージを送信する
-    sendMessage("テスト質問");
-
-    // 受信済みのテキストが宙に浮かず、会話履歴の吹き出しとして残ることを確認する。
-    // ただし完全な回答と見分けが付くよう、中断された印が付いた状態で残る
-    await waitFor(() => {
-      expect(screen.getByText(/途中まで/)).toBeInTheDocument();
-    });
-    // 途切れている印が付くことを確認する。印が無いと画面上は完全な回答と区別が付かず、
-    // 次の質問ではこの欠けた回答が文脈として送り返されてしまう
-    await waitFor(() => {
-      expect(screen.getByText(/途切れています/)).toBeInTheDocument();
-    });
-    // 通信エラーの通知も併せて表示されることを確認する
-    await waitFor(() => {
-      expect(screen.getByRole("alert")).toHaveTextContent("通信エラー");
-    });
-    // 捨てずにコンソールへ残していることを確認する
-    expect(errorSpy).toHaveBeenCalled();
-    // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
-    await waitForIdle();
-    // スパイを元に戻して他のテストへ影響させない
-    errorSpy.mockRestore();
+      // 受信済みのテキストが宙に浮かず、会話履歴の吹き出しとして残ることを確認する。
+      // ただし完全な回答と見分けが付くよう、中断された印が付いた状態で残る
+      await waitFor(() => {
+        expect(screen.getByText(/途中まで/)).toBeInTheDocument();
+      });
+      // 途切れている印が付くことを確認する。印が無いと画面上は完全な回答と区別が付かず、
+      // 次の質問ではこの欠けた回答が文脈として送り返されてしまう
+      await waitFor(() => {
+        expect(screen.getByText(/途切れています/)).toBeInTheDocument();
+      });
+      // 通信エラーの通知も併せて表示されることを確認する
+      await waitFor(() => {
+        expect(screen.getByRole("alert")).toHaveTextContent("通信エラー");
+      });
+      // 捨てずにコンソールへ残していることを確認する
+      expect(errorSpy).toHaveBeenCalled();
+      // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
+      await waitForIdle();
+    } finally {
+      // スパイを元に戻して他のテストへ影響させない
+      errorSpy.mockRestore();
+    }
   });
 
   it("CRLF で区切られたストリームでも完全な回答として扱うこと", async () => {

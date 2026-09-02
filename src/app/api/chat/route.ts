@@ -154,7 +154,7 @@ function rateLimitedResponse(retryAfterSeconds: string = RETRY_AFTER_SECONDS): N
  * 枠まで食い潰す。逆に上流が「2 秒」のときは不要に 60 秒待たせることになる。
  *
  * @param error - 上流から受け取った API エラー
- * @returns 秒数の文字列。ヘッダが無い・数値でない・負の場合は null
+ * @returns 秒数の文字列。ヘッダが無い・10 進数字だけの形でない場合は null
  */
 function upstreamRetryAfterSeconds(error: InstanceType<typeof Anthropic.APIError>): string | null {
   // ヘッダは実装によって形が異なるため、取得できないときは素直に諦める
@@ -163,16 +163,24 @@ function upstreamRetryAfterSeconds(error: InstanceType<typeof Anthropic.APIError
   if (!raw) {
     return null;
   }
-  // 秒数として解釈する（RFC 9110 は HTTP-date も許すが、上流は秒数を返す）
-  const seconds = Number(raw);
-  // 数値でない・負の値は信用せず、自前の待機時間へ倒す
-  if (!Number.isFinite(seconds) || seconds < 0) {
+  // 秒数（RFC 9110 の delay-seconds は 10 進数字だけ）の形かを厳密に確かめる。
+  // Number() の変換規則に任せると、空白だけの値が 0 に、"0x10" が 16 に、
+  // "1e3" が 1000 になってしまう。とくに空白だけの値は下の切り上げで 1 秒に化け、
+  // 成功しえない再試行を 1 秒後に促して自前の枠まで食い潰す
+  // （この関数が防ぎたいことそのもの）。RFC 9110 は HTTP-date も許すが、
+  // その形は数字だけではないのでここで弾かれ、自前の待機時間へ倒れる
+  if (!/^\d+$/.test(raw.trim())) {
     return null;
   }
-  // 端数を切り上げつつ、最低でも 1 秒は待たせる。
-  // 0 をそのまま伝えると「すぐ再試行してよい」の意味になり、上流に弾かれ続ける
-  // リクエストで自前のレート制限の枠まで食い潰す（この関数が防ぎたいことそのもの）
-  return String(Math.max(1, Math.ceil(seconds)));
+  // 数字だけであることが確かめられたので秒数へ変換する
+  const seconds = Number(raw.trim());
+  // 桁が多すぎて有限の数値にならない値は信用せず、自前の待機時間へ倒す
+  if (!Number.isFinite(seconds)) {
+    return null;
+  }
+  // 最低でも 1 秒は待たせる。0 をそのまま伝えると「すぐ再試行してよい」の意味になり、
+  // 上流に弾かれ続けるリクエストで自前のレート制限の枠まで食い潰す
+  return String(Math.max(1, seconds));
 }
 
 /**

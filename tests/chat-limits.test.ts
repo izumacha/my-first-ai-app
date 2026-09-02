@@ -304,12 +304,34 @@ describe("共有する入力上限", () => {
     // 上限内の履歴を送ったのに 413 になる設定にしてはいけない。413 になると
     // 弾かれたメッセージが履歴に残り続けて窓からも抜けず、400 について
     // 塞いだのとまったく同じ「復帰できない」状態が再発する。
-    // 日本語は UTF-8 で 1 文字 3 バイトなので、最悪ケースをその換算で見積もる
-    const BYTES_PER_CHARACTER = 3;
+    //
+    // 見積もりは「日本語 1 文字 = UTF-8 で 3 バイト」ではなく、JSON 化したときの
+    // 最悪ケースで行う。JSON.stringify は制御文字（U+0000〜U+001F のうち
+    // 短縮エスケープを持たないもの）を 6 バイトのエスケープ表記へ展開するため、
+    // 3 バイト換算だと「上限内の履歴なのに 413」になる設定を見逃す
+    // （上限値を上げたときに黙って現実の問題になる）
+    const WORST_CASE_BYTES_PER_UNIT = 6;
     const worstCaseBodyBytes =
-      MAX_MESSAGE_COUNT * MAX_CONTENT_LENGTH * BYTES_PER_CHARACTER;
-    // JSON の構造（キー・括弧・エスケープ）の分も乗るので、余裕を持って収まることを求める
+      MAX_MESSAGE_COUNT * MAX_CONTENT_LENGTH * WORST_CASE_BYTES_PER_UNIT;
+    // JSON の構造（キー・括弧）の分も乗るので、余裕を持って収まることを求める
     expect(worstCaseBodyBytes).toBeLessThan(MAX_BODY_BYTES);
+  });
+
+  it("最悪ケースの見積もりが実際の JSON 化の結果を下回らない", () => {
+    // 見積もりの係数（1 符号単位あたり 6 バイト）が本当に最悪ケースかを、
+    // 実際に JSON 化して確かめる。係数を実測から切り離すと、上の検査は
+    // 「決めた数どうしの比較」になり、現実の肥大化を見張らなくなる
+    const WORST_CASE_BYTES_PER_UNIT = 6;
+    // 最も膨らむ文字（短縮エスケープを持たない制御文字）だけの本文を作る
+    const worstContent = "\u0001".repeat(100);
+    // 1 メッセージ分を JSON 化してバイト数を測る
+    const encodedLength = new TextEncoder().encode(
+      JSON.stringify(worstContent)
+    ).length;
+    // 前後の引用符 2 バイトを除いた本文の展開量が係数以内であることを確認する
+    expect(encodedLength - 2).toBeLessThanOrEqual(
+      worstContent.length * WORST_CASE_BYTES_PER_UNIT
+    );
   });
 
   it("履歴の最大件数は user/assistant の往復を保てる 2 件以上である", () => {

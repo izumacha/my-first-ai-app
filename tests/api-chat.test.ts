@@ -159,6 +159,9 @@ import { MissingApiKeyError } from "@/lib/anthropic";
 import { POST } from "@/app/api/chat/route";
 // 完了の番兵（送信側と読み取り側で共有する定数）
 import { SSE_DONE_MARKER } from "@/lib/sse";
+// ボディサイズ上限（定義元は @/lib/chat-limits）。テストへ数値を書き写すと、
+// 上限を変えたときにテストだけが古い値を見たまま緑になる
+import { MAX_BODY_BYTES } from "@/lib/chat-limits";
 
 /**
  * テスト用の POST リクエストを組み立てるヘルパー
@@ -414,8 +417,8 @@ describe("POST /api/chat のボディサイズ上限", () => {
       headers: {
         "content-type": "application/json",
         "x-forwarded-for": uniqueIp(),
-        // 上限（1,000,000 バイト）を超える値を申告する
-        "content-length": "2000000",
+        // 上限を超える値を申告する（値は定数から導く）
+        "content-length": String(MAX_BODY_BYTES + 1),
       },
       body: JSON.stringify({ messages: validMessages }),
     });
@@ -425,9 +428,11 @@ describe("POST /api/chat のボディサイズ上限", () => {
   });
 
   it("Content-Length の申告が無い巨大ボディも実測で 413 を返す", async () => {
-    // チャンク転送を模した「Content-Length 無し」の巨大ボディ（上限 1,000,000 バイト超）を作る
+    // チャンク転送を模した「Content-Length 無し」の巨大ボディ（上限超）を作る。
+    // 長さは定数から導く（書き写すと、上限を上げたときにこの試験だけが
+    // 上限内のボディを送るようになり、413 の経路を検証しなくなる）
     const hugeBody = JSON.stringify({
-      messages: [{ role: "user", content: "a".repeat(1_100_000) }],
+      messages: [{ role: "user", content: "a".repeat(MAX_BODY_BYTES + 100_000) }],
     });
     // fetch 互換の Request 構築ではヘッダに content-length が自動付与されないため、
     // ヘッダ検査だけの実装ではこのリクエストが素通りしてしまう（実測チェックの回帰防止）
@@ -963,6 +968,34 @@ describe("POST /api/chat の上流エラーマッピング", () => {
     const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
     // 最低 1 秒は待たせることを確認する
     expect(res.headers.get("Retry-After")).toBe("1");
+  });
+
+  // RFC 9110 の delay-seconds は 10 進数字だけなのに、Number() の変換規則に任せると
+  // "0x10" が 16 に、"1e3" が 1000 に、"5.9" が（切り上げで）6 に、"+5" が 5 になり、
+  // 上流が意図していない待機時間をクライアントへ伝えてしまう。
+  // ここに並べるのは「厳密判定を外すと通ってしまう」値だけにする
+  // （たとえば HTTP-date 形式や空白だけの値は Number() でも NaN・空文字になるため、
+  //   並べても判定の有無を区別できない＝空振りのケースになる）
+  it.each([
+    ["0x10", "16 進数に見える値"],
+    ["1e3", "指数表記の値"],
+    ["5.9", "小数の値"],
+    ["+5", "符号付きの値"],
+  ])("秒数として解釈できない Retry-After（%s）は自前の待機時間へ倒す", async (rawHeader) => {
+    createMock.mockImplementationOnce(() =>
+      Promise.reject(
+        new Anthropic.APIError(
+          429,
+          { type: "error", error: { type: "rate_limit_error", message: "slow down" } },
+          "rate limited",
+          new Headers({ "retry-after": rawHeader })
+        )
+      )
+    );
+    // 正常な形のリクエストを送る
+    const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
+    // 上流の値ではなく自前の待機時間（60 秒）が使われることを確認する
+    expect(res.headers.get("Retry-After")).toBe("60");
   });
 
   it("上流 429 に Retry-After が無ければ自前の待機時間を使う", async () => {
