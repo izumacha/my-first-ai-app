@@ -4,7 +4,7 @@
  */
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef } from "react";
 import ChatContainer from "@/components/ChatContainer";
 import ChatInput from "@/components/ChatInput";
 import CategoryChips from "@/components/CategoryChips";
@@ -59,6 +59,10 @@ export default function Home() {
   // エラーメッセージを管理する state
   const [error, setError] = useState<string | null>(null);
 
+  // 送信が進行中かどうかを保持する参照。isLoading（state）は再描画されるまで
+  // 更新が見えないため、重なった送信を止める用途には使えない
+  const inFlightRef = useRef(false);
+
   /**
    * 画面上部の通知（前回の送信の結果）を消す処理
    * 入力欄が送信を止めたときに呼ばれ、関係の無い古い通知が残らないようにする。
@@ -87,6 +91,18 @@ export default function Home() {
         setError(contentProblem);
         return;
       }
+
+      // 送信が既に進行中なら何もしない。
+      // 重なると、2 回目が「1 回目の追加が反映される前の履歴」を読んでしまい、
+      // 画面には両方の質問が並ぶのに API へ送る履歴からは直前の質問が抜ける
+      // （表示と送信内容が食い違い、しかもどこにもエラーが出ない）。
+      // 送信ボタンは送信中に無効化されるが、入力欄を経由しない送信経路が
+      // 増えても必ずここを通るよう、この層でも止める
+      if (inFlightRef.current) {
+        return;
+      }
+      // 進行中の印を立てる（解除は下の finally で必ず行う）
+      inFlightRef.current = true;
 
       // ユーザーのメッセージオブジェクトを作成する
       const userMessage: Message = { role: "user", content };
@@ -231,9 +247,7 @@ export default function Home() {
         // ここへ来るのは通信の失敗（オフライン等）だけとは限らず、try の中の
         // 不具合もすべて同じ文言に化ける。中身を捨てると、画面に出る文言だけが
         // 残って原因を追う手がかりが消える。
-        // ただし、途切れた回答を印付きで残せているケースは長い回答で日常的に
-        // 起こりうるので、障害として積み上げず debug に落とす
-        // 途切れは日常的に起こるので error では積み上げない。ただし debug だと
+        // ただし途切れは日常的に起こるので error では積み上げない。debug だと
         // ブラウザの既定のログレベルでは表示されず、ここへ紛れ込む実装の不具合
         // （try の中で投げられた TypeError 等）が誰にも見えないまま
         // 「回答を最後まで受け取れませんでした」だけが出続ける。既定で見える warn にする
@@ -245,6 +259,8 @@ export default function Home() {
       } finally {
         // ローディング状態を終了する
         setIsLoading(false);
+        // 進行中の印を下ろす（次の送信を受け付ける）
+        inFlightRef.current = false;
       }
     },
     [messages, category]

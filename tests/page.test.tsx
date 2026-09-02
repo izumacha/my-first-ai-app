@@ -390,6 +390,57 @@ describe("チャット画面のストリーミング処理", () => {
     await waitForIdle();
   });
 
+  it("送信中は次の送信を受け付けず、送った履歴が画面と一致すること", async () => {
+    // 応答を保留したままにして「送信中」の状態を作るストリームを用意する
+    const encoder = new TextEncoder();
+    const fetchMock = vi.fn().mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          // 少しだけ遅らせて、2 回目の送信が重なる余地を作る
+          setTimeout(() => {
+            const stream = new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(
+                  encoder.encode('data: {"text":"回答"}\n\ndata: [DONE]\n\n')
+                );
+                controller.close();
+              },
+            });
+            resolve(new Response(stream, { status: 200 }));
+          }, 20);
+        })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    // チャット画面を描画する
+    render(<Home />);
+    // 1 回目の送信を始める（応答は保留中）
+    sendMessage("1 つ目の質問");
+
+    // 応答が返るまでの間、送信操作そのものができないことを確認する
+    // （ハンドラー側にも進行中のガードがあるが、そちらは入力欄を経由しない
+    //   送信経路が増えたときのための防御で、通常はここで止まる）
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "送信中..." })).toBeDisabled();
+    });
+
+    // 1 回目の応答が返るまで待つ
+    await waitFor(() => {
+      expect(screen.getByText("回答")).toBeInTheDocument();
+    });
+
+    // 送信は 1 回だけで、送った履歴の末尾が画面の質問と一致することを確認する。
+    // 重なった送信を許すと、2 回目が「1 回目の追加が反映される前の履歴」を送り、
+    // 画面には並んでいる質問が API 側から抜け落ちる
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(
+      (fetchMock.mock.calls[0][1] as { body: string }).body
+    ) as { messages: { role: string; content: string }[] };
+    expect(body.messages[body.messages.length - 1].content).toBe("1 つ目の質問");
+    // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
+    await waitForIdle();
+  });
+
   it("CRLF で区切られたストリームでも完全な回答として扱うこと", async () => {
     // 途中のプロキシが CRLF で流す場合を模す。行末の CR を落とし損ねると
     // 本文は届くのに [DONE] だけ一致せず、完全な回答に中断の印が付いてしまう

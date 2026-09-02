@@ -288,8 +288,13 @@ async function readBodyWithinLimit(
     total += value.byteLength;
     // 合計が上限を超えたら、それ以上読まずに打ち切って「超過」を知らせる
     if (total > limitBytes) {
-      // 残りのボディの受信を中止する（読み続けてメモリを消費しない）
-      await reader.cancel();
+      // 残りのボディの受信を中止する（読み続けてメモリを消費しない）。
+      // 既にエラーで終わっているストリームの cancel は reject するため、
+      // 捕まえずに待つと 413 のつもりが「想定外のエラー」の 500 に化ける
+      // （目的は解放なので、失敗しても実害は無い。debug には残す）
+      await reader.cancel().catch((cancelError: unknown) => {
+        console.debug("リクエストボディの解放に失敗しました:", cancelError);
+      });
       return null;
     }
     // 上限内のチャンクを配列に追加する
