@@ -25,6 +25,43 @@ function makeMockStream() {
   };
 }
 
+/**
+ * 「差分を 1 件流したあとに失敗する」ストリームのモックを生成する。
+ * 接続確立後（＝ 200 とヘッダを返し終えたあと）にだけ起きる失敗を再現するために使う。
+ * @param failure - 反復の途中で投げるエラー
+ * @returns 1 件流してから failure を投げる、中断用コントローラ付きのモックストリーム
+ */
+function makeFailingStream(failure: unknown) {
+  return {
+    // クライアント切断時に route が呼ぶ中断用コントローラ（呼び出しを記録する）
+    controller: { abort: vi.fn() },
+    // 1 件流してから失敗する非同期イテレータを実装する
+    async *[Symbol.asyncIterator]() {
+      // 正常なデルタを 1 件返す
+      yield {
+        type: "content_block_delta",
+        delta: { type: "text_delta", text: "こん" },
+      };
+      // 反復の途中で指定されたエラーを投げる
+      throw failure;
+    },
+  };
+}
+
+/**
+ * ストリームを最後まで（またはエラーになるまで）読み進める。
+ * 反復中のエラーは start() の中で起きるため、ボディを実際に読まないと表面化しない。
+ * @param body - 読み進めるレスポンスボディ
+ */
+async function drainBody(body: ReadableStream<Uint8Array>): Promise<void> {
+  // 読み取り口を取得する
+  const reader = body.getReader();
+  // 終端（done）に達するまで読み続ける。エラーがあればここで reject する
+  while (!(await reader.read()).done) {
+    // 読み取り継続（終端またはエラー到達待ち）
+  }
+}
+
 // messages.create の呼び出しを記録するモック関数（既定では正常なストリームで解決する）。
 // 実 SDK の create({stream:true}) は「上流の HTTP 応答を受けてから」解決する Promise を
 // 返すため、モックも同期 return ではなく Promise で解決／拒否させて実挙動に合わせる
@@ -514,37 +551,73 @@ describe("POST /api/chat の上流エラーマッピング", () => {
   it("ストリーム反復中のエラーはレスポンスボディのエラーとして伝わる", async () => {
     // 最初のデルタを流した後、反復の途中で失敗するストリームを仕込む
     createMock.mockImplementationOnce(() =>
-      Promise.resolve({
-        // 中断用コントローラ（この試験では使われない）
-        controller: { abort: vi.fn() },
-        // 1 件流してから失敗する非同期イテレータを実装する
-        async *[Symbol.asyncIterator]() {
-          // 正常なデルタを 1 件返す
-          yield {
-            type: "content_block_delta",
-            delta: { type: "text_delta", text: "こん" },
-          };
-          // 反復の途中で上流の切断などを模したエラーを投げる
-          throw new Error("upstream connection lost");
-        },
-      })
+      Promise.resolve(makeFailingStream(new Error("upstream connection lost")))
     );
-    // 正常な形のリクエストを送る（接続確立後にだけ失敗する想定）
-    const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
-    // 接続確立後の失敗なので 200（SSE 開始済み）であることを確認する
-    expect(res.status).toBe(200);
-    // ボディを読み進めると、途中エラーが reader へ伝播（reject）することを確認する
-    const reader = (res.body as ReadableStream<Uint8Array>).getReader();
-    // 1 チャンク目（正常デルタ）は読めることを確認する
-    const first = await reader.read();
-    expect(first.done).toBe(false);
-    // 以降の読み取りはエラーで reject されることを確認する（エラーの握り潰し防止）
-    await expect(async () => {
-      // ストリームの終端（またはエラー）まで読み続ける
-      while (!(await reader.read()).done) {
-        // 読み取り継続（エラー到達待ち）
-      }
-    }).rejects.toThrow("upstream connection lost");
+    // サーバログの出力は別の試験で確認するので、ここでは出力を抑えるだけにする
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // 正常な形のリクエストを送る（接続確立後にだけ失敗する想定）
+      const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
+      // 接続確立後の失敗なので 200（SSE 開始済み）であることを確認する
+      expect(res.status).toBe(200);
+      // ボディを読み進めると、途中エラーが reader へ伝播（reject）することを確認する
+      const reader = (res.body as ReadableStream<Uint8Array>).getReader();
+      // 1 チャンク目（正常デルタ）は読めることを確認する
+      const first = await reader.read();
+      expect(first.done).toBe(false);
+      // 以降の読み取りはエラーで reject されることを確認する（エラーの握り潰し防止）
+      await expect(async () => {
+        // ストリームの終端（またはエラー）まで読み続ける
+        while (!(await reader.read()).done) {
+          // 読み取り継続（エラー到達待ち）
+        }
+      }).rejects.toThrow("upstream connection lost");
+    } finally {
+      // スパイを元に戻して他のテストへ影響させない
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("ストリーム反復中のエラーはサーバログにも残る", async () => {
+    // 反復の途中で上流の切断を模したエラーを投げるストリームを仕込む
+    const failure = new Error("upstream connection lost");
+    createMock.mockImplementationOnce(() => Promise.resolve(makeFailingStream(failure)));
+    // サーバログへの記録を検証するためスパイを仕込む
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // 正常な形のリクエストを送る（接続確立後にだけ失敗する想定）
+      const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
+      // ボディを読み進めて反復中のエラーを表面化させる（reject するので捕捉する）
+      await expect(drainBody(res.body as ReadableStream<Uint8Array>)).rejects.toThrow(
+        "upstream connection lost"
+      );
+      // 200 を返し終えた後の失敗は POST の catch へ戻らないため、ここで記録しないと
+      // 上流障害の痕跡がサーバ側に一切残らない（§6 エラーを握り潰さない）
+      expect(errorSpy).toHaveBeenCalledWith(expect.any(String), failure);
+    } finally {
+      // スパイを元に戻して他のテストへ影響させない
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("ストリーム反復中の中断（クライアント切断）はサーバ障害としてログに残さない", async () => {
+    // 通常のクライアント切断を模して、SDK の中断エラーを反復中に投げるストリームを仕込む
+    createMock.mockImplementationOnce(() =>
+      Promise.resolve(makeFailingStream(new Anthropic.APIUserAbortError()))
+    );
+    // サーバ障害ログが呼ばれないことを検証するためスパイを仕込む
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // 正常な形のリクエストを送る（配信中にクライアントが切断した想定）
+      const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
+      // 中断は異常系ではないので、ストリームはエラーにならず静かに終わる
+      await drainBody(res.body as ReadableStream<Uint8Array>);
+      // 日常的に起きる切断でログを埋めない（本当の障害が埋もれるのを防ぐ）
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      // スパイを元に戻して他のテストへ影響させない
+      errorSpy.mockRestore();
+    }
   });
 
   it("接続確立前のクライアント切断（abort）は 500 ではなく 499 で静かに終える", async () => {

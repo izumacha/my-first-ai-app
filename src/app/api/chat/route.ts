@@ -353,6 +353,11 @@ type UpstreamStream = AsyncIterable<Anthropic.RawMessageStreamEvent> & {
  * @returns SSE のバイト列を流す ReadableStream
  */
 function createSseStream(stream: UpstreamStream): ReadableStream<Uint8Array> {
+  // 受信側が自分から切断した（cancel() が呼ばれた）かどうかを覚えておくフラグ。
+  // 中断の原因が「受信側の切断」か「リクエストそのものの中断（request.signal）」かで
+  // 後始末が変わるため区別する。cancel() は controller が使えなくなる前に同期的に
+  // 呼ばれるので、下の catch へ届く時点で必ず最新の値になっている
+  let cancelledByConsumer = false;
   // SSE のチャンクを順次書き出す ReadableStream を組み立てて返す
   return new ReadableStream({
     async start(controller) {
@@ -374,16 +379,34 @@ function createSseStream(stream: UpstreamStream): ReadableStream<Uint8Array> {
         // ストリームを閉じる
         controller.close();
       } catch (error) {
-        // クライアント切断による中断は異常系ではないため、静かに終了する
-        // （cancel() 後の controller はもう使えず、エラー通知の意味も無い）
+        // クライアント切断による中断は異常系ではないため、エラー通知はせず静かに終える
         if (isAbortError(error)) {
+          // 受信側が自分から切断していれば controller はもう使えないので何もしない
+          // （cancel() 済みのストリームを close() すると TypeError になる）。
+          // 一方 request.signal 由来の中断では受信側がまだ読んでいる可能性があり、
+          // ここで何もせずに抜けるとストリームが完結も失敗もしないまま宙吊りになり、
+          // 読み手の read() が永久に解決しない（§8 リソースを確実に解放する）
+          if (!cancelledByConsumer) {
+            controller.close();
+          }
           return;
         }
+        // 中断以外の失敗（上流の切断・overloaded 等）はサーバログに必ず残す。
+        // この時点では既に 200 とヘッダを返し終えているため POST ハンドラーの
+        // catch（mapErrorToResponse）へは戻らず、controller.error() は受信側を
+        // reject させるだけでサーバ側には何の記録も残らない。ログを出さないと
+        // 上流障害が繰り返し起きても運用者が気づけない（§6 エラーを握り潰さない）
+        console.error(
+          "チャット API のストリーミング中にエラーが発生しました:",
+          error
+        );
         // 中断以外のストリーム中のエラーはコントローラーに伝える
         controller.error(error);
       }
     },
     cancel() {
+      // 受信側が自分から切断したことを記録する（上の catch が後始末を分岐するのに使う）
+      cancelledByConsumer = true;
       // 受信側（クライアント）が切断したら上流の Claude ストリームも中断する。
       // 放置すると切断後も上流の生成が続き、トークンが課金され続けてしまう
       stream.controller.abort();
