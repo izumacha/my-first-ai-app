@@ -175,6 +175,27 @@ export function createRateLimiter(options: RateLimiterOptions = {}): RateLimiter
     }
   }
 
+  /**
+   * ウィンドウ内に残る記録だけを取り出す。
+   *
+   * <p>共有バケット（記録に送信元キーを持つ）と通常のバケット（時刻だけ）で
+   * 保持する形が違うため、「ウィンドウ内かどうか」の規則だけをここに集約する。
+   * 判定を各分岐へ書き写すと、規則を変えたときに片方だけ直して静かに食い違う。
+   *
+   * @param entries - 判定対象の記録一覧
+   * @param at - 記録から時刻を取り出す関数
+   * @param now - 現在時刻（ミリ秒）
+   * @returns ウィンドウ内に残る記録だけを含む新しい配列
+   */
+  function keepWithinWindow<T>(
+    entries: readonly T[],
+    at: (entry: T) => number,
+    now: number
+  ): T[] {
+    // 経過時間がウィンドウ幅未満の記録だけを残す
+    return entries.filter((entry) => now - at(entry) < windowMs);
+  }
+
   return {
     isRateLimited(clientKey: string, now: number = Date.now()): boolean {
       // 追跡表が上限に達していたら、期限切れの送信元エントリをまとめて掃除する。
@@ -209,11 +230,14 @@ export function createRateLimiter(options: RateLimiterOptions = {}): RateLimiter
 
       // 共有バケットで数える場合。判定は「どの送信元の分か」を問わず全体で行うが、
       // 記録には送信元キーを残す（下の引き継ぎに要る）。時刻だけの配列を扱う
-      // 通常経路と形が違うため、まとめずに分けている
+      // 通常経路と形が違うため、この分岐だけ記録の形のまま扱う
+      // （ウィンドウの規則そのものは keepWithinWindow に集約して共有する）
       if (useOverflow) {
         // ウィンドウ内の記録だけを残す
-        const recentRecords = overflowRecords.filter(
-          (record) => now - record.at < windowMs
+        const recentRecords = keepWithinWindow(
+          overflowRecords,
+          (record) => record.at,
+          now
         );
         // 共有の枠を使い切っていれば制限超過と判定する（この回は数えない）
         if (recentRecords.length >= maxRequests) {
@@ -229,21 +253,37 @@ export function createRateLimiter(options: RateLimiterOptions = {}): RateLimiter
 
       // この送信元の過去のリクエスト時刻一覧を取得する。
       //
-      // 表にまだ無い送信元は、**共有バケットに残っている自分の分だけを引き継ぐ**。
+      // 表にまだ無い送信元は、**共有バケットに残っている自分の分を引き取る**
+      // （引き取ったら共有バケットからは取り除く。下記）。
       // 空から始めると、表が満杯だった間に共有バケットで使い切ったはずの枠が
       // 空きができた瞬間にリセットされ、同じ送信元が 1 ウィンドウ内に上限の
       // 2 倍まで通れてしまう（送信元キーは偽装できるので、表を満杯にしてから
-      // この切り替わりを狙える）。引き継ぐ範囲を自分の分だけに絞るのが要点で、
-      // 共有バケット全体を引き継ぐと、無関係な新規クライアントが他人の消費で
+      // この切り替わりを狙える）。引き取る範囲を自分の分だけに絞るのが要点で、
+      // 共有バケット全体を引き取ると、無関係な新規クライアントが他人の消費で
       // 弾かれる（掃除を間隔で絞ったのと同じ「理由なく 429」を作ってしまう）
-      const timestamps =
-        buckets.get(clientKey) ??
-        overflowRecords
+      let timestamps = buckets.get(clientKey);
+      // 表にまだ無い＝共有バケットからの引き取り（昇格）が要るかもしれない
+      if (timestamps === undefined) {
+        // 共有バケットに残っている自分の分を時刻の配列として取り出す
+        timestamps = overflowRecords
           .filter((record) => record.key === clientKey)
           .map((record) => record.at);
+        // 引き取った分は共有バケットから取り除く。残したままにすると同じ
+        // リクエストを 2 か所で二重に数えることになり、新規クライアントのために
+        // 空けておくべき共有の枠を、昇格済みの送信元が食い続けてしまう
+        if (timestamps.length > 0) {
+          overflowRecords = overflowRecords.filter(
+            (record) => record.key !== clientKey
+          );
+        }
+      }
 
       // ウィンドウ内のリクエストだけを残すようフィルタリングする
-      const recentTimestamps = timestamps.filter((t) => now - t < windowMs);
+      const recentTimestamps = keepWithinWindow(
+        timestamps,
+        (timestamp) => timestamp,
+        now
+      );
 
       // リクエスト数が上限に達していたら制限超過と判定する（この回は数えない）
       if (recentTimestamps.length >= maxRequests) {
