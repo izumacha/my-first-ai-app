@@ -99,7 +99,7 @@ describe("trimHistoryForRequest", () => {
 describe("本文が受付上限を超えるメッセージの扱い", () => {
   it("上限を超える assistant 発言は切り詰めて送る（送信不能にしない）", () => {
     // 上流の回答が上限を超えた場合を模した履歴を用意する。
-    // 入力欄には maxLength があるので user 側は超えないが、assistant 側は制御できない
+    // assistant 発言は上流の回答なので、こちら側では長さを制御できない
     const history: Message[] = [
       { role: "user", content: "レシピを教えて" },
       { role: "assistant", content: "あ".repeat(MAX_CONTENT_LENGTH + 500) },
@@ -114,6 +114,18 @@ describe("本文が受付上限を超えるメッセージの扱い", () => {
     for (const message of trimmed) {
       expect(message.content.length).toBeLessThanOrEqual(MAX_CONTENT_LENGTH);
     }
+  });
+
+  it("上限を超える user 発言は切り詰めない（黙って質問を削らない）", () => {
+    // ユーザーが上限を超える長文を貼り付けた場合を模す
+    const longQuestion = "あ".repeat(MAX_CONTENT_LENGTH + 500);
+    const history: Message[] = [{ role: "user", content: longQuestion }];
+    // 切り詰めを適用する
+    const trimmed = trimHistoryForRequest(history);
+    // user 発言はそのまま送る。ここで黙って削ると、ユーザーは質問が途中で
+    // 切れたことに気づけないまま送信してしまう（サーバーが理由付きの 400 を
+    // 返し、画面にその理由が出るほうが「何が起きたか」が伝わる）
+    expect(trimmed[0].content).toBe(longQuestion);
   });
 
   it("上限以内のメッセージは同じオブジェクトのまま返す（不要な複製をしない）", () => {
@@ -149,7 +161,7 @@ describe("本文が受付上限を超えるメッセージの扱い", () => {
 
 describe("共有する入力上限", () => {
   it("本文の最大文字数は正の整数である", () => {
-    // 画面の maxLength とサーバーの検証で共有するため、妥当な値であることを確認する
+    // 履歴の切り詰めとサーバーの検証で共有するため、妥当な値であることを確認する
     expect(Number.isInteger(MAX_CONTENT_LENGTH)).toBe(true);
     expect(MAX_CONTENT_LENGTH).toBeGreaterThan(0);
   });

@@ -278,14 +278,50 @@ describe("チャット画面のストリーミング処理", () => {
     // メッセージを送信する
     sendMessage("テスト質問");
 
-    // 受信済みのテキストが宙に浮かず、会話履歴の吹き出しとして残ることを確認する
+    // 受信済みのテキストが宙に浮かず、会話履歴の吹き出しとして残ることを確認する。
+    // ただし完全な回答と見分けが付くよう、中断された印が付いた状態で残る
     await waitFor(() => {
-      expect(screen.getByText("途中まで")).toBeInTheDocument();
+      expect(screen.getByText(/途中まで/)).toBeInTheDocument();
+    });
+    // 中断の印が付くことを確認する。印が無いと画面上は完全な回答と区別が付かず、
+    // 次の質問ではこの欠けた回答が文脈として送り返されてしまう
+    await waitFor(() => {
+      expect(screen.getByText(/中断されました/)).toBeInTheDocument();
     });
     // 通信エラーの通知も併せて表示されることを確認する
     await waitFor(() => {
       expect(screen.getByRole("alert")).toHaveTextContent("通信エラー");
     });
+    // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
+    await waitForIdle();
+  });
+
+  it("最後まで届いた回答には中断の印を付けないこと", async () => {
+    // 差分と [DONE] を正常に流すストリームを返す
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValue(
+          new Response(
+            makeStream(['data: {"text":"完全な回答"}\n\ndata: [DONE]\n\n']),
+            { status: 200 }
+          )
+        )
+    );
+
+    // チャット画面を描画する
+    render(<Home />);
+    // メッセージを送信する
+    sendMessage("テスト質問");
+
+    // 回答が確定するまで待つ
+    await waitFor(() => {
+      expect(screen.getByText("完全な回答")).toBeInTheDocument();
+    });
+    // 正常に完了した回答に中断の印が付いていないことを確認する
+    // （付いてしまうと、毎回の回答に誤った注意書きが残る）
+    expect(screen.queryByText(/中断されました/)).not.toBeInTheDocument();
     // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
     await waitForIdle();
   });

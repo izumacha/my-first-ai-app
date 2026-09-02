@@ -13,6 +13,11 @@ import { parseSseDataLine, SSE_DONE_MARKER } from "@/lib/sse";
 import { trimHistoryForRequest } from "@/lib/chat-limits";
 import type { Message, CategoryId } from "@/lib/types";
 
+/** 途中で切れた回答の末尾に付ける印（§6 UI 文言は一元管理）。
+ * 画面上で「完全な回答」と見分けられるようにするのが主目的だが、この文字列は
+ * 次の質問の文脈としてもそのまま送られるため、AI 側も回答が途切れたことを読み取れる。 */
+const TRUNCATED_ANSWER_SUFFIX = "\n\n（回答はここで中断されました）";
+
 /**
  * チャット画面のメインページコンポーネント
  * ユーザーの入力を受け取り、API にストリーミングリクエストを送信し、
@@ -95,6 +100,10 @@ export default function Home() {
         const decoder = new TextDecoder();
         // ストリーミングで受信したテキストを蓄積する変数
         let accumulated = "";
+        // 回答が最後まで届いたかどうか（[DONE] を受け取れば完了）。
+        // 途中で切れた回答をそのまま履歴に残すと、見た目が完全な回答と変わらず、
+        // 次の質問ではその欠けた回答が文脈として送り返されてしまう
+        let completed = false;
         // チャンクの切れ目で分断された「行の途中」を次のチャンクまで持ち越すバッファ。
         // reader.read() は行境界と無関係な位置でデータを区切るため、バッファ無しだと
         // 分断された JSON がパース失敗として捨てられ、回答の文字が欠落してしまう
@@ -131,6 +140,8 @@ export default function Home() {
               // ストリーム終了マーカーなら読み取り全体を完了させる
               if (data === SSE_DONE_MARKER) {
                 sawDone = true;
+                // 最後まで届いたことを記録する（途中で切れた回答と区別するため）
+                completed = true;
                 break;
               }
 
@@ -162,7 +173,15 @@ export default function Home() {
           if (accumulated) {
             setMessages((prev) => [
               ...prev,
-              { role: "assistant", content: accumulated },
+              {
+                role: "assistant",
+                // 途中で切れた回答には印を付ける。印が無いと画面上は完全な回答と
+                // 見分けが付かず、しかも次の質問でこの欠けた回答が文脈として
+                // 送り返され、AI は続きがある前提で答えてしまう
+                content: completed
+                  ? accumulated
+                  : `${accumulated}${TRUNCATED_ANSWER_SUFFIX}`,
+              },
             ]);
           }
           // ストリーミング表示を必ずクリアする（エラー時の吹き出し残留を防ぐ）

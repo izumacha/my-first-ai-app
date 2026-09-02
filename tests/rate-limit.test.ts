@@ -154,15 +154,37 @@ describe("追跡表が満杯のときの挙動", () => {
     expect(limiter.trackedClientCount).toBe(2);
 
     // t=1500 では a・b は期限切れ（1500 - 500 >= 1000）だが、同じウィンドウ 1 では
-    // もう掃除しないので回収されない。満杯のままなので新規送信元は共有バケットへ回る。
-    // 掃除を毎回走らせる実装だとここで a・b が消えて追跡数は 1 になる
+    // もう掃除しないので回収されない。満杯のままなので新規送信元 c は共有バケットへ回る
     expect(limiter.isRateLimited("c", 1500)).toBe(false);
-    expect(limiter.trackedClientCount).toBe(3);
+    // 追跡表は a・b のまま（c は表に入らず共有バケットで数えられている）
+    expect(limiter.trackedClientCount).toBe(2);
+    // c が共有バケットを使ったことは、別の新規送信元 e が同じ枠を食い合うことで分かる。
+    // 掃除を毎回走らせる実装なら a・b が消えて c は自分のバケットを持つため、ここは false になる
+    expect(limiter.isRateLimited("e", 1600)).toBe(true);
 
     // ウィンドウ 2 に入れば掃除が再び走り、期限切れの a・b が回収される
-    // （回収の遅れは最大 1 ウィンドウで、取りこぼしにはならない）
+    // （回収の遅れは 1 ウィンドウ未満で、取りこぼしにはならない）
     expect(limiter.isRateLimited("d", 2000)).toBe(false);
-    expect(limiter.trackedClientCount).toBe(2);
+    // 空いた枠に d が自分のバケットを持てている
+    expect(limiter.trackedClientCount).toBe(1);
+  });
+
+  it("共有バケットは追跡表の外に持つ（上限を超えて表が膨らまない）", () => {
+    // 1 件までしか追跡できない制限器を作る
+    const limiter = createRateLimiter({
+      windowMs: 1000,
+      maxRequests: 5,
+      maxTrackedClients: 1,
+    });
+    // 1 件の送信元で表を満杯にする
+    limiter.isRateLimited("a", 0);
+    // 満杯後の新規送信元は共有バケットで数えられる
+    limiter.isRateLimited("b", 10);
+    limiter.isRateLimited("c", 20);
+    // 共有バケットを表の中のキーとして持つと、表の件数が上限を超えてしまう。
+    // 上限が小さいときは共有バケットだけで表が埋まり、実クライアントが
+    // 1 件も自分のバケットを持てなくなる
+    expect(limiter.trackedClientCount).toBe(1);
   });
 });
 

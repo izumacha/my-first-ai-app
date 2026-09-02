@@ -16,7 +16,7 @@ import { formatSseFrame, SSE_DONE_MARKER } from "@/lib/sse";
 // 入力上限はクライアントと共有する（唯一の参照元は @/lib/chat-limits）
 import { MAX_CONTENT_LENGTH, MAX_MESSAGE_COUNT } from "@/lib/chat-limits";
 // レート制限の判定ロジックと上限値（唯一の参照元は @/lib/rate-limit）
-import { createRateLimiter, RATE_LIMIT_WINDOW_MS } from "@/lib/rate-limit";
+import { createRateLimiter } from "@/lib/rate-limit";
 import type { ChatErrorResponse, Message, Role } from "@/lib/types";
 
 /** 送信元ごとのレート制限器（判定ロジックと状態は @/lib/rate-limit に集約）。
@@ -33,9 +33,12 @@ const MAX_CLIENT_KEY_LENGTH = 64;
  * （readBodyWithinLimit）。これにより検証前の巨大ボディでメモリを消費させられない。 */
 const MAX_BODY_BYTES = 1_000_000;
 
-/** 429 応答の Retry-After ヘッダに載せる待機秒数（レート制限ウィンドウと同じ長さ）。
- * クライアントが正しくバックオフできるよう、いつ再試行してよいかを明示する。 */
-const RETRY_AFTER_SECONDS = String(RATE_LIMIT_WINDOW_MS / 1000);
+/** 429 応答の Retry-After ヘッダに載せる待機秒数。
+ * クライアントが正しくバックオフできるよう、いつ再試行してよいかを明示する。
+ * 既定値ではなく**実際に使っている制限器のウィンドウ幅**から導く。既定値を読むと、
+ * 上限を差し替えたときにヘッダだけが古い値のまま残り、クライアントが誤った時間だけ
+ * 待つ（または閉じたままの窓へ再試行して 429 を重ねる）ずれが起きる。 */
+const RETRY_AFTER_SECONDS = String(rateLimiter.windowMs / 1000);
 
 /** メッセージのロールとして受け付ける値の一覧（未知のロールを Claude へ転送しない） */
 const ALLOWED_ROLES: readonly Role[] = ["user", "assistant"];
@@ -335,13 +338,14 @@ function createSseStream(
         // ここへ普通に到達する。区別せず [DONE] を送ると、途中で切れた回答が
         // 「完全な回答」としてクライアントに確定・保存され、次のターンでは
         // 欠けたままの回答が文脈として送り返される（しかもサーバには何も残らない）
+        //
+        // ここではログを出さない: 中断の理由が「クライアントがタブを閉じた」のか
+        // 「プラットフォームが実行時間上限で打ち切った」のかは区別できない。
+        // タブ閉じでも request.signal は中断され、cancel() が届く順序は保証が無いので、
+        // ログを出すと通常の離脱のたびに障害ログが積まれて本物の障害が埋もれる。
+        // 上流そのものの失敗（下の console.error）は別経路なので記録は失われない
         if (requestSignal.aborted) {
-          // 運用者が気づけるようサーバログに残す（§6 エラーを握り潰さない）
-          console.error(
-            "チャット API のストリーミングが完了前に中断されました:",
-            requestSignal.reason
-          );
-          // 受信側にも「完了していない」ことを伝える（正常完了と見分けられるようにする）
+          // 受信側には「完了していない」ことを伝える（正常完了と見分けられるようにする）
           controller.error(new Error("ストリーミングが完了前に中断されました"));
           return;
         }

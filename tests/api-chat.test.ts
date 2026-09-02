@@ -703,7 +703,8 @@ describe("POST /api/chat の上流エラーマッピング", () => {
         },
       })
     );
-    // 中断の記録が残ることを検証するためスパイを仕込む
+    // 通常のタブ閉じでも request.signal は中断されるため、この経路では
+    // サーバ障害ログを出さない（出すと通常の離脱のたびにログが積まれる）
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       // 中断シグナル付きのリクエストを送る
@@ -714,8 +715,8 @@ describe("POST /api/chat の上流エラーマッピング", () => {
       // 正常完了（[DONE] を送って close）で終わらせてはいけない。
       // 完了扱いにすると、途中で切れた回答が確定版として履歴に残る
       await expect(drainBody(res.body as ReadableStream<Uint8Array>)).rejects.toThrow();
-      // 運用者が気づけるようサーバログにも残る
-      expect(errorSpy).toHaveBeenCalled();
+      // 中断の理由（離脱かプラットフォームの打ち切りか）は区別できないので記録しない
+      expect(errorSpy).not.toHaveBeenCalled();
     } finally {
       // スパイを元に戻して他のテストへ影響させない
       errorSpy.mockRestore();
