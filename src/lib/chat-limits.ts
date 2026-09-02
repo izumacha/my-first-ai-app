@@ -128,8 +128,9 @@ export function findContentProblem(content: string): string | null {
  *          そのまま出力に残る（サーバーが理由付きの 400 を返す。次のターンでは
  *          過去の発言として切り詰められるので、その状態は 1 往復で解消する）
  * @returns 上の前提が満たされていれば、そのまま API へ送ってよい履歴
- *          （user 発言で始まり、件数は {@link MAX_MESSAGE_COUNT} 以内、
- *          本文はいずれも {@link MAX_CONTENT_LENGTH} 以内）。
+ *          （user 発言で**始まり**、user 発言で**終わり**、件数は
+ *          {@link MAX_MESSAGE_COUNT} 以内、本文はいずれも
+ *          {@link MAX_CONTENT_LENGTH} 以内）。
  *          送れる user 発言が 1 件も無い場合は空配列（送信側が呼ぶ限り、末尾は必ず
  *          今回のユーザー入力なので空にはならない）
  */
@@ -152,8 +153,18 @@ export function trimHistoryForRequest(
     start += 1;
   }
 
-  // user 発言から始まる部分を取り出す
-  const windowed = recent.slice(start);
+  // 窓の末尾が user 発言になる位置を探す。assistant 発言で終わる履歴は
+  // サーバーが 400 で弾く（上流はその続きを書いてしまうため）。先頭と同じく、
+  // 送れない形を組み立てないのはこのモジュールの役目なので、ここで整える。
+  // 呼び出し側が末尾に今回のユーザー入力を積む限り 1 件も捨てられない
+  let end = recent.length;
+  // 末尾が user 以外である間、終了位置を 1 つずつ手前へ戻す
+  while (end > start && recent[end - 1].role !== "user") {
+    end -= 1;
+  }
+
+  // user 発言で始まり user 発言で終わる部分を取り出す
+  const windowed = recent.slice(start, end);
 
   // 空になったら、履歴の中で最後の user 発言だけを送る。
   // 空配列を送るとサーバーが「メッセージを 1 件以上指定してください。」で 400 を

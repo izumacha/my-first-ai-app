@@ -35,8 +35,10 @@ function makeAlternatingHistory(count: number): Message[] {
 
 describe("trimHistoryForRequest", () => {
   it("上限以下の履歴はそのまま返す", () => {
-    // 上限ちょうどの件数の履歴を用意する
-    const history = makeAlternatingHistory(MAX_MESSAGE_COUNT);
+    // 上限ちょうどに収まり、かつ user 発言で終わる件数（奇数）の履歴を用意する。
+    // 偶数だと末尾が assistant になり、末尾を user へそろえる処理で 1 件落ちる
+    // （その形はサーバーが 400 で弾くので、送る前に落とすのが正しい）
+    const history = makeAlternatingHistory(MAX_MESSAGE_COUNT - 1);
     // 切り詰めを適用する
     const trimmed = trimHistoryForRequest(history);
     // 1 件も捨てられていないことを確認する
@@ -82,7 +84,24 @@ describe("trimHistoryForRequest", () => {
       expect(trimmed.length).toBeLessThanOrEqual(MAX_MESSAGE_COUNT);
       // 先頭が user 発言であることを確認する
       expect(trimmed[0].role).toBe("user");
+      // 末尾も user 発言であることを確認する（assistant で終わる履歴はサーバーが
+      // 400 で弾く。上流はその続きを書いてしまうため）
+      expect(trimmed[trimmed.length - 1].role).toBe("user");
     }
+  });
+
+  it("末尾が assistant 発言なら、その分を落として user 発言で終える", () => {
+    // 送信直後の失敗などで、末尾が回答のまま残っている履歴を模す
+    const history: Message[] = [
+      { role: "user", content: "質問" },
+      { role: "assistant", content: "回答" },
+    ];
+    // 切り詰めを適用する
+    const trimmed = trimHistoryForRequest(history);
+    // assistant で終わる履歴はサーバーが 400 で弾くので、送る形にして返す。
+    // 「送れない形を組み立てない」のがこのモジュールの役目で、先頭を user へ
+    // そろえるのと同じ理由（呼び出し側が末尾に質問を積む限り 1 件も捨てられない）
+    expect(trimmed).toEqual([{ role: "user", content: "質問" }]);
   });
 
   it("元の配列を書き換えない（純粋関数）", () => {
@@ -181,6 +200,7 @@ describe("本文が受付上限を超えるメッセージの扱い", () => {
     const history: Message[] = [
       { role: "user", content: "質問" },
       { role: "assistant", content: interrupted },
+      { role: "user", content: "続きを教えて" },
     ];
     // 切り詰めを適用する
     const trimmed = trimHistoryForRequest(history);
@@ -246,6 +266,7 @@ describe("本文が受付上限を超えるメッセージの扱い", () => {
     const history: Message[] = [
       { role: "user", content: "質問" },
       { role: "assistant", content },
+      { role: "user", content: "続きを教えて" },
     ];
     // 切り詰めを適用する
     const trimmed = trimHistoryForRequest(history);
