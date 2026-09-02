@@ -96,8 +96,6 @@ export default function ChatInput({ onSend, isLoading }: ChatInputProps) {
           aria-label="メッセージを入力"
           // 上限超過で弾かれている間は、支援技術にも「不正な入力」であることを伝える
           aria-invalid={inputError !== null}
-          // 理由の文章と入力欄を結び付け、読み上げでも対応が分かるようにする
-          aria-describedby={inputError ? "chat-input-error" : undefined}
           disabled={isLoading}
           className="flex-1 rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
         />
@@ -116,7 +114,9 @@ export default function ChatInput({ onSend, isLoading }: ChatInputProps) {
         <p
           // 拒否のたびに key が変わるので要素が作り直され、同じ文言でも読み上げ直される
           key={inputError.attempt}
-          id="chat-input-error"
+          // role="alert" だけで読み上げる。入力欄から aria-describedby でも
+          // 結び付けると、同じ文章が「通知」と「入力欄の説明」の 2 回読まれる。
+          // 状態そのものは aria-invalid が伝えるので、文章の紐付けは重ねない
           role="alert"
           className="text-sm text-red-700 dark:text-red-300"
         >

@@ -921,6 +921,25 @@ describe("POST /api/chat の上流エラーマッピング", () => {
     expect(res.headers.get("Retry-After")).toBe("300");
   });
 
+  it("上流 429 の Retry-After が 0 でも最低 1 秒は待たせる", async () => {
+    // 0 をそのまま伝えると「すぐ再試行してよい」の意味になり、
+    // 上流に弾かれ続けるリクエストで自前の枠まで食い潰す
+    createMock.mockImplementationOnce(() =>
+      Promise.reject(
+        new Anthropic.APIError(
+          429,
+          { type: "error", error: { type: "rate_limit_error", message: "slow down" } },
+          "rate limited",
+          new Headers({ "retry-after": "0" })
+        )
+      )
+    );
+    // 正常な形のリクエストを送る
+    const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
+    // 最低 1 秒は待たせることを確認する
+    expect(res.headers.get("Retry-After")).toBe("1");
+  });
+
   it("上流 429 に Retry-After が無ければ自前の待機時間を使う", async () => {
     // ヘッダが無い 429 を返す場合を模す
     createMock.mockImplementationOnce(() =>

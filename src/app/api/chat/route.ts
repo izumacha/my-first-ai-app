@@ -154,8 +154,10 @@ function upstreamRetryAfterSeconds(error: InstanceType<typeof Anthropic.APIError
   if (!Number.isFinite(seconds) || seconds < 0) {
     return null;
   }
-  // 端数が出ないよう切り上げた秒数を返す
-  return String(Math.ceil(seconds));
+  // 端数を切り上げつつ、最低でも 1 秒は待たせる。
+  // 0 をそのまま伝えると「すぐ再試行してよい」の意味になり、上流に弾かれ続ける
+  // リクエストで自前のレート制限の枠まで食い潰す（この関数が防ぎたいことそのもの）
+  return String(Math.max(1, Math.ceil(seconds)));
 }
 
 /**
@@ -492,7 +494,8 @@ function mapErrorToResponse(error: unknown): NextResponse<ChatErrorResponse> | R
     // 上流のレート制限（429）はそのまま 429 として返す（CLAUDE.md のステータス契約）。
     // 待機時間は上流が指定していればそれに従う（自前の待機時間は上流の都合を知らない）
     if (error.status === 429) {
-      return rateLimitedResponse(upstreamRetryAfterSeconds(error) ?? RETRY_AFTER_SECONDS);
+      // 上流の指定が無ければ引数を省略し、既定（自前の待機時間）を 1 か所に保つ
+      return rateLimitedResponse(upstreamRetryAfterSeconds(error) ?? undefined);
     }
     // 上流の 400（リクエスト内容起因のエラー）はクライアントエラーとして 400 で返す。
     // 500 に倒すとクライアント起因の問題がサーバ障害として誤って記録・表示されてしまう

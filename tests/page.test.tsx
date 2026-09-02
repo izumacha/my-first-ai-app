@@ -283,10 +283,10 @@ describe("チャット画面のストリーミング処理", () => {
     await waitFor(() => {
       expect(screen.getByText(/途中まで/)).toBeInTheDocument();
     });
-    // 中断の印が付くことを確認する。印が無いと画面上は完全な回答と区別が付かず、
+    // 途切れている印が付くことを確認する。印が無いと画面上は完全な回答と区別が付かず、
     // 次の質問ではこの欠けた回答が文脈として送り返されてしまう
     await waitFor(() => {
-      expect(screen.getByText(/中断されました/)).toBeInTheDocument();
+      expect(screen.getByText(/途切れています/)).toBeInTheDocument();
     });
     // 通信エラーの通知も併せて表示されることを確認する
     await waitFor(() => {
@@ -320,13 +320,13 @@ describe("チャット画面のストリーミング処理", () => {
     await waitFor(() => {
       expect(screen.getByText("完全な回答")).toBeInTheDocument();
     });
-    // 中断の印が付いていないことを確認する
-    expect(screen.queryByText(/中断されました/)).not.toBeInTheDocument();
+    // 途切れている印が付いていないことを確認する
+    expect(screen.queryByText(/途切れています/)).not.toBeInTheDocument();
     // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
     await waitForIdle();
   });
 
-  it("解析できない差分があった回答には中断の印を付けること", async () => {
+  it("解析できない差分があった回答には途切れている印を付けること", async () => {
     // 壊れた差分が 1 件混じるが [DONE] は普通に届く場合を模す。
     // 読み飛ばした事実を覚えていないと、欠けのある回答が完全な回答として確定する
     vi.stubGlobal(
@@ -350,9 +350,9 @@ describe("チャット画面のストリーミング処理", () => {
     await waitFor(() => {
       expect(screen.getByText(/前半/)).toBeInTheDocument();
     });
-    // 欠けがあるので中断の印が付くことを確認する
+    // 欠けがあるので途切れている印が付くことを確認する
     await waitFor(() => {
-      expect(screen.getByText(/中断されました/)).toBeInTheDocument();
+      expect(screen.getByText(/途切れています/)).toBeInTheDocument();
     });
     // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
     await waitForIdle();
@@ -379,9 +379,9 @@ describe("チャット画面のストリーミング処理", () => {
     // メッセージを送信する
     sendMessage("テスト質問");
 
-    // 欠けがあるので中断の印が付くことを確認する
+    // 欠けがあるので途切れている印が付くことを確認する
     await waitFor(() => {
-      expect(screen.getByText(/中断されました/)).toBeInTheDocument();
+      expect(screen.getByText(/途切れています/)).toBeInTheDocument();
     });
     // "undefined" が本文へ紛れ込んでいないことを確認する
     expect(screen.queryByText(/undefined/)).not.toBeInTheDocument();
@@ -413,8 +413,8 @@ describe("チャット画面のストリーミング処理", () => {
     await waitFor(() => {
       expect(screen.getByText("CR 区切りの回答")).toBeInTheDocument();
     });
-    // 完了も検出できているので中断の印は付かない
-    expect(screen.queryByText(/中断されました/)).not.toBeInTheDocument();
+    // 完了も検出できているので途切れている印は付かない
+    expect(screen.queryByText(/途切れています/)).not.toBeInTheDocument();
     // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
     await waitForIdle();
   });
@@ -444,7 +444,7 @@ describe("チャット画面のストリーミング処理", () => {
     await waitForIdle();
   });
 
-  it("最後まで届いた回答には中断の印を付けないこと", async () => {
+  it("最後まで届いた回答には途切れている印を付けないこと", async () => {
     // 差分と [DONE] を正常に流すストリームを返す
     vi.stubGlobal(
       "fetch",
@@ -467,9 +467,9 @@ describe("チャット画面のストリーミング処理", () => {
     await waitFor(() => {
       expect(screen.getByText("完全な回答")).toBeInTheDocument();
     });
-    // 正常に完了した回答に中断の印が付いていないことを確認する
+    // 正常に完了した回答に途切れている印が付いていないことを確認する
     // （付いてしまうと、毎回の回答に誤った注意書きが残る）
-    expect(screen.queryByText(/中断されました/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/途切れています/)).not.toBeInTheDocument();
     // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
     await waitForIdle();
   });

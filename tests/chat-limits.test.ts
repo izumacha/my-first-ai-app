@@ -109,6 +109,31 @@ describe("trimHistoryForRequest", () => {
     expect(trimmed.every((message) => message.content.trim() !== "")).toBe(true);
   });
 
+  it("窓に user 発言が残らなくても、空の配列は返さない", () => {
+    // 直近 50 件がすべて assistant 発言になる履歴を作る。
+    // 窓の先頭を user にそろえる処理で全部落ち、素朴な実装では空配列になる
+    const history: Message[] = [
+      { role: "user", content: "ずっと前の質問" },
+      ...Array.from({ length: MAX_MESSAGE_COUNT + 1 }, (_, i) => ({
+        role: "assistant" as const,
+        content: `回答${i}`,
+      })),
+    ];
+    // 切り詰めを適用する
+    const trimmed = trimHistoryForRequest(history);
+    // 空配列を送るとサーバーが「メッセージを 1 件以上指定してください。」で 400 を
+    // 返す ——「必ず 400 になるリクエストを送らない」ためのモジュールが、自ら
+    // その状態を作ってしまう。履歴のどこかに user 発言があればそれを送る
+    expect(trimmed.length).toBeGreaterThan(0);
+    expect(trimmed[0].role).toBe("user");
+  });
+
+  it("user 発言が 1 件も無ければ空のまま返す（送れるものが無い）", () => {
+    // assistant 発言しか無い履歴では送れるものが無いので、空のまま返す
+    const history: Message[] = [{ role: "assistant", content: "回答" }];
+    expect(trimHistoryForRequest(history)).toEqual([]);
+  });
+
   it("空の履歴は空のまま返す", () => {
     // 履歴が空の場合は切り詰める対象が無い
     expect(trimHistoryForRequest([])).toEqual([]);
@@ -139,7 +164,7 @@ describe("本文が受付上限を超えるメッセージの扱い", () => {
   });
 
   it("中断済みの回答を切り詰めても、未完了であることを示す印は残る", () => {
-    // 画面側が付けた「中断されました」の印を含む、上限を超える回答を用意する
+    // 画面側が付けた「途切れています」の印を含む、上限を超える回答を用意する
     const interrupted = `${"あ".repeat(MAX_CONTENT_LENGTH)}${TRUNCATED_ANSWER_SUFFIX}`;
     const history: Message[] = [
       { role: "user", content: "質問" },
@@ -150,7 +175,7 @@ describe("本文が受付上限を超えるメッセージの扱い", () => {
     // 上限以内に収まっていることを確認する
     expect(trimmed[1].content.length).toBeLessThanOrEqual(MAX_CONTENT_LENGTH);
     // 末尾は必ず省略の印で終わる。
-    // 「中断されました」の印は本文の末尾にあるため切り詰めで失われるが、
+    // 「途切れています」の印は本文の末尾にあるため切り詰めで失われるが、
     // 代わりに省略の印が入るので「この回答は完全ではない」という情報は残る
     // （どちらか一方でも残っていればよい、という緩い条件にすると、
     //   印を一切付けない実装に劣化しても緑のまま通ってしまう）

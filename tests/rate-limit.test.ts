@@ -137,29 +137,29 @@ describe("追跡表が満杯のときの挙動", () => {
   });
 
   it("掃除の回数はリクエスト数ではなく経過時間で決まる", () => {
-    // 掃除の最短間隔はウィンドウの 1/10 ＝ 100ms
+    // 掃除の最短間隔はウィンドウの 1/60。60000ms のウィンドウなら 1000ms になる
     const limiter = createRateLimiter({
-      windowMs: 1000,
+      windowMs: 60_000,
       maxRequests: 100,
       maxTrackedClients: 2,
     });
     // 2 件の送信元で表を満杯にする
-    limiter.isRateLimited("a", 500);
-    limiter.isRateLimited("b", 500);
+    limiter.isRateLimited("a", 5_000);
+    limiter.isRateLimited("b", 5_000);
     // 満杯になってから最初の呼び出しで 1 回目の掃除が走る
-    limiter.isRateLimited("a", 510);
+    limiter.isRateLimited("a", 5_100);
     expect(limiter.sweepCount).toBe(1);
 
-    // 同じ間隔の中で何度呼んでも掃除は増えない。
+    // 同じ間隔（1000ms）の中で何度呼んでも掃除は増えない。
     // 毎リクエスト走査する実装だと、偽装キーで表を満杯にされた状態で
     // 全リクエストが 1 万件の走査を負担することになる
-    for (let t = 520; t < 610; t += 10) {
+    for (let t = 5_200; t < 6_100; t += 100) {
       limiter.isRateLimited("a", t);
     }
     expect(limiter.sweepCount).toBe(1);
 
-    // 間隔（100ms）を越えれば次の掃除が走る
-    limiter.isRateLimited("a", 611);
+    // 間隔を越えれば次の掃除が走る
+    limiter.isRateLimited("a", 6_101);
     expect(limiter.sweepCount).toBe(2);
   });
 
@@ -246,6 +246,14 @@ describe("Retry-After の待機秒数", () => {
     expect(createRateLimiter({ windowMs: 1500 }).retryAfterSeconds).toBe(2);
     // 1 秒未満のウィンドウでも 0 ではなく 1 を返す（0 は「すぐ再試行してよい」の意味になる）
     expect(createRateLimiter({ windowMs: 200 }).retryAfterSeconds).toBe(1);
+  });
+});
+
+describe("上流の Retry-After の扱い", () => {
+  it("0 秒でも最低 1 秒は待たせる", () => {
+    // 0 を返すと「すぐ再試行してよい」の意味になり、上流に弾かれ続ける
+    // リクエストで自前のレート制限の枠まで食い潰す
+    expect(createRateLimiter({ windowMs: 1 }).retryAfterSeconds).toBe(1);
   });
 });
 
