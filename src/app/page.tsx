@@ -8,7 +8,7 @@ import { useState, useCallback } from "react";
 import ChatContainer from "@/components/ChatContainer";
 import ChatInput from "@/components/ChatInput";
 import CategoryChips from "@/components/CategoryChips";
-import { parseSseDataLine, splitSseLines, SSE_DONE_MARKER } from "@/lib/sse";
+import { readSseAnswer } from "@/lib/sse";
 // 送信する会話履歴をサーバーの受付上限まで切り詰めるヘルパー（上限の定義元は @/lib/chat-limits）
 import {
   findContentProblem,
@@ -149,98 +149,37 @@ export default function Home() {
         // ここまで来たら応答の読み取りに入る（接続は成立している）
         startedStreaming = true;
 
-        // テキストデコーダーを準備する
-        const decoder = new TextDecoder();
-        // ストリーミングで受信したテキストを蓄積する変数
-        let accumulated = "";
-        // チャンクの切れ目で分断された「行の途中」を次のチャンクまで持ち越すバッファ。
-        // reader.read() は行境界と無関係な位置でデータを区切るため、バッファ無しだと
-        // 分断された JSON がパース失敗として捨てられ、回答の文字が欠落してしまう
-        let lineBuffer = "";
-        // 終了マーカー [DONE] を受信したかどうかのフラグ（外側の読み取りループも止めるため）
-        let sawDone = false;
-        // 解析できずに読み飛ばした差分があったかどうか（回答に欠けがある印）
-        let droppedFrame = false;
+        // 受信済みの本文を保持する（途中で切れても画面に残せるよう、読み取り側から
+        // コールバックで受け取る。読み取りが例外で終わると戻り値は得られない）
+        let received = "";
+        // 完了として扱ってよいか（終端の番兵を受け取り、読み飛ばしも無かったか）
+        let completed = false;
 
         try {
-          // ストリームからデータを順次読み取るループ
-          while (!sawDone) {
-            // チャンクを読み取る
-            const { done, value } = await reader.read();
+          // SSE の読み取りは @/lib/sse に集約している（書式・行区切りと同じ場所）。
+          // 本文が伸びるたびに受け取り、画面の途中表示を更新する
+          const answer = await readSseAnswer(reader, (text) => {
+            received = text;
+            setStreamingText(text);
+          });
+          // 完了したかを控える（例外で終わった場合はここへ来ないので false のまま）
+          completed = answer.completed;
 
-            // ストリーム終了なら停止する
-            if (done) break;
-
-            // バイナリデータを文字列にデコードし、持ち越し分と連結する
-            lineBuffer += decoder.decode(value, { stream: true });
-
-            // SSE 形式の行に切り分ける（行区切りの規則は @/lib/sse に集約）。
-            // 未完の行は次のチャンクへ持ち越し、完結した行だけを処理する
-            const { lines, remainder } = splitSseLines(lineBuffer);
-            lineBuffer = remainder;
-
-            for (const line of lines) {
-              // データ行なら本文を取り出す（データ行でなければ null が返る。書式は @/lib/sse に集約）
-              const data = parseSseDataLine(line);
-
-              // データ行でない行（フレーム区切りの空行など）は読み飛ばす
-              if (data === null) {
-                continue;
-              }
-
-              // ストリーム終了マーカーなら読み取り全体を完了させる
-              if (data === SSE_DONE_MARKER) {
-                sawDone = true;
-                break;
-              }
-
-              try {
-                // JSON をパースしてテキスト差分を取得する
-                const parsed = JSON.parse(data) as { text?: unknown };
-                // 期待した形（text が文字列）でなければ差分として使えない。
-                // 型を確かめずに足すと "undefined" や数値が本文へ紛れ込み、
-                // しかも解析は成功しているので「完全な回答」として確定してしまう
-                if (typeof parsed.text !== "string") {
-                  throw new TypeError("差分の形式が想定と異なります");
-                }
-                // 蓄積テキストに差分を追加する
-                accumulated += parsed.text;
-                // ストリーミング表示を更新する
-                setStreamingText(accumulated);
-              } catch (parseError) {
-                // 壊れた差分は表示できないので飛ばすが、黙って捨てない。
-                // 捨てた事実を覚えておかないと、[DONE] は普通に届くため
-                // 「欠けのある回答」が完全な回答として履歴に確定してしまう
-                // （未完了の回答には必ず印を付ける、という約束が崩れる）。
-                //
-                // ログに残すのは最初の 1 件だけにする。ここは行ごとのループなので、
-                // 壊れた差分を流し続ける上流にあたると回答 1 本で数百件のログが出て
-                // ブラウザのコンソールが埋まってしまう（読み飛ばした事実は
-                // droppedFrame が 1 度覚えれば印を付けるのに足りる）
-                if (!droppedFrame) {
-                  console.debug(
-                    "差分の解析に失敗したため読み飛ばしました:",
-                    parseError
-                  );
-                }
-                droppedFrame = true;
-              }
-            }
-          }
           // ここへ来たのは読み取りが例外なく終わったときだけ（＝通信は成功した）。
           // それでも 1 文字も受け取れていないなら、黙って何も起きなかったように
           // 終わらせない。ローディングだけ止まって画面に何も出ないと、
           // ユーザーは失敗に気づかず再送して上流の呼び出しを重ねる。
           // finally 側で判定すると失敗経路でも走り、外側の catch が上書きする順序に
           // 依存した「たまたま正しい」状態になる
-          if (!accumulated.trim()) {
+          if (!received.trim()) {
             setError(MESSAGES.emptyAnswer);
           }
         } finally {
-          // 読み取りを終えた reader を必ず解放する。[DONE] を受信して while を抜けた
-          // 場合、レスポンスボディは reader にロックされたまま未消費として残るため、
-          // ブラウザが HTTP コネクションを再利用できず握ったままになる。成功・失敗の
-          // どちらの経路でも通るこの finally で解放する（§8 リソースを確実に解放する）
+          // 読み取りを終えた reader を必ず解放する。[DONE] を受信して読み取りを
+          // 終えた場合、レスポンスボディは reader にロックされたまま未消費として
+          // 残るため、ブラウザが HTTP コネクションを再利用できず握ったままになる。
+          // 成功・失敗のどちらの経路でも通るこの finally で解放する
+          // （§8 リソースを確実に解放する）
           await reader.cancel().catch((cancelError: unknown) => {
             // 既にエラーで終了したストリームの cancel は reject するが、目的は解放なので
             // 失敗しても実害は無い。それでも黙って捨てず debug ログには残す（§6）
@@ -251,7 +190,7 @@ export default function Home() {
           // 消えたうえ、宙に浮いた吹き出しが次の送信まで表示され続けてしまう。
           // 空白だけの回答は残さない。残すとサーバーの検証（本文が空）で以降の
           // 送信がすべて 400 になり、往復が成立しないので窓からも抜けない
-          if (accumulated.trim()) {
+          if (received.trim()) {
             setMessages((prev) => [
               ...prev,
               {
@@ -259,13 +198,9 @@ export default function Home() {
                 // 途中で切れた回答には印を付ける。印が無いと画面上は完全な回答と
                 // 見分けが付かず、しかも次の質問でこの欠けた回答が文脈として
                 // 送り返され、AI は続きがある前提で答えてしまう
-                // [DONE] を受け取れていれば完了。sawDone は読み取りループの
-                // 制御にも使っている同じ事実なので、別の変数へ写し取らない
-                // （2 つに分けると片方だけ変わって静かに食い違う）
-                content:
-                  sawDone && !droppedFrame
-                    ? accumulated
-                    : `${accumulated}${TRUNCATED_ANSWER_SUFFIX}`,
+                content: completed
+                  ? received
+                  : `${received}${TRUNCATED_ANSWER_SUFFIX}`,
               },
             ]);
           }
@@ -288,8 +223,12 @@ export default function Home() {
         // 残って原因を追う手がかりが消える。
         // ただし、途切れた回答を印付きで残せているケースは長い回答で日常的に
         // 起こりうるので、障害として積み上げず debug に落とす
+        // 途切れは日常的に起こるので error では積み上げない。ただし debug だと
+        // ブラウザの既定のログレベルでは表示されず、ここへ紛れ込む実装の不具合
+        // （try の中で投げられた TypeError 等）が誰にも見えないまま
+        // 「回答を最後まで受け取れませんでした」だけが出続ける。既定で見える warn にする
         if (startedStreaming) {
-          console.debug("配信が完了前に終わりました:", requestError);
+          console.warn("配信が完了前に終わりました:", requestError);
         } else {
           console.error("チャットのリクエストに失敗しました:", requestError);
         }

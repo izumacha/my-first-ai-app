@@ -73,3 +73,106 @@ export function splitSseLines(buffer: string): {
   // 完結した行と持ち越し分を返す
   return { lines: parts, remainder };
 }
+
+/**
+ * SSE のストリームを最後まで読み、届いた回答本文と完了したかどうかを返す。
+ *
+ * <p>読み取りループを画面から切り離すのは 2 つの理由がある。
+ * (1) `page.tsx` 側に可変状態（蓄積・行バッファ・番兵・読み飛ばし）が 5 つ並び、
+ * 内側の finally → 外側の catch → 外側の finally という実行順に依存して
+ * どのエラー表示が勝つかが決まる状態になっていた。順序を崩す改修が事故になりやすい。
+ * (2) ここは実質的に純粋な変換（バイト列 → 本文＋完了したか）なので、書式・行区切りと
+ * 同じこのモジュールに置けば `tests/sse.test.ts` の契約テストの射程に入る。
+ *
+ * <p>**例外はそのまま呼び出し元へ投げる。** 途中で切れた配信でも受信済みの本文は
+ * 画面に残す必要があるため、呼び出し元は `onText` で受け取った最新の本文を使う
+ * （関数の戻り値は完了した場合にしか得られない）。
+ *
+ * @param reader - レスポンスボディの読み取り口
+ * @param onText - 本文が伸びるたびに呼ばれるコールバック（引数は先頭からの累積）
+ * @returns 受信した本文と、完了として扱ってよいか（終端の番兵を受け取り、かつ
+ *          読み飛ばした差分が無い場合だけ true）
+ */
+export async function readSseAnswer(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  onText: (text: string) => void
+): Promise<{ text: string; completed: boolean }> {
+  // バイト列を文字列へ戻すデコーダーを用意する
+  const decoder = new TextDecoder();
+  // 受信した本文を先頭から蓄積する
+  let accumulated = "";
+  // チャンクの切れ目で分断された「行の途中」を次のチャンクまで持ち越すバッファ。
+  // read() は行境界と無関係な位置でデータを区切るため、バッファ無しだと
+  // 分断された JSON がパース失敗として捨てられ、回答の文字が欠落してしまう
+  let lineBuffer = "";
+  // 終端の番兵 [DONE] を受け取ったか
+  let sawDone = false;
+  // 解析できずに読み飛ばした差分があったか（回答に欠けがある印）
+  let droppedFrame = false;
+
+  // 終端の番兵を受け取るまで読み続ける
+  while (!sawDone) {
+    // 次のかたまりを読み取る
+    const { done, value } = await reader.read();
+
+    // ストリームが終わったら抜ける（番兵が来ていなければ未完了として扱われる）
+    if (done) break;
+
+    // バイナリデータを文字列にデコードし、持ち越し分と連結する
+    lineBuffer += decoder.decode(value, { stream: true });
+
+    // SSE 形式の行に切り分ける。未完の行は次のチャンクへ持ち越す
+    const { lines, remainder } = splitSseLines(lineBuffer);
+    lineBuffer = remainder;
+
+    // 完結した行を順に処理する
+    for (const line of lines) {
+      // データ行なら本文を取り出す（データ行でなければ null が返る）
+      const data = parseSseDataLine(line);
+
+      // データ行でない行（フレーム区切りの空行など）は読み飛ばす
+      if (data === null) {
+        continue;
+      }
+
+      // 終端の番兵なら読み取り全体を完了させる
+      if (data === SSE_DONE_MARKER) {
+        sawDone = true;
+        break;
+      }
+
+      try {
+        // JSON をパースしてテキスト差分を取得する
+        const parsed = JSON.parse(data) as { text?: unknown };
+        // 期待した形（text が文字列）でなければ差分として使えない。
+        // 型を確かめずに足すと "undefined" や数値が本文へ紛れ込み、
+        // しかも解析は成功しているので「完全な回答」として確定してしまう
+        if (typeof parsed.text !== "string") {
+          throw new TypeError("差分の形式が想定と異なります");
+        }
+        // 蓄積テキストに差分を追加する
+        accumulated += parsed.text;
+        // 伸びた本文を呼び出し元へ渡す（画面の途中表示と、失敗時の取り出しに使う）
+        onText(accumulated);
+      } catch (parseError) {
+        // 壊れた差分は表示できないので飛ばすが、黙って捨てない。
+        // 捨てた事実を覚えておかないと、[DONE] は普通に届くため
+        // 「欠けのある回答」が完全な回答として確定してしまう
+        // （未完了の回答には必ず印を付ける、という約束が崩れる）。
+        //
+        // ログに残すのは最初の 1 件だけにする。ここは行ごとのループなので、
+        // 壊れた差分を流し続ける上流にあたると回答 1 本で数百件のログが出て
+        // ブラウザのコンソールが埋まってしまう（読み飛ばした事実は
+        // droppedFrame が 1 度覚えれば印を付けるのに足りる）
+        if (!droppedFrame) {
+          console.debug("差分の解析に失敗したため読み飛ばしました:", parseError);
+        }
+        droppedFrame = true;
+      }
+    }
+  }
+
+  // 本文と、完了として扱ってよいかを返す。
+  // 番兵を受け取っていても読み飛ばした差分があれば「欠けのある回答」なので完了にしない
+  return { text: accumulated, completed: sawDone && !droppedFrame };
+}
