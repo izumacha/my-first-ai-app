@@ -53,6 +53,15 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
 
   /**
+   * 画面上部の通知（前回の送信の結果）を消す処理
+   * 入力欄が送信を止めたときに呼ばれ、関係の無い古い通知が残らないようにする。
+   */
+  const clearError = useCallback(() => {
+    // エラー表示を消す
+    setError(null);
+  }, []);
+
+  /**
    * メッセージ送信処理
    * ユーザーのメッセージを会話履歴に追加し、API にストリーミングリクエストを送る。
    */
@@ -278,7 +287,11 @@ export default function Home() {
       <ChatContainer messages={messages} streamingText={streamingText} />
 
       {/* メッセージ入力フォームを表示する */}
-      <ChatInput onSend={handleSend} isLoading={isLoading} />
+      <ChatInput
+        onSend={handleSend}
+        onClearError={clearError}
+        isLoading={isLoading}
+      />
     </div>
   );
 }

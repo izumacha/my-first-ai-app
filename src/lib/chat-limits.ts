@@ -47,11 +47,12 @@ export const CONTENT_EMPTY_MESSAGE = "メッセージ本文を入力してくだ
  * 古いまま残る。{@link CONTENT_TOO_LONG_MESSAGE} と同じ理由でここに置く。 */
 export const TOO_MANY_MESSAGES_MESSAGE = `メッセージ数が上限（${MAX_MESSAGE_COUNT} 件）を超えています。`;
 
-/** 上限を超えた assistant 発言を切り詰めたときに末尾へ付ける印。
- * 印なしで切ると、AI から見て「そこで終わった回答」と区別が付かず、
+/** 上限を超えた過去の発言を切り詰めたときに末尾へ付ける印。
+ * 印なしで切ると、AI から見て「そこで終わった発言」と区別が付かず、
  * 続きを尋ねたときに省略された部分を踏まえない答えが返る。
+ * user / assistant のどちらの発言にも付くので文言は「発言」で中立にしてある。
  * 切り口の位置を導くのにこの長さが要るため export する（テストからも参照する）。 */
-export const OMITTED_ANSWER_SUFFIX = "\n\n（以前の回答はここで省略されました）";
+export const OMITTED_MESSAGE_SUFFIX = "\n\n（以前の発言はここで省略されました）";
 
 /** 最後まで届かなかった回答の末尾に画面側が付ける印（§6 UI 文言は一元管理）。
  *
@@ -63,7 +64,7 @@ export const OMITTED_ANSWER_SUFFIX = "\n\n（以前の回答はここで省略�
  * AI 側が「起きていない中断」を謝る材料にもなってしまう。
  *
  * <p>`page.tsx` が表示・保存する文言だが、定義はここに置く。理由は 2 つある。
- * (1) この印は**末尾にある**ことを前提に {@link OMITTED_ANSWER_SUFFIX} 側の
+ * (1) この印は**末尾にある**ことを前提に {@link OMITTED_MESSAGE_SUFFIX} 側の
  * 切り詰め位置を決めており、片方だけ変えるとその設計根拠が黙って崩れる。
  * (2) 同じ「送信する本文の作り方」に関わる約束事なので、`src/lib/sse.ts` と同じく
  * 送信側と表示側の唯一の参照元を 1 か所に置く。 */
@@ -155,12 +156,33 @@ export function trimHistoryForRequest(
     return lastUserMessage ? [lastUserMessage] : [];
   }
 
-  // assistant 発言の本文は受付上限に収めて返す
-  return windowed.map(capAssistantContent);
+  // 過去の発言の本文は受付上限に収めて返す。
+  // 例外は末尾の user 発言（＝いま送ろうとしている質問）だけで、そこは削らない
+  return windowed.map((message, index) =>
+    isCurrentQuestion(message, index, windowed.length)
+      ? message
+      : capContent(message)
+  );
 }
 
 /**
- * assistant 発言の本文だけを受付上限の文字数に収める。
+ * その発言が「いま送ろうとしている質問」かを判定する。
+ * @param message - 判定する発言
+ * @param index - 窓の中での位置
+ * @param length - 窓の件数
+ * @returns 末尾の user 発言なら true
+ */
+function isCurrentQuestion(
+  message: Message,
+  index: number,
+  length: number
+): boolean {
+  // 窓の末尾にある user 発言だけが「これから尋ねる質問」に当たる
+  return index === length - 1 && message.role === "user";
+}
+
+/**
+ * 過去の発言の本文を受付上限の文字数に収める。
  *
  * <p>**assistant 発言は上流 Claude の回答なのでこちら側では長さを制御できない**。
  * max_tokens を広げているカテゴリ（料理・手続き）では上限を超える回答が返りうる。
@@ -169,23 +191,21 @@ export function trimHistoryForRequest(
  * 全部 400 になるため、件数上限のときとまったく同じ「再読み込みするまで復帰
  * できない」状態になる。発言ごと捨てず切り詰めるのは、会話のターン構成
  * （誰がいつ何を言ったか）を保ったまま送れるようにするため。画面に表示する履歴は
- * 切り詰めないので、ユーザーから見える回答が欠けることはない。
+ * 切り詰めないので、ユーザーから見える発言が欠けることはない。
  *
- * <p><b>user 発言は切り詰めない。</b> こちらはユーザーが打った文章そのものなので、
- * 黙って削ると「質問が途中で切れたことに気づけないまま送信される」ことになる
- * （入力欄に maxLength を付けないのと同じ理由。§7 状態はテキストで伝える）。
- * 上限を超えた user 発言はそのまま送り、サーバーが理由付きの 400 を返して
- * 画面に表示されるほうが「何が起きたか」が伝わる。
+ * <p><b>いま尋ねようとしている質問（末尾の user 発言）だけは切り詰めない。</b>
+ * ユーザーが打ったばかりの文章を黙って削ると、「質問が途中で切れたことに
+ * 気づけないまま送信される」ことになる（入力欄に maxLength を付けないのと同じ理由。
+ * §7 状態はテキストで伝える）。そちらは `findContentProblem` が送信前に理由付きで
+ * 弾き、万一すり抜けてもサーバーが理由付きの 400 を返す。
+ * <b>一方、過去の user 発言は切り詰める。</b> 履歴から読み直されるだけの文章は
+ * もう編集できないので、削らずに送ると「必ず 400 になるのに窓からも抜けない」
+ * 状態を作ってしまい、このモジュールが塞いだはずの穴がロール違いで再発する。
  *
  * @param message - 送信候補のメッセージ
- * @returns assistant 発言なら本文が上限以内に収まったもの、それ以外はそのまま
- *          （元のオブジェクトは変更しない）
+ * @returns 本文が上限以内に収まったもの（元のオブジェクトは変更しない）
  */
-function capAssistantContent(message: Message): Message {
-  // user 発言は削らずそのまま送る（超過はサーバーが理由付きの 400 で知らせる）
-  if (message.role !== "assistant") {
-    return message;
-  }
+function capContent(message: Message): Message {
   // 上限以内ならそのまま使う（無駄なオブジェクト生成もしない）
   if (message.content.length <= MAX_CONTENT_LENGTH) {
     return message;
@@ -201,7 +221,7 @@ function capAssistantContent(message: Message): Message {
   // ほぼ全文を返して上限を超える（そのまま送ると復帰できない 400 になる）。
   // そもそもそんな設定にしないことは FieldLengths 的な不変条件としてテストで固定
   // しているが、計算そのものも反転しないようにしておく
-  let end = Math.max(0, MAX_CONTENT_LENGTH - OMITTED_ANSWER_SUFFIX.length);
+  let end = Math.max(0, MAX_CONTENT_LENGTH - OMITTED_MESSAGE_SUFFIX.length);
   // 切り口がサロゲートペア（絵文字など 2 単位で 1 文字を表す並び）の途中なら 1 つ手前で切る。
   // 片割れだけ残すと文字として成立しない値を上流へ送ることになる
   if (isHighSurrogate(message.content.charCodeAt(end - 1))) {
@@ -211,7 +231,7 @@ function capAssistantContent(message: Message): Message {
   // ロールはそのままに、切り詰めた本文＋省略の印を持つ新しいメッセージを返す
   return {
     role: message.role,
-    content: `${message.content.slice(0, end)}${OMITTED_ANSWER_SUFFIX}`,
+    content: `${message.content.slice(0, end)}${OMITTED_MESSAGE_SUFFIX}`,
   };
 }
 

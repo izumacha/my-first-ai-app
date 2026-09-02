@@ -276,6 +276,23 @@ describe("POST /api/chat の入力検証", () => {
     expect(res.status).toBe(400);
   });
 
+  it("assistant 発言で始まる履歴は上流を呼ばずに 400 を返す", async () => {
+    // 上流 Claude は「最初のメッセージが user ロール」であることを要求するため、
+    // この形は必ず上流で 400 になる。画面側（trimHistoryForRequest）は窓の先頭を
+    // user にそろえて防いでいるが、保証を送信側だけに置くと、画面以外の
+    // 呼び出し元では消えてしまう（入力を信用しない境界はサーバー側）
+    const res = await POST(
+      makeRequest(
+        { messages: [{ role: "assistant", content: "回答" }] },
+        uniqueIp()
+      )
+    );
+    // 400 が返ることを確認する
+    expect(res.status).toBe(400);
+    // 上流を 1 往復むだに呼んでいないことを確認する（課金と待ち時間が発生する）
+    expect(createMock).not.toHaveBeenCalled();
+  });
+
   it("正常なリクエストは SSE ストリーム（200）を返す", async () => {
     // 正常なメッセージを送る
     const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));

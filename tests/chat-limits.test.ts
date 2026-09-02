@@ -12,7 +12,7 @@ import {
   MAX_BODY_BYTES,
   MAX_CONTENT_LENGTH,
   MAX_MESSAGE_COUNT,
-  OMITTED_ANSWER_SUFFIX,
+  OMITTED_MESSAGE_SUFFIX,
   TRUNCATED_ANSWER_SUFFIX,
   trimHistoryForRequest,
 } from "@/lib/chat-limits";
@@ -182,19 +182,38 @@ describe("本文が受付上限を超えるメッセージの扱い", () => {
     // 代わりに省略の印が入るので「この回答は完全ではない」という情報は残る
     // （どちらか一方でも残っていればよい、という緩い条件にすると、
     //   印を一切付けない実装に劣化しても緑のまま通ってしまう）
-    expect(trimmed[1].content.endsWith(OMITTED_ANSWER_SUFFIX)).toBe(true);
+    expect(trimmed[1].content.endsWith(OMITTED_MESSAGE_SUFFIX)).toBe(true);
   });
 
-  it("上限を超える user 発言は切り詰めない（黙って質問を削らない）", () => {
+  it("いま送る質問（末尾の user 発言）は切り詰めない（黙って質問を削らない）", () => {
     // ユーザーが上限を超える長文を貼り付けた場合を模す
     const longQuestion = "あ".repeat(MAX_CONTENT_LENGTH + 500);
     const history: Message[] = [{ role: "user", content: longQuestion }];
     // 切り詰めを適用する
     const trimmed = trimHistoryForRequest(history);
-    // user 発言はそのまま送る。ここで黙って削ると、ユーザーは質問が途中で
-    // 切れたことに気づけないまま送信してしまう（サーバーが理由付きの 400 を
-    // 返し、画面にその理由が出るほうが「何が起きたか」が伝わる）
+    // これから尋ねる質問はそのまま送る。ここで黙って削ると、ユーザーは質問が
+    // 途中で切れたことに気づけないまま送信してしまう（findContentProblem が
+    // 送信前に弾き、すり抜けてもサーバーが理由付きの 400 を返して画面に出る）
     expect(trimmed[0].content).toBe(longQuestion);
+  });
+
+  it("過去の user 発言は切り詰める（復帰できない 400 を作らない）", () => {
+    // 上限を超える user 発言が履歴に残っている状態を模す
+    const history: Message[] = [
+      { role: "user", content: "あ".repeat(MAX_CONTENT_LENGTH + 500) },
+      { role: "assistant", content: "回答" },
+      { role: "user", content: "次の質問" },
+    ];
+    // 切り詰めを適用する
+    const trimmed = trimHistoryForRequest(history);
+    // 過去の発言はもう編集できないので、そのまま送るとサーバーが必ず 400 を返し、
+    // 往復が成立しないので 50 件の窓からも抜けず、再読み込みまで復帰できない。
+    // ロールが違うだけで、このモジュールが塞いだはずの穴がそのまま再発する
+    for (const message of trimmed) {
+      expect(message.content.length).toBeLessThanOrEqual(MAX_CONTENT_LENGTH);
+    }
+    // 省略した事実は本文に残す（印なしで削ると「そこで終わった発言」と区別が付かない）
+    expect(trimmed[0].content.endsWith(OMITTED_MESSAGE_SUFFIX)).toBe(true);
   });
 
   it("上限以内のメッセージは同じオブジェクトのまま返す（不要な複製をしない）", () => {
@@ -212,7 +231,7 @@ describe("本文が受付上限を超えるメッセージの扱い", () => {
     // 置く。上限そのものを境界だと思って組み立てると切り口が絵文字から外れ、
     // ガードを外しても落ちない空振りのテストになる（実測で確認済み）
     const emoji = "😀";
-    const cutIndex = MAX_CONTENT_LENGTH - OMITTED_ANSWER_SUFFIX.length;
+    const cutIndex = MAX_CONTENT_LENGTH - OMITTED_MESSAGE_SUFFIX.length;
     const content = "あ".repeat(cutIndex - 1) + emoji + "あ".repeat(100);
     // その本文を持つ assistant 発言を含む履歴を用意する
     const history: Message[] = [
@@ -227,7 +246,7 @@ describe("本文が受付上限を超えるメッセージの扱い", () => {
     // 印を付けたあとの末尾を見ると常に印の最後の文字になり、切り口を検査できない
     const body = trimmed[1].content.slice(
       0,
-      trimmed[1].content.length - OMITTED_ANSWER_SUFFIX.length
+      trimmed[1].content.length - OMITTED_MESSAGE_SUFFIX.length
     );
     // 切り口に片割れだけのサロゲートが残っていないことを確認する。
     // 残っていると文字として成立しない値を上流へ送ることになる
@@ -269,7 +288,7 @@ describe("共有する入力上限", () => {
     // 印のほうが長いと、切り詰めの計算（上限 − 印の長さ）が負になり、
     // 切り詰めたつもりがほぼ全文を返して上限を超える。上限は定数なので
     // 実行時ではなくここで固定しておけば、設定ミスは CI で必ず落ちる
-    expect(MAX_CONTENT_LENGTH).toBeGreaterThan(OMITTED_ANSWER_SUFFIX.length);
+    expect(MAX_CONTENT_LENGTH).toBeGreaterThan(OMITTED_MESSAGE_SUFFIX.length);
   });
 
   it("件数 × 文字数の最大ペイロードが本文サイズ上限に収まる", () => {

@@ -12,6 +12,11 @@ import { findContentProblem } from "@/lib/chat-limits";
 interface ChatInputProps {
   /** メッセージ送信時に呼ばれるコールバック関数 */
   onSend: (message: string) => void;
+  /** 直前の送信についての通知（画面上部のエラー）を消すコールバック関数。
+   * 送信を止めたときに呼ぶ。呼ばないと、前回の失敗の通知（429 など）が
+   * 残ったまま入力欄の下にも別の理由が出て、role="alert" が 2 つ同時に並び、
+   * いま行った操作と関係の無い理由まで読み上げられてしまう */
+  onClearError: () => void;
   /** 送信中かどうか（true の間は送信ボタンを無効化する） */
   isLoading: boolean;
 }
@@ -20,7 +25,11 @@ interface ChatInputProps {
  * チャットの入力フォームを表示するコンポーネント
  * Enter キーまたは送信ボタンでメッセージを送信する。
  */
-export default function ChatInput({ onSend, isLoading }: ChatInputProps) {
+export default function ChatInput({
+  onSend,
+  onClearError,
+  isLoading,
+}: ChatInputProps) {
   // 入力欄のテキストを管理する state
   const [input, setInput] = useState("");
   // 送信前の検証で弾いた理由を保持する state（問題が無ければ null）。
@@ -52,6 +61,10 @@ export default function ChatInput({ onSend, isLoading }: ChatInputProps) {
     // 入力はあえて消さない（消すと、長文を貼り付けた人がその文章ごと失う）
     const problem = findContentProblem(trimmed);
     if (problem) {
+      // 直前の送信についての通知（画面上部のエラー）を消す。
+      // 消さないと、前回の失敗の通知と今回の理由が role="alert" として 2 つ並び、
+      // いま行った操作と関係の無い理由まで読み上げられる
+      onClearError();
       // 拒否の回数を進めて記録する（同じ文言でも読み上げが再び走るようにする）
       setInputError((previous) => ({
         message: problem,

@@ -102,12 +102,19 @@ const ERROR_MESSAGES = {
   /** 本文が文字列でない・空のときの文言（画面側の送信前検証と共有する。
    * 書き写すと、片方だけ直したときに同じ拒否理由が 2 つの文言で現れる） */
   messageContentEmpty: CONTENT_EMPTY_MESSAGE,
+  /** 会話履歴が user 発言で始まっていないときの文言 */
+  messagesMustStartWithUser: "会話履歴は user の発言から始めてください。",
 } as const;
 
 /** SSE のチャンクを組み立てる際に使い回すエンコーダ。
  * イベントごとに new TextEncoder() すると生成コストが無駄に積み上がるため 1 つを共有する
  * （TextEncoder は状態を持たず、使い回しても安全）。 */
 const sseEncoder = new TextEncoder();
+
+/** リクエストボディのバイト列を文字列へ戻すときに使い回すデコーダ。
+ * リクエストごとに new TextDecoder() する必要は無い（1 回の decode で完結する
+ * 使い方では状態を持たない）ので、上の sseEncoder と同じ理由で 1 つを共有する。 */
+const bodyDecoder = new TextDecoder();
 
 /**
  * エラー応答（JSON）を組み立てる共通ヘルパー。
@@ -285,8 +292,8 @@ async function readBodyWithinLimit(
     // 次のコピー開始位置をチャンク分だけ進める
     offset += chunk.byteLength;
   }
-  // バイト列を UTF-8 文字列に変換して返す
-  return new TextDecoder().decode(merged);
+  // バイト列を UTF-8 文字列に変換して返す（デコーダはモジュールで共有する）
+  return bodyDecoder.decode(merged);
 }
 
 /**
@@ -329,6 +336,14 @@ function validateMessages(messages: unknown): string | null {
     if (content.length > MAX_CONTENT_LENGTH) {
       return CONTENT_TOO_LONG_MESSAGE;
     }
+  }
+  // 先頭が user 発言でない履歴は上流 Claude が必ず 400 で拒否するため、ここで弾く。
+  // 画面側（trimHistoryForRequest）は窓の先頭が user になるまで古い側を捨てて
+  // この形を保証しているが、保証を送信側だけに置くと上流を 1 往復むだに呼ぶ
+  // （課金と待ち時間が発生する）うえ、画面以外の呼び出し元では保証が消える。
+  // 検証はこの層（入力は信用しない境界）に置く
+  if ((messages[0] as Message).role !== "user") {
+    return ERROR_MESSAGES.messagesMustStartWithUser;
   }
   // すべての検証を通過したら問題なし（null）を返す
   return null;
@@ -450,11 +465,11 @@ function createSseStream(
         // いるので黙って閉じてはいけない。[DONE] なしで close() すると、読み手は
         // done で抜けて「完全な回答」として確定させてしまい、正常完了と区別が付かない。
         // error() なら終端も伝わる（宙吊りにならない）うえ、切れたことも伝わる
+        // なお、受信側が既に切断していれば error() は仕様上その場で戻る（何も起きない）
+        // ので、切断の有無で呼び分ける必要はない。呼び分けが要るのは enqueue() /
+        // close() のほうで、あちらは切断後に呼ぶと TypeError になる
         if (isAbortError(error)) {
-          // 受信側がいなければ伝える相手もいないので何もしない
-          if (!cancelledByConsumer) {
-            controller.error(error);
-          }
+          controller.error(error);
           return;
         }
 
@@ -468,11 +483,8 @@ function createSseStream(
           error
         );
 
-        // 受信側が残っているときだけエラーを伝える
-        // （cancel() 済みの controller へ error() を呼ぶ意味は無い）
-        if (!cancelledByConsumer) {
-          controller.error(error);
-        }
+        // 受信側へ失敗を伝える（切断済みなら上と同じく何も起きない）
+        controller.error(error);
       }
     },
     cancel() {
