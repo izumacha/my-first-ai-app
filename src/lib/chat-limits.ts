@@ -58,6 +58,28 @@ export const OMITTED_ANSWER_SUFFIX = "\n\n（以前の回答はここで省略�
 export const TRUNCATED_ANSWER_SUFFIX = "\n\n（回答はここで中断されました）";
 
 /**
+ * 送信しようとしている本文に問題があれば、その理由を返す。
+ *
+ * <p>上限の規則をここに 1 つだけ置き、**表示する側（入力欄）と送る側（画面）の
+ * 両方がこれを呼ぶ**。判定を書き写すと、片方だけ直したときに「入力欄は通すのに
+ * サーバーが弾く」ずれが生まれる。両者は役割が違うので、どちらも必要:
+ * 入力欄は「入力を消さずに理由を見せる」ための表示、送る側は「上限を超えた本文を
+ * 履歴に積ませない」ための防御（積むとサーバーが 400 を返す一方で履歴には残り、
+ * 往復が成立しないので窓からも抜けず、再読み込みするまで復帰できなくなる）。
+ *
+ * @param content - 送信しようとしている本文
+ * @returns 問題があれば表示する理由、問題なければ null
+ */
+export function findContentProblem(content: string): string | null {
+  // 上限を超えていれば、その理由を返す
+  if (content.length > MAX_CONTENT_LENGTH) {
+    return CONTENT_TOO_LONG_MESSAGE;
+  }
+  // 問題が無ければ null を返す
+  return null;
+}
+
+/**
  * 送信する会話履歴を上限件数まで切り詰める。
  *
  * <p>単純に直近 {@link MAX_MESSAGE_COUNT} 件を切り出すだけでは足りない。

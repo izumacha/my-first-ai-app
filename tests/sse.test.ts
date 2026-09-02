@@ -10,6 +10,7 @@ import { NextRequest } from "next/server";
 import {
   formatSseFrame,
   parseSseDataLine,
+  splitSseLines,
   SSE_DATA_PREFIX,
   SSE_DONE_MARKER,
 } from "@/lib/sse";
@@ -155,22 +156,37 @@ describe("SSE のサーバー↔クライアント契約", () => {
   });
 });
 
-describe("CRLF で区切られたストリーム", () => {
-  it("行末の CR を取り除いてデータを取り出す", () => {
-    // SSE の行区切りは CRLF も認められており、途中のプロキシが CRLF で流すことがある
-    expect(parseSseDataLine(`${SSE_DATA_PREFIX}{"text":"あ"}\r`)).toBe('{"text":"あ"}');
+describe("splitSseLines", () => {
+  it("LF で区切られた行を切り出し、未完の行を持ち越す", () => {
+    // 最後の要素は行の途中の可能性があるので持ち越す
+    expect(splitSseLines("a\nb\nc")).toEqual({ lines: ["a", "b"], remainder: "c" });
   });
 
-  it("CR が付いていても終端の番兵と一致する", () => {
-    // ここが一致しないと本文は届くのに完了だけ検出できず、
-    // 完全な回答が毎回「中断された」と誤判定される
-    expect(parseSseDataLine(`${SSE_DATA_PREFIX}${SSE_DONE_MARKER}\r`)).toBe(
-      SSE_DONE_MARKER
+  it("CRLF で区切られた行から CR を残さない", () => {
+    // CR が残ると本文の末尾に付き、終端の番兵と文字列比較したときに一致しない。
+    // JSON としては CR は空白なので解析は通ってしまい、「本文は届くのに完了だけ
+    // 検出できない」＝完全な回答が毎回「中断された」と誤判定される
+    expect(splitSseLines("a\r\nb\r\n").lines).toEqual(["a", "b"]);
+  });
+
+  it("CR だけで区切られた行も切り出す", () => {
+    // LF だけで割ると 1 行も切り出せず、応答全体がバッファに溜まったまま捨てられる
+    expect(splitSseLines("a\rb\rc")).toEqual({ lines: ["a", "b"], remainder: "c" });
+  });
+
+  it("区切りが 1 つも無ければ全体を持ち越す", () => {
+    // 行の途中で読み取りが区切られた場合に、次の受信と連結できるようにする
+    expect(splitSseLines("data: {\"te")).toEqual({
+      lines: [],
+      remainder: 'data: {"te',
+    });
+  });
+
+  it("切り出した行はそのままデータ行として解析できる", () => {
+    // 行区切りの処理と data 行の解析が噛み合っていることを確かめる
+    const { lines } = splitSseLines(
+      `${SSE_DATA_PREFIX}${SSE_DONE_MARKER}\r\n\r\n`
     );
-  });
-
-  it("CR で始まる空行はデータ行として扱わない", () => {
-    // フレーム区切りの空行が CRLF になっても、データ行と誤認しない
-    expect(parseSseDataLine("\r")).toBeNull();
+    expect(parseSseDataLine(lines[0])).toBe(SSE_DONE_MARKER);
   });
 });

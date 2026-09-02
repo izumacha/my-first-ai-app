@@ -5,8 +5,8 @@
 "use client";
 
 import { useState } from "react";
-// 本文の受付上限とその超過を知らせる文言（定義元は @/lib/chat-limits）
-import { CONTENT_TOO_LONG_MESSAGE, MAX_CONTENT_LENGTH } from "@/lib/chat-limits";
+// 送信してよい本文かを判定する共有の規則（定義元は @/lib/chat-limits）
+import { findContentProblem } from "@/lib/chat-limits";
 
 /** ChatInput コンポーネントの Props */
 interface ChatInputProps {
@@ -46,14 +46,15 @@ export default function ChatInput({ onSend, isLoading }: ChatInputProps) {
     // 空文字なら何もしない
     if (!trimmed) return;
 
-    // 上限を超える本文は送らずにここで止める。
+    // 送ってよい本文かを共有の規則で判定する。問題があればここで止める。
     // 送ってしまうと、サーバーが 400 を返す一方で会話履歴には残るため、
     // 以降のすべての送信が同じ 400 になり、再読み込みするまで会話を続けられなくなる。
     // 入力はあえて消さない（消すと、長文を貼り付けた人がその文章ごと失う）
-    if (trimmed.length > MAX_CONTENT_LENGTH) {
+    const problem = findContentProblem(trimmed);
+    if (problem) {
       // 拒否の回数を進めて記録する（同じ文言でも読み上げが再び走るようにする）
       setInputError((previous) => ({
-        message: CONTENT_TOO_LONG_MESSAGE,
+        message: problem,
         attempt: (previous?.attempt ?? 0) + 1,
       }));
       return;

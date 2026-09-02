@@ -35,17 +35,41 @@ export function formatSseFrame(payload: string): string {
  * @returns データ部分の文字列。データ行でなければ null
  */
 export function parseSseDataLine(line: string): string | null {
-  // 行末の復帰文字（CR）を落としてから判定する。
-  // SSE の行区切りは LF だけでなく CRLF・CR も認められており、途中の
-  // プロキシや CDN が CRLF で流してくることがある。CR を残したままだと
-  // 本文の末尾に \r が付き、終端の番兵と文字列比較したときに一致しない。
-  // JSON としては CR は空白なので解析は通ってしまい、「本文は届くのに
-  // 完了だけ検出できない」＝完全な回答が毎回「中断された」と誤判定される
-  const withoutCarriageReturn = line.endsWith("\r") ? line.slice(0, -1) : line;
   // データ行でなければ取り出すものが無いので null を返す
-  if (!withoutCarriageReturn.startsWith(SSE_DATA_PREFIX)) {
+  if (!line.startsWith(SSE_DATA_PREFIX)) {
     return null;
   }
   // プレフィックスの長さ分だけ読み飛ばして本文を取り出す（長さは定数から導く）
-  return withoutCarriageReturn.slice(SSE_DATA_PREFIX.length);
+  return line.slice(SSE_DATA_PREFIX.length);
+}
+
+/** SSE の行区切り。仕様では CRLF・CR・LF のいずれも認められている。
+ * LF だけで割ると、CR だけで区切るストリームでは 1 行も切り出せず応答が
+ * 丸ごと捨てられ、CRLF では本文の末尾に \r が残って終端の番兵と一致しなくなる
+ * （本文は届くのに完了だけ検出できず、完全な回答が「中断された」と誤判定される）。 */
+const SSE_LINE_SEPARATOR = /\r\n|\r|\n/;
+
+/**
+ * 受信バッファを SSE の行へ切り分ける。
+ *
+ * <p>読み取りは行境界と無関係な位置で区切られて届くため、最後の要素は
+ * 「行の途中」の可能性がある。それを次の読み取りへ持ち越せるよう、
+ * 完結した行と持ち越し分を分けて返す。
+ *
+ * <p>行区切りの規則を書式と同じこのモジュールに置くのは、読み取り側だけが
+ * 知っている状態にすると `tests/sse.test.ts` の契約テストの目が届かなくなるため。
+ *
+ * @param buffer - 前回の持ち越しと今回の受信を連結した文字列
+ * @returns 完結した行の配列と、次へ持ち越す未完の行
+ */
+export function splitSseLines(buffer: string): {
+  lines: string[];
+  remainder: string;
+} {
+  // 行区切りで分割する（最後の要素は未完の行の可能性がある）
+  const parts = buffer.split(SSE_LINE_SEPARATOR);
+  // 最後の要素を持ち越し分として取り出す（必ず 1 要素はあるので空文字にはならない）
+  const remainder = parts.pop() ?? "";
+  // 完結した行と持ち越し分を返す
+  return { lines: parts, remainder };
 }

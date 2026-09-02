@@ -684,7 +684,70 @@ describe("POST /api/chat の上流エラーマッピング", () => {
     }
   });
 
-  it("max_tokens で打ち切られた回答を『完全な回答』として終わらせない", async () => {
+  it.each([
+    ["max_tokens", "長さの上限"],
+    ["model_context_window_exceeded", "文脈長の超過"],
+    ["refusal", "生成の拒否"],
+  ])("%s で打ち切られた回答を『完全な回答』として終わらせない", async (stopReason) => {
+    // 上流が最後まで話し終えずに生成を止めた場合を模す。
+    // 打ち切りの理由を列挙して弾く実装だと、列挙し忘れた理由が
+    // 黙って「完全な回答」に化ける（上流の理由は増える）
+    createMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        // 中断用コントローラ（この試験では使われない）
+        controller: { abort: vi.fn() },
+        // デルタを 1 件流したあと、打ち切りの理由を伝えて正常終了する
+        async *[Symbol.asyncIterator]() {
+          yield {
+            type: "content_block_delta",
+            delta: { type: "text_delta", text: "途中まで" },
+          };
+          yield {
+            type: "message_delta",
+            delta: { stop_reason: stopReason, stop_sequence: null },
+          };
+        },
+      })
+    );
+    // 正常な形のリクエストを送る
+    const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
+    // 応答本文を読み取って文字列にする
+    const body = await new Response(res.body).text();
+    // 受信済みのデルタは届いていることを確認する
+    expect(body).toContain("途中まで");
+    // 完了の番兵は送らない（送ると画面側が「完全な回答」として確定させる）
+    expect(body).not.toContain(SSE_DONE_MARKER);
+  });
+
+  it.each([["end_turn"], ["stop_sequence"]])(
+    "%s で終わった回答は完了として扱う",
+    async (stopReason) => {
+      // 最後まで話し終えた場合を模す
+      createMock.mockImplementationOnce(() =>
+        Promise.resolve({
+          controller: { abort: vi.fn() },
+          async *[Symbol.asyncIterator]() {
+            yield {
+              type: "content_block_delta",
+              delta: { type: "text_delta", text: "完全な回答" },
+            };
+            yield {
+              type: "message_delta",
+              delta: { stop_reason: stopReason, stop_sequence: null },
+            };
+          },
+        })
+      );
+      // 正常な形のリクエストを送る
+      const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
+      // 応答本文を読み取って文字列にする
+      const body = await new Response(res.body).text();
+      // 完了の番兵が送られることを確認する（付けないと毎回中断扱いになる）
+      expect(body).toContain(SSE_DONE_MARKER);
+    }
+  );
+
+  it("旧仕様の max_tokens 打ち切りも従来どおり未完了として扱う", async () => {
     // 上流が長さの上限で生成を止めた場合を模す（このアプリでいちばん起きやすい打ち切り理由）
     createMock.mockImplementationOnce(() =>
       Promise.resolve({
@@ -834,6 +897,46 @@ describe("POST /api/chat の上流エラーマッピング", () => {
       // スパイを元に戻して他のテストへ影響させない
       errorSpy.mockRestore();
     }
+  });
+
+  it("上流 429 の Retry-After を尊重して中継する", async () => {
+    // 上流が「300 秒待て」と指定した 429 を返す場合を模す
+    createMock.mockImplementationOnce(() =>
+      Promise.reject(
+        new Anthropic.APIError(
+          429,
+          { type: "error", error: { type: "rate_limit_error", message: "slow down" } },
+          "rate limited",
+          new Headers({ "retry-after": "300" })
+        )
+      )
+    );
+    // 正常な形のリクエストを送る
+    const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
+    // 429 が返ることを確認する
+    expect(res.status).toBe(429);
+    // 自前の待機時間（60 秒）ではなく上流の指定を伝えることを確認する。
+    // 自前の値を返すと、クライアントは成功しえない再試行を繰り返して
+    // 自前のレート制限の枠まで食い潰す
+    expect(res.headers.get("Retry-After")).toBe("300");
+  });
+
+  it("上流 429 に Retry-After が無ければ自前の待機時間を使う", async () => {
+    // ヘッダが無い 429 を返す場合を模す
+    createMock.mockImplementationOnce(() =>
+      Promise.reject(
+        new Anthropic.APIError(
+          429,
+          { type: "error", error: { type: "rate_limit_error", message: "slow down" } },
+          "rate limited",
+          new Headers()
+        )
+      )
+    );
+    // 正常な形のリクエストを送る
+    const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
+    // 自前のウィンドウ幅（60 秒）へ倒れることを確認する
+    expect(res.headers.get("Retry-After")).toBe("60");
   });
 
   it("接続確立前のクライアント切断（abort）は 500 ではなく 499 で静かに終える", async () => {

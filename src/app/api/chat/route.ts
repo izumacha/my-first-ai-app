@@ -41,6 +41,12 @@ const MAX_CLIENT_KEY_LENGTH = 64;
  * 秒への換算（RFC 9110 の delay-seconds は整数）は制限器側が担う。 */
 const RETRY_AFTER_SECONDS = String(rateLimiter.retryAfterSeconds);
 
+/** 「回答を最後まで話し終えた」ことを表す終了理由。これ以外はすべて途中終了として扱う。
+ * 列挙するのを「完了の理由」側にしているのが要点で、打ち切りの理由（max_tokens /
+ * model_context_window_exceeded / refusal 等）を列挙する向きにすると、
+ * 上流に新しい打ち切り理由が増えたときに黙って「完全な回答」に化ける。 */
+const COMPLETE_STOP_REASONS: readonly string[] = ["end_turn", "stop_sequence"];
+
 /** メッセージのロールとして受け付ける値の一覧（未知のロールを Claude へ転送しない） */
 const ALLOWED_ROLES: readonly Role[] = ["user", "assistant"];
 
@@ -117,11 +123,39 @@ function jsonError(
  * 自前のレート制限と上流 429 の両方で同じ応答を返すため共通化する（§6 DRY）。
  * @returns Retry-After ヘッダ付きの 429 レスポンス
  */
-function rateLimitedResponse(): NextResponse<ChatErrorResponse> {
+function rateLimitedResponse(retryAfterSeconds: string = RETRY_AFTER_SECONDS): NextResponse<ChatErrorResponse> {
   // 再試行までの待機秒数を Retry-After で明示して 429 を返す
   return jsonError(ERROR_MESSAGES.rateLimited, 429, {
-    "Retry-After": RETRY_AFTER_SECONDS,
+    "Retry-After": retryAfterSeconds,
   });
+}
+
+/**
+ * 上流が返した Retry-After ヘッダから待機秒数を取り出す。
+ *
+ * <p>上流のレート制限を 429 として中継するとき、自前の制限器の待機時間
+ * （既定 60 秒）をそのまま載せてはいけない。上流が「300 秒待て」と言っている
+ * のに 60 秒と伝えると、クライアントは成功しえない再試行を繰り返して自前の
+ * 枠まで食い潰す。逆に上流が「2 秒」のときは不要に 60 秒待たせることになる。
+ *
+ * @param error - 上流から受け取った API エラー
+ * @returns 秒数の文字列。ヘッダが無い・数値でない・負の場合は null
+ */
+function upstreamRetryAfterSeconds(error: InstanceType<typeof Anthropic.APIError>): string | null {
+  // ヘッダは実装によって形が異なるため、取得できないときは素直に諦める
+  const raw = error.headers?.get?.("retry-after");
+  // ヘッダが無ければ使えない
+  if (!raw) {
+    return null;
+  }
+  // 秒数として解釈する（RFC 9110 は HTTP-date も許すが、上流は秒数を返す）
+  const seconds = Number(raw);
+  // 数値でない・負の値は信用せず、自前の待機時間へ倒す
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    return null;
+  }
+  // 端数が出ないよう切り上げた秒数を返す
+  return String(Math.ceil(seconds));
 }
 
 /**
@@ -318,16 +352,18 @@ function createSseStream(
   // SSE のチャンクを順次書き出す ReadableStream を組み立てて返す
   return new ReadableStream({
     async start(controller) {
-      // 上流が「長さの上限（max_tokens）」で生成を打ち切ったかどうか。
-      // このアプリでいちばん起きやすい打ち切り理由で、しかも通信としては正常に
-      // 終わるため、見落とすと途中で切れた回答が「完全な回答」として確定される
-      let stoppedForLength = false;
+      // 上流が伝えてきた生成の終了理由（届かなければ null のまま）。
+      // 「打ち切りの理由を列挙して弾く」のではなく「最後まで話し終えた理由だけを
+      // 完了とみなす」向きで判定する。SDK の StopReason には max_tokens 以外にも
+      // model_context_window_exceeded や refusal といった途中終了があり、
+      // 列挙側で持つと新しい理由が増えるたびに黙って「完全な回答」に化ける
+      let finalStopReason: string | null = null;
       try {
         // テキストデルタイベントを順次読み出す
         for await (const event of stream) {
-          // 生成の終了理由を伝えるイベントなら、長さ上限で切れたかどうかを控える
-          if (event.type === "message_delta" && event.delta.stop_reason === "max_tokens") {
-            stoppedForLength = true;
+          // 生成の終了理由を伝えるイベントなら、その理由を控える
+          if (event.type === "message_delta" && event.delta.stop_reason) {
+            finalStopReason = event.delta.stop_reason;
           }
           // content_block_delta イベントからテキスト差分を取得する
           if (
@@ -368,11 +404,12 @@ function createSseStream(
           controller.error(new Error("ストリーミングが完了前に中断されました"));
           return;
         }
-        // 長さ上限で打ち切られた回答は「完了」ではないので終端の番兵を送らない。
+        // 最後まで話し終えた理由でなければ「完了」ではないので終端の番兵を送らない。
         // 受信側は [DONE] を受け取れなかった読み取りを「途中で切れた回答」として
         // 扱い、印を付けて履歴に残す。通信としては正常なのでエラーにはしない
-        // （エラーにすると、実際には届いている回答に通信障害の警告が出てしまう）
-        if (stoppedForLength) {
+        // （エラーにすると、実際には届いている回答に通信障害の警告が出てしまう）。
+        // 終了理由が届かないストリーム（古い上流・テストのモック）は完了扱いにする
+        if (finalStopReason !== null && !COMPLETE_STOP_REASONS.includes(finalStopReason)) {
           controller.close();
           return;
         }
@@ -452,9 +489,10 @@ function mapErrorToResponse(error: unknown): NextResponse<ChatErrorResponse> | R
     if (error.status === 401) {
       return jsonError(ERROR_MESSAGES.invalidApiKey, 401);
     }
-    // 上流のレート制限（429）はそのまま 429 として返す（CLAUDE.md のステータス契約）
+    // 上流のレート制限（429）はそのまま 429 として返す（CLAUDE.md のステータス契約）。
+    // 待機時間は上流が指定していればそれに従う（自前の待機時間は上流の都合を知らない）
     if (error.status === 429) {
-      return rateLimitedResponse();
+      return rateLimitedResponse(upstreamRetryAfterSeconds(error) ?? RETRY_AFTER_SECONDS);
     }
     // 上流の 400（リクエスト内容起因のエラー）はクライアントエラーとして 400 で返す。
     // 500 に倒すとクライアント起因の問題がサーバ障害として誤って記録・表示されてしまう

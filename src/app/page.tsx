@@ -8,9 +8,10 @@ import { useState, useCallback } from "react";
 import ChatContainer from "@/components/ChatContainer";
 import ChatInput from "@/components/ChatInput";
 import CategoryChips from "@/components/CategoryChips";
-import { parseSseDataLine, SSE_DONE_MARKER } from "@/lib/sse";
+import { parseSseDataLine, splitSseLines, SSE_DONE_MARKER } from "@/lib/sse";
 // 送信する会話履歴をサーバーの受付上限まで切り詰めるヘルパー（上限の定義元は @/lib/chat-limits）
 import {
+  findContentProblem,
   TRUNCATED_ANSWER_SUFFIX,
   trimHistoryForRequest,
 } from "@/lib/chat-limits";
@@ -59,6 +60,17 @@ export default function Home() {
     async (content: string) => {
       // エラー表示をクリアする
       setError(null);
+
+      // 上限を超える本文は履歴に積まない。積むとサーバーが 400 を返す一方で
+      // 履歴には残り続け、以降のすべての送信が同じ 400 になって復帰できなくなる。
+      // 入力欄側も同じ規則（findContentProblem）で先に弾くが、あちらは
+      // 「入力を消さずに理由を見せる」表示のための検証で、履歴を守るのはこの層。
+      // 入力欄を経由しない送信経路が増えても、必ずここを通る
+      const contentProblem = findContentProblem(content);
+      if (contentProblem) {
+        setError(contentProblem);
+        return;
+      }
 
       // ユーザーのメッセージオブジェクトを作成する
       const userMessage: Message = { role: "user", content };
@@ -137,13 +149,10 @@ export default function Home() {
             // バイナリデータを文字列にデコードし、持ち越し分と連結する
             lineBuffer += decoder.decode(value, { stream: true });
 
-            // SSE 形式の行を分割する（最後の要素は「行の途中」の可能性がある）。
-            // 区切りは LF だけでなく CRLF・CR も認められているので 3 通りを見る。
-            // LF だけで割ると、CR だけで区切るストリームでは 1 行も切り出せず、
-            // 応答全体がバッファに溜まったまま捨てられる（回答が丸ごと消える）
-            const lines = lineBuffer.split(/\r\n|\r|\n/);
-            // 最後の要素は未完の行として次のチャンクへ持ち越す（完結行だけを処理する）
-            lineBuffer = lines.pop() ?? "";
+            // SSE 形式の行に切り分ける（行区切りの規則は @/lib/sse に集約）。
+            // 未完の行は次のチャンクへ持ち越し、完結した行だけを処理する
+            const { lines, remainder } = splitSseLines(lineBuffer);
+            lineBuffer = remainder;
 
             for (const line of lines) {
               // データ行なら本文を取り出す（データ行でなければ null が返る。書式は @/lib/sse に集約）
@@ -183,6 +192,15 @@ export default function Home() {
               }
             }
           }
+          // ここへ来たのは読み取りが例外なく終わったときだけ（＝通信は成功した）。
+          // それでも 1 文字も受け取れていないなら、黙って何も起きなかったように
+          // 終わらせない。ローディングだけ止まって画面に何も出ないと、
+          // ユーザーは失敗に気づかず再送して上流の呼び出しを重ねる。
+          // finally 側で判定すると失敗経路でも走り、外側の catch が上書きする順序に
+          // 依存した「たまたま正しい」状態になる
+          if (!accumulated.trim()) {
+            setError(MESSAGES.emptyAnswer);
+          }
         } finally {
           // 読み取りを終えた reader を必ず解放する。[DONE] を受信して while を抜けた
           // 場合、レスポンスボディは reader にロックされたまま未消費として残るため、
@@ -195,9 +213,9 @@ export default function Home() {
           });
           // 成功・途中失敗のどちらでも、受信済みのテキストがあれば会話履歴に残す。
           // ここで確定させないと、途中でストリームが切れたときに受信済みの回答が
-          // 消えたうえ、宙に浮いた吹き出しが次の送信まで表示され続けてしまう
-          // 空白だけの回答は履歴に残さない。残すとサーバーの検証（本文が空）で
-          // 以降の送信がすべて 400 になり、往復が成立しないので窓からも抜けない
+          // 消えたうえ、宙に浮いた吹き出しが次の送信まで表示され続けてしまう。
+          // 空白だけの回答は残さない。残すとサーバーの検証（本文が空）で以降の
+          // 送信がすべて 400 になり、往復が成立しないので窓からも抜けない
           if (accumulated.trim()) {
             setMessages((prev) => [
               ...prev,
@@ -215,11 +233,6 @@ export default function Home() {
                     : `${accumulated}${TRUNCATED_ANSWER_SUFFIX}`,
               },
             ]);
-          } else {
-            // 1 文字も受け取れなかった場合は、黙って何も起きなかったように
-            // 終わらせない。ローディングだけ止まって画面に何も出ないと、
-            // ユーザーは失敗に気づかず再送して上流の呼び出しを重ねる
-            setError(MESSAGES.emptyAnswer);
           }
           // ストリーミング表示を必ずクリアする（エラー時の吹き出し残留を防ぐ）
           setStreamingText("");
