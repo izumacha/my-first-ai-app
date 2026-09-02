@@ -20,7 +20,7 @@ import type { Mock } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import Home from "@/app/page";
 // 送信履歴の上限（画面とサーバーで共有する定数）を参照する
-import { MAX_MESSAGE_COUNT } from "@/lib/chat-limits";
+import { MAX_CONTENT_LENGTH, MAX_MESSAGE_COUNT } from "@/lib/chat-limits";
 import type { Message } from "@/lib/types";
 
 /** テストで組み立てた ReadableStream の解放（cancel）を記録するためのスパイ置き場 */
@@ -324,6 +324,29 @@ describe("チャット画面のストリーミング処理", () => {
     expect(screen.queryByText(/中断されました/)).not.toBeInTheDocument();
     // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
     await waitForIdle();
+  });
+
+  it("上限を超える本文は送信も履歴への追加もしないこと（画面全体の契約）", async () => {
+    // fetch が呼ばれないことを確かめるためモックを差し替える
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    // チャット画面を描画する
+    render(<Home />);
+    // 上限を超える長文を送信する。
+    // 実際には入力欄側の検証で先に止まるが、ここで確かめたいのは層ではなく
+    // 「画面から長すぎる本文を送っても、リクエストも履歴も汚れない」という結果。
+    // page.tsx 側の同じ検証は、入力欄を経由しない送信経路が増えたときの
+    // 備え（履歴を守る最後の砦）で、画面操作からは到達できない
+    sendMessage("あ".repeat(MAX_CONTENT_LENGTH + 1));
+
+    // 送信していないことを確認する（サーバーの 400 を待たずに止める）
+    await waitFor(() => {
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+    // 履歴にも積まれていないことを確認する。積むと以降のすべての送信が
+    // 同じ 400 になり、往復が成立しないので窓からも抜けず復帰できなくなる
+    expect(screen.queryByText(/^あ+$/)).not.toBeInTheDocument();
   });
 
   it("会話が続いても送信する履歴を受付上限以内に保つこと", async () => {

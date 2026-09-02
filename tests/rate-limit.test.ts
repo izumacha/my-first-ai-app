@@ -136,36 +136,57 @@ describe("追跡表が満杯のときの挙動", () => {
     expect(limiter.isRateLimited("a", 5600)).toBe(true);
   });
 
-  it("掃除は 1 ウィンドウにつき 1 回だけ実行する", () => {
-    // 2 件までしか追跡できず、1 ウィンドウに 1 回だけ許可する制限器を作る
+  it("掃除の回数はリクエスト数ではなく経過時間で決まる", () => {
+    // 掃除の最短間隔はウィンドウの 1/10 ＝ 100ms
+    const limiter = createRateLimiter({
+      windowMs: 1000,
+      maxRequests: 100,
+      maxTrackedClients: 2,
+    });
+    // 2 件の送信元で表を満杯にする
+    limiter.isRateLimited("a", 500);
+    limiter.isRateLimited("b", 500);
+    // 満杯になってから最初の呼び出しで 1 回目の掃除が走る
+    limiter.isRateLimited("a", 510);
+    expect(limiter.sweepCount).toBe(1);
+
+    // 同じ間隔の中で何度呼んでも掃除は増えない。
+    // 毎リクエスト走査する実装だと、偽装キーで表を満杯にされた状態で
+    // 全リクエストが 1 万件の走査を負担することになる
+    for (let t = 520; t < 610; t += 10) {
+      limiter.isRateLimited("a", t);
+    }
+    expect(limiter.sweepCount).toBe(1);
+
+    // 間隔（100ms）を越えれば次の掃除が走る
+    limiter.isRateLimited("a", 611);
+    expect(limiter.sweepCount).toBe(2);
+  });
+
+  it("期限切れになれば 1 間隔以内に回収する（次のウィンドウまで待たない）", () => {
+    // 掃除の最短間隔はウィンドウの 1/10 ＝ 100ms
     const limiter = createRateLimiter({
       windowMs: 1000,
       maxRequests: 1,
       maxTrackedClients: 2,
     });
-    // t=500 に 2 件の送信元で表を満杯にする（記録は t=1500 に期限切れになる）
-    limiter.isRateLimited("a", 500);
-    limiter.isRateLimited("b", 500);
+    // ウィンドウの途中（t=1001）で表を満杯にする。記録は t=2001 に期限切れになる
+    limiter.isRateLimited("a", 1001);
+    limiter.isRateLimited("b", 1001);
 
-    // t=1000 はウィンドウ 1 の最初の呼び出しなので掃除が走る。
-    // ただし a・b はまだ期限切れではない（1000 - 500 < 1000）ので残る。
-    // a は枠を使い切っているので制限され、記録も更新されない
-    expect(limiter.isRateLimited("a", 1000)).toBe(true);
+    // t=2000 に掃除が走るが、まだ期限切れではない（2000 - 1001 = 999 < 1000）ので
+    // 何も回収されない。新規送信元 c は共有バケットへ回る
+    expect(limiter.isRateLimited("c", 2000)).toBe(false);
     expect(limiter.trackedClientCount).toBe(2);
 
-    // t=1500 では a・b は期限切れ（1500 - 500 >= 1000）だが、同じウィンドウ 1 では
-    // もう掃除しないので回収されない。満杯のままなので新規送信元 c は共有バケットへ回る
-    expect(limiter.isRateLimited("c", 1500)).toBe(false);
-    // 追跡表は a・b のまま（c は表に入らず共有バケットで数えられている）
-    expect(limiter.trackedClientCount).toBe(2);
-    // c が共有バケットを使ったことは、別の新規送信元 e が同じ枠を食い合うことで分かる。
-    // 掃除を毎回走らせる実装なら a・b が消えて c は自分のバケットを持つため、ここは false になる
-    expect(limiter.isRateLimited("e", 1600)).toBe(true);
-
-    // ウィンドウ 2 に入れば掃除が再び走り、期限切れの a・b が回収される
-    // （回収の遅れは 1 ウィンドウ未満で、取りこぼしにはならない）
-    expect(limiter.isRateLimited("d", 2000)).toBe(false);
-    // 空いた枠に d が自分のバケットを持てている
+    // t=2500 では a・b は期限切れ（2500 - 1001 = 1499 >= 1000）。
+    // 間隔で絞る実装なら前回の掃除から 500ms 経っているので回収され、
+    // 新規送信元 d は自分のバケットを持てる。
+    //
+    // 「1 ウィンドウに 1 回」で絞る実装だと、t=2000 と t=2500 は同じウィンドウなので
+    // 掃除は走らない。回収できる枠しかないのに表は満杯のままで、d は共有バケットへ
+    // 押し込まれて弾かれる（正規の新規クライアントが理由なく 429 を受ける）
+    expect(limiter.isRateLimited("d", 2500)).toBe(false);
     expect(limiter.trackedClientCount).toBe(1);
   });
 
@@ -210,6 +231,21 @@ describe("上限値の検証（fail-closed）", () => {
     ).not.toThrow();
     // 既定値（引数なし）でも生成できることを確認する
     expect(() => createRateLimiter()).not.toThrow();
+  });
+});
+
+describe("Retry-After の待機秒数", () => {
+  it("ウィンドウ幅を秒へ直した値を返す", () => {
+    // 1 分のウィンドウなら 60 秒
+    expect(createRateLimiter({ windowMs: 60_000 }).retryAfterSeconds).toBe(60);
+  });
+
+  it("端数が出る設定でも整数を返す（切り上げ）", () => {
+    // RFC 9110 の delay-seconds は整数。1.5 のような小数を送るとクライアントは
+    // 解釈できず、ヘッダが無いのと同じ扱いになって閉じたままの窓へ叩き続ける
+    expect(createRateLimiter({ windowMs: 1500 }).retryAfterSeconds).toBe(2);
+    // 1 秒未満のウィンドウでも 0 ではなく 1 を返す（0 は「すぐ再試行してよい」の意味になる）
+    expect(createRateLimiter({ windowMs: 200 }).retryAfterSeconds).toBe(1);
   });
 });
 

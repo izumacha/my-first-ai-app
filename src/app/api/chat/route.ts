@@ -41,8 +41,9 @@ const MAX_BODY_BYTES = 1_000_000;
  * クライアントが正しくバックオフできるよう、いつ再試行してよいかを明示する。
  * 既定値ではなく**実際に使っている制限器のウィンドウ幅**から導く。既定値を読むと、
  * 上限を差し替えたときにヘッダだけが古い値のまま残り、クライアントが誤った時間だけ
- * 待つ（または閉じたままの窓へ再試行して 429 を重ねる）ずれが起きる。 */
-const RETRY_AFTER_SECONDS = String(rateLimiter.windowMs / 1000);
+ * 待つ（または閉じたままの窓へ再試行して 429 を重ねる）ずれが起きる。
+ * 秒への換算（RFC 9110 の delay-seconds は整数）は制限器側が担う。 */
+const RETRY_AFTER_SECONDS = String(rateLimiter.retryAfterSeconds);
 
 /** メッセージのロールとして受け付ける値の一覧（未知のロールを Claude へ転送しない） */
 const ALLOWED_ROLES: readonly Role[] = ["user", "assistant"];

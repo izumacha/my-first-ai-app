@@ -11,6 +11,8 @@ import CategoryChips from "@/components/CategoryChips";
 import { parseSseDataLine, SSE_DONE_MARKER } from "@/lib/sse";
 // 送信する会話履歴をサーバーの受付上限まで切り詰めるヘルパー（上限の定義元は @/lib/chat-limits）
 import {
+  CONTENT_TOO_LONG_MESSAGE,
+  MAX_CONTENT_LENGTH,
   TRUNCATED_ANSWER_SUFFIX,
   trimHistoryForRequest,
 } from "@/lib/chat-limits";
@@ -41,6 +43,16 @@ export default function Home() {
     async (content: string) => {
       // エラー表示をクリアする
       setError(null);
+
+      // 上限を超える本文は履歴に積まない。積むとサーバーが 400 を返す一方で
+      // 履歴には残り続け、以降のすべての送信が同じ 400 になって復帰できなくなる。
+      // 入力欄側でも同じ検証をしているが、そこは「入力を消さずに理由を見せる」
+      // ための表示の都合であって、履歴を守る責任はこの層にある
+      // （送信経路が増えたときに、この防御だけは必ず通る）
+      if (content.length > MAX_CONTENT_LENGTH) {
+        setError(CONTENT_TOO_LONG_MESSAGE);
+        return;
+      }
 
       // ユーザーのメッセージオブジェクトを作成する
       const userMessage: Message = { role: "user", content };
@@ -98,10 +110,6 @@ export default function Home() {
         const decoder = new TextDecoder();
         // ストリーミングで受信したテキストを蓄積する変数
         let accumulated = "";
-        // 回答が最後まで届いたかどうか（[DONE] を受け取れば完了）。
-        // 途中で切れた回答をそのまま履歴に残すと、見た目が完全な回答と変わらず、
-        // 次の質問ではその欠けた回答が文脈として送り返されてしまう
-        let completed = false;
         // チャンクの切れ目で分断された「行の途中」を次のチャンクまで持ち越すバッファ。
         // reader.read() は行境界と無関係な位置でデータを区切るため、バッファ無しだと
         // 分断された JSON がパース失敗として捨てられ、回答の文字が欠落してしまう
@@ -138,8 +146,6 @@ export default function Home() {
               // ストリーム終了マーカーなら読み取り全体を完了させる
               if (data === SSE_DONE_MARKER) {
                 sawDone = true;
-                // 最後まで届いたことを記録する（途中で切れた回答と区別するため）
-                completed = true;
                 break;
               }
 
@@ -178,7 +184,10 @@ export default function Home() {
                 // 途中で切れた回答には印を付ける。印が無いと画面上は完全な回答と
                 // 見分けが付かず、しかも次の質問でこの欠けた回答が文脈として
                 // 送り返され、AI は続きがある前提で答えてしまう
-                content: completed
+                // [DONE] を受け取れていれば完了。sawDone は読み取りループの
+                // 制御にも使っている同じ事実なので、別の変数へ写し取らない
+                // （2 つに分けると片方だけ変わって静かに食い違う）
+                content: sawDone
                   ? accumulated
                   : `${accumulated}${TRUNCATED_ANSWER_SUFFIX}`,
               },

@@ -103,6 +103,27 @@ describe("ChatInput", () => {
     expect(input).toHaveValue(tooLong);
   });
 
+  it("同じ本文で再び弾かれたときも警告を出し直すこと", () => {
+    // モック関数を作成する
+    const mockOnSend = vi.fn();
+    render(<ChatInput onSend={mockOnSend} isLoading={false} />);
+
+    // 上限を超える長文を入力して送信する
+    const input = screen.getByPlaceholderText("メッセージを入力...");
+    fireEvent.change(input, { target: { value: "あ".repeat(MAX_CONTENT_LENGTH + 1) } });
+    fireEvent.submit(input.closest("form")!);
+    // 1 回目の警告要素を控えておく
+    const firstAlert = screen.getByRole("alert");
+
+    // 何も直さずにもう一度送信する（「反応が無い」と思った人が取る自然な操作）
+    fireEvent.submit(input.closest("form")!);
+
+    // 警告要素が作り直されていることを確認する。同じ文言を入れ直すだけだと
+    // React が再描画を省くため要素はそのまま残り、スクリーンリーダーには
+    // 何も読み上げられない＝2 回目の操作に対する反応がゼロになる
+    expect(screen.getByRole("alert")).not.toBe(firstAlert);
+  });
+
   it("入力を直し始めた時点で上限超過の警告が消えること", () => {
     // モック関数を作成する
     const mockOnSend = vi.fn();

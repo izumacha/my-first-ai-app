@@ -29,6 +29,12 @@ export const MAX_TRACKED_CLIENTS = 10_000;
 //     実クライアントが 1 件も自分のバケットを持てなくなる、
 // という 2 つの副作用が出る。
 
+/** 1 ウィンドウあたり何回まで掃除を許すか。
+ * 大きくすると回収は速くなるが走査の回数が増え、小さくすると逆になる。
+ * 10 は「回収の遅れをウィンドウの 1 割（既定なら 6 秒）に抑えつつ、
+ * 走査はどれだけリクエストが来ても 1 秒あたり 1 回未満」に収まる値。 */
+const SWEEP_INTERVALS_PER_WINDOW = 10;
+
 /** レート制限の上限値（テストから小さい値を注入するために差し替え可能にする） */
 export interface RateLimiterOptions {
   /** ウィンドウ幅（ミリ秒）。省略時は {@link RATE_LIMIT_WINDOW_MS} */
@@ -50,10 +56,18 @@ export interface RateLimiter {
   isRateLimited(clientKey: string, now?: number): boolean;
   /** いま追跡している送信元キーの数（掃除が効いているかを観測するために公開する） */
   readonly trackedClientCount: number;
-  /** この制限器が実際に使っているウィンドウ幅（ミリ秒）。
-   * 429 応答の Retry-After は必ずここから導く。既定値を直接読むと、
-   * 上限を差し替えたときにヘッダだけが古い値のまま残ってしまう */
-  readonly windowMs: number;
+  /** これまでに掃除（表の全走査）を実行した回数。
+   * 掃除の頻度はリクエスト数から切り離されている必要があるが、その効果は
+   * 判定結果には現れないため、外から観測できる形で公開する
+   * （運用時に「走査がどれだけ走っているか」を見るのにも使える）。 */
+  readonly sweepCount: number;
+  /** 429 応答の `Retry-After` に載せる待機秒数。
+   * 既定値ではなく**この制限器が実際に使っているウィンドウ幅**から導くので、
+   * 上限を差し替えてもヘッダだけが古い値のまま残ることがない。
+   * RFC 9110 の delay-seconds は整数なので切り上げた値を返す
+   * （小数を送るとクライアントは解釈できず、ヘッダが無いのと同じ扱いになる。
+   * 切り下げないのは、早すぎる再試行を勧めないため）。 */
+  readonly retryAfterSeconds: number;
 }
 
 /**
@@ -108,12 +122,21 @@ export function createRateLimiter(options: RateLimiterOptions = {}): RateLimiter
     "maxTrackedClients"
   );
 
+  // 掃除を行う最短間隔（ミリ秒）。ウィンドウ幅から導く。
+  // 走査の頻度をリクエスト数から切り離しつつ、回収の遅れをウィンドウの 1 割に抑える
+  const sweepIntervalMs = Math.max(
+    1,
+    Math.floor(windowMs / SWEEP_INTERVALS_PER_WINDOW)
+  );
+
   // 送信元キーごとに、ウィンドウ内のリクエスト時刻を保持する表
   const buckets = new Map<string, number[]>();
   // 表が満杯のときに新規送信元をまとめて数える共有バケット（表とは別に持つ。理由は上の注記）
   let overflowTimestamps: number[] = [];
-  // 最後に掃除を実行したウィンドウ番号（まだ一度も掃除していないことを表す -1 で初期化）
-  let lastSweptWindow = -1;
+  // 最後に掃除を実行した時刻（まだ一度も掃除していないので、必ず 1 回目が走る値で初期化）
+  let lastSweptAt = Number.NEGATIVE_INFINITY;
+  // これまでに掃除を実行した回数（頻度が絞れているかを外から観測するために数える）
+  let sweepCount = 0;
 
   /**
    * ウィンドウ外になったエントリを表から取り除く。
@@ -142,21 +165,26 @@ export function createRateLimiter(options: RateLimiterOptions = {}): RateLimiter
 
   return {
     isRateLimited(clientKey: string, now: number = Date.now()): boolean {
-      // 現在がどのウィンドウに属するかを求める（掃除の頻度を絞るのに使う）
-      const currentWindow = Math.floor(now / windowMs);
-
       // 追跡表が上限に達していたら、期限切れの送信元エントリをまとめて掃除する。
-      // ただし掃除は 1 ウィンドウにつき 1 回までに絞る。表が満杯のまま維持される
-      // （偽装キーを送り続けられている）状況では、絞らないと全リクエストが
-      // 毎回 1 万件の走査を負担することになり、攻撃者が安価にサーバの CPU を
-      // 消費させられてしまう（§8 重い処理でリクエスト処理をブロックしない）。
-      // 掃除はウィンドウの境目ごとに走るので、あるエントリが期限切れになってから
-      // 回収されるまでの遅れは 1 ウィンドウ未満に収まる（エントリが表に残る時間で
-      // 数えると、最後のリクエストから最長 2 ウィンドウ弱）。回収漏れは起きず、
-      // 遅れている間の新規送信元も共有バケットで数えるので素通りにはならない
-      if (buckets.size >= maxTrackedClients && lastSweptWindow !== currentWindow) {
-        // このウィンドウでは掃除済みであることを記録する
-        lastSweptWindow = currentWindow;
+      //
+      // ただし掃除は一定間隔に絞る。表が満杯のまま維持される（偽装キーを送り続け
+      // られている）状況では、絞らないと全リクエストが毎回 1 万件の走査を負担する
+      // ことになり、攻撃者が安価にサーバの CPU を消費させられてしまう
+      // （§8 重い処理でリクエスト処理をブロックしない）。
+      //
+      // 絞り方を「1 ウィンドウに 1 回」ではなく時間間隔にしているのが要点。
+      // ウィンドウ単位だと、そのウィンドウの早い時点で（まだ何も期限切れでない
+      // タイミングで）掃除を使い切ってしまい、その後エントリが期限切れになっても
+      // 次のウィンドウまで回収されない。その間、表は「回収できる枠しかないのに満杯」
+      // という状態のままなので、新規の正規クライアントが共有バケットへ押し込まれて
+      // 429 を受ける。間隔で絞れば、期限切れからの遅れは常に 1 間隔以内に収まる
+      const sweepIsDue =
+        // 時刻が巻き戻った場合も「間隔が空いた」とみなして掃除する（止まらないように）
+        now < lastSweptAt || now - lastSweptAt >= sweepIntervalMs;
+      if (buckets.size >= maxTrackedClients && sweepIsDue) {
+        // 掃除した時刻と回数を記録する
+        lastSweptAt = now;
+        sweepCount += 1;
         // 期限切れのエントリを取り除く
         sweepExpired(now);
       }
@@ -197,9 +225,14 @@ export function createRateLimiter(options: RateLimiterOptions = {}): RateLimiter
       return buckets.size;
     },
 
-    get windowMs(): number {
-      // この制限器が実際に使っているウィンドウ幅を返す
-      return windowMs;
+    get sweepCount(): number {
+      // これまでに掃除を実行した回数を返す
+      return sweepCount;
+    },
+
+    get retryAfterSeconds(): number {
+      // ウィンドウ幅を秒へ直し、整数になるよう切り上げて返す
+      return Math.ceil(windowMs / 1000);
     },
   };
 }

@@ -23,8 +23,14 @@ interface ChatInputProps {
 export default function ChatInput({ onSend, isLoading }: ChatInputProps) {
   // 入力欄のテキストを管理する state
   const [input, setInput] = useState("");
-  // 送信前の検証で弾いた理由を保持する state（問題が無ければ null）
-  const [inputError, setInputError] = useState<string | null>(null);
+  // 送信前の検証で弾いた理由を保持する state（問題が無ければ null）。
+  // attempt（何回目の拒否か）を一緒に持つのは、同じ文言で再び弾かれたときに
+  // React が「値が変わっていない」と判断して再描画を省き、role="alert" が
+  // 読み上げ直されないため。この値を key にして要素を作り直させる
+  const [inputError, setInputError] = useState<{
+    message: string;
+    attempt: number;
+  } | null>(null);
 
   /**
    * フォーム送信時のハンドラー
@@ -45,7 +51,11 @@ export default function ChatInput({ onSend, isLoading }: ChatInputProps) {
     // 以降のすべての送信が同じ 400 になり、再読み込みするまで会話を続けられなくなる。
     // 入力はあえて消さない（消すと、長文を貼り付けた人がその文章ごと失う）
     if (trimmed.length > MAX_CONTENT_LENGTH) {
-      setInputError(CONTENT_TOO_LONG_MESSAGE);
+      // 拒否の回数を進めて記録する（同じ文言でも読み上げが再び走るようにする）
+      setInputError((previous) => ({
+        message: CONTENT_TOO_LONG_MESSAGE,
+        attempt: (previous?.attempt ?? 0) + 1,
+      }));
       return;
     }
 
@@ -102,8 +112,14 @@ export default function ChatInput({ onSend, isLoading }: ChatInputProps) {
       </div>
       {/* 送信前の検証で弾いた理由を表示する（role="alert" で即時に読み上げさせる） */}
       {inputError && (
-        <p id="chat-input-error" role="alert" className="text-sm text-red-700 dark:text-red-300">
-          {inputError}
+        <p
+          // 拒否のたびに key が変わるので要素が作り直され、同じ文言でも読み上げ直される
+          key={inputError.attempt}
+          id="chat-input-error"
+          role="alert"
+          className="text-sm text-red-700 dark:text-red-300"
+        >
+          {inputError.message}
         </p>
       )}
     </form>
