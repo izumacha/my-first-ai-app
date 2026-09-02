@@ -311,9 +311,17 @@ function createSseStream(
   // SSE のチャンクを順次書き出す ReadableStream を組み立てて返す
   return new ReadableStream({
     async start(controller) {
+      // 上流が「長さの上限（max_tokens）」で生成を打ち切ったかどうか。
+      // このアプリでいちばん起きやすい打ち切り理由で、しかも通信としては正常に
+      // 終わるため、見落とすと途中で切れた回答が「完全な回答」として確定される
+      let stoppedForLength = false;
       try {
         // テキストデルタイベントを順次読み出す
         for await (const event of stream) {
+          // 生成の終了理由を伝えるイベントなら、長さ上限で切れたかどうかを控える
+          if (event.type === "message_delta" && event.delta.stop_reason === "max_tokens") {
+            stoppedForLength = true;
+          }
           // content_block_delta イベントからテキスト差分を取得する
           if (
             event.type === "content_block_delta" &&
@@ -351,6 +359,14 @@ function createSseStream(
         if (requestSignal.aborted) {
           // 受信側には「完了していない」ことを伝える（正常完了と見分けられるようにする）
           controller.error(new Error("ストリーミングが完了前に中断されました"));
+          return;
+        }
+        // 長さ上限で打ち切られた回答は「完了」ではないので終端の番兵を送らない。
+        // 受信側は [DONE] を受け取れなかった読み取りを「途中で切れた回答」として
+        // 扱い、印を付けて履歴に残す。通信としては正常なのでエラーにはしない
+        // （エラーにすると、実際には届いている回答に通信障害の警告が出てしまう）
+        if (stoppedForLength) {
+          controller.close();
           return;
         }
         // ストリーム終了を通知する（番兵の値は読み取り側と共有の定数を使う）

@@ -8,6 +8,8 @@ import { describe, it, expect } from "vitest";
 import {
   MAX_CONTENT_LENGTH,
   MAX_MESSAGE_COUNT,
+  OMITTED_ANSWER_SUFFIX,
+  TRUNCATED_ANSWER_SUFFIX,
   trimHistoryForRequest,
 } from "@/lib/chat-limits";
 import type { Message } from "@/lib/types";
@@ -90,6 +92,22 @@ describe("trimHistoryForRequest", () => {
     expect(history).toEqual(snapshot);
   });
 
+  it("本文が空白だけのメッセージは送らない", () => {
+    // 上流が空白だけの回答を返して正常終了した場合を模す
+    const history: Message[] = [
+      { role: "user", content: "質問" },
+      { role: "assistant", content: "   \n  " },
+      { role: "user", content: "次の質問" },
+    ];
+    // 切り詰めを適用する
+    const trimmed = trimHistoryForRequest(history);
+    // 空白だけの発言が取り除かれることを確認する。残すとサーバーが
+    // 「メッセージ本文を入力してください。」で 400 を返し、しかも往復が成立しないので
+    // 50 件の窓が進まず、その発言が永久に抜けない（復帰できない 400）
+    expect(trimmed).toHaveLength(2);
+    expect(trimmed.every((message) => message.content.trim() !== "")).toBe(true);
+  });
+
   it("空の履歴は空のまま返す", () => {
     // 履歴が空の場合は切り詰める対象が無い
     expect(trimHistoryForRequest([])).toEqual([]);
@@ -122,7 +140,7 @@ describe("本文が受付上限を超えるメッセージの扱い", () => {
   it("切り詰めても末尾の印は残る（印だけが真っ先に消えない）", () => {
     // 画面側が付けた「中断されました」の印を含む、上限ちょうどを超える回答を用意する。
     // 素朴に末尾から削ると、末尾にある印が最初に失われてしまう
-    const interrupted = `${"あ".repeat(MAX_CONTENT_LENGTH)}\n\n（回答はここで中断されました）`;
+    const interrupted = `${"あ".repeat(MAX_CONTENT_LENGTH)}${TRUNCATED_ANSWER_SUFFIX}`;
     const history: Message[] = [
       { role: "user", content: "質問" },
       { role: "assistant", content: interrupted },
@@ -158,10 +176,12 @@ describe("本文が受付上限を超えるメッセージの扱い", () => {
   });
 
   it("切り詰めでサロゲートペアを割らない", () => {
-    // 上限の境界がちょうど絵文字（サロゲートペア）の途中に来る本文を作る。
-    // 上限より 1 文字短い部分＋絵文字にすると、上限位置がペアの真ん中になる
+    // 実際の切り口は「上限 − 省略の印の長さ」なので、そこへ絵文字（サロゲートペア）を
+    // 置く。上限そのものを境界だと思って組み立てると切り口が絵文字から外れ、
+    // ガードを外しても落ちない空振りのテストになる（実測で確認済み）
     const emoji = "😀";
-    const content = "あ".repeat(MAX_CONTENT_LENGTH - 1) + emoji + "あ";
+    const cutIndex = MAX_CONTENT_LENGTH - OMITTED_ANSWER_SUFFIX.length;
+    const content = "あ".repeat(cutIndex - 1) + emoji + "あ".repeat(100);
     // その本文を持つ assistant 発言を含む履歴を用意する
     const history: Message[] = [
       { role: "user", content: "質問" },
@@ -171,9 +191,15 @@ describe("本文が受付上限を超えるメッセージの扱い", () => {
     const trimmed = trimHistoryForRequest(history);
     // 上限以内に収まっていることを確認する
     expect(trimmed[1].content.length).toBeLessThanOrEqual(MAX_CONTENT_LENGTH);
-    // 片割れだけのサロゲートが末尾に残っていないことを確認する。
+    // 省略の印を外して、実際に切った本文の末尾を取り出す。
+    // 印を付けたあとの末尾を見ると常に印の最後の文字になり、切り口を検査できない
+    const body = trimmed[1].content.slice(
+      0,
+      trimmed[1].content.length - OMITTED_ANSWER_SUFFIX.length
+    );
+    // 切り口に片割れだけのサロゲートが残っていないことを確認する。
     // 残っていると文字として成立しない値を上流へ送ることになる
-    const lastCode = trimmed[1].content.charCodeAt(trimmed[1].content.length - 1);
+    const lastCode = body.charCodeAt(body.length - 1);
     expect(lastCode >= 0xd800 && lastCode <= 0xdbff).toBe(false);
   });
 });

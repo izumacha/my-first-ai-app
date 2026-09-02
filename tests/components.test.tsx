@@ -103,6 +103,28 @@ describe("ChatInput", () => {
     expect(input).toHaveValue(tooLong);
   });
 
+  it("入力を直し始めた時点で上限超過の警告が消えること", () => {
+    // モック関数を作成する
+    const mockOnSend = vi.fn();
+    render(<ChatInput onSend={mockOnSend} isLoading={false} />);
+
+    // まず上限を超える長文で弾かれる状態を作る
+    const input = screen.getByPlaceholderText("メッセージを入力...");
+    fireEvent.change(input, { target: { value: "あ".repeat(MAX_CONTENT_LENGTH + 1) } });
+    fireEvent.submit(input.closest("form")!);
+    // 警告が出ていることを確認する（前提の確認）
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+
+    // 送信せずに短く直す（ユーザーが指摘を受けて修正している最中の状態）
+    fireEvent.change(input, { target: { value: "短い質問" } });
+
+    // 妥当な入力に直した時点で警告が消えることを確認する。
+    // 残っていると、正しい入力が「不正な入力」として読み上げられ続ける
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    // 支援技術向けの不正フラグも下りることを確認する
+    expect(input).toHaveAttribute("aria-invalid", "false");
+  });
+
   it("上限を超えた後に短く直せば送信できること", () => {
     // モック関数を作成する
     const mockOnSend = vi.fn();

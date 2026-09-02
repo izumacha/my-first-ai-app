@@ -71,7 +71,16 @@ export default function ChatInput({ onSend, isLoading }: ChatInputProps) {
         <input
           type="text"
           value={input}
-          onChange={(e) => setInput(e.target.value)}
+          onChange={(e) => {
+            // 入力を反映する
+            setInput(e.target.value);
+            // 直し始めたら前回の理由表示を消す。消さないと、短く直したあとも
+            // 「上限を超えています」と aria-invalid が残り続け、妥当な入力が
+            // 支援技術に不正な入力として読み上げられてしまう（再検証は送信時に行う）
+            if (inputError) {
+              setInputError(null);
+            }
+          }}
           placeholder="メッセージを入力..."
           aria-label="メッセージを入力"
           // 上限超過で弾かれている間は、支援技術にも「不正な入力」であることを伝える

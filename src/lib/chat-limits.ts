@@ -30,8 +30,18 @@ export const CONTENT_TOO_LONG_MESSAGE = `メッセージ本文が上限（${MAX_
 
 /** 上限を超えた assistant 発言を切り詰めたときに末尾へ付ける印。
  * 印なしで切ると、AI から見て「そこで終わった回答」と区別が付かず、
- * 続きを尋ねたときに省略された部分を踏まえない答えが返る。 */
-const OMITTED_ANSWER_SUFFIX = "\n\n（以前の回答はここで省略されました）";
+ * 続きを尋ねたときに省略された部分を踏まえない答えが返る。
+ * 切り口の位置を導くのにこの長さが要るため export する（テストからも参照する）。 */
+export const OMITTED_ANSWER_SUFFIX = "\n\n（以前の回答はここで省略されました）";
+
+/** 最後まで届かなかった回答の末尾に画面側が付ける印（§6 UI 文言は一元管理）。
+ *
+ * <p>`page.tsx` が表示・保存する文言だが、定義はここに置く。理由は 2 つある。
+ * (1) この印は**末尾にある**ことを前提に {@link OMITTED_ANSWER_SUFFIX} 側の
+ * 切り詰め位置を決めており、片方だけ変えるとその設計根拠が黙って崩れる。
+ * (2) 同じ「送信する本文の作り方」に関わる約束事なので、`src/lib/sse.ts` と同じく
+ * 送信側と表示側の唯一の参照元を 1 か所に置く。 */
+export const TRUNCATED_ANSWER_SUFFIX = "\n\n（回答はここで中断されました）";
 
 /**
  * 送信する会話履歴を上限件数まで切り詰める。
@@ -54,8 +64,14 @@ const OMITTED_ANSWER_SUFFIX = "\n\n（以前の回答はここで省略されま
 export function trimHistoryForRequest(
   messages: readonly Message[]
 ): Message[] {
+  // 本文が空白だけのメッセージを先に取り除く。
+  // サーバーは空白だけの本文を 400 で弾くため、これが履歴に紛れ込むと以降の送信が
+  // すべて 400 になり、しかも往復が成立しないので 50 件の窓が進まず永久に抜けない
+  // （件数・文字数の上限で塞いだのと同じ「復帰できない 400」を作らないための防御）
+  const meaningful = messages.filter((message) => message.content.trim() !== "");
+
   // 直近 MAX_MESSAGE_COUNT 件だけを切り出す（古い側から捨てる）
-  const recent = messages.slice(-MAX_MESSAGE_COUNT);
+  const recent = meaningful.slice(-MAX_MESSAGE_COUNT);
 
   // 窓の先頭が user 発言になる位置を探す（assistant で始まる窓は上流が 400 にするため）
   let start = 0;

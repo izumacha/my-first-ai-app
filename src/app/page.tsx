@@ -10,13 +10,11 @@ import ChatInput from "@/components/ChatInput";
 import CategoryChips from "@/components/CategoryChips";
 import { parseSseDataLine, SSE_DONE_MARKER } from "@/lib/sse";
 // 送信する会話履歴をサーバーの受付上限まで切り詰めるヘルパー（上限の定義元は @/lib/chat-limits）
-import { trimHistoryForRequest } from "@/lib/chat-limits";
+import {
+  TRUNCATED_ANSWER_SUFFIX,
+  trimHistoryForRequest,
+} from "@/lib/chat-limits";
 import type { Message, CategoryId } from "@/lib/types";
-
-/** 途中で切れた回答の末尾に付ける印（§6 UI 文言は一元管理）。
- * 画面上で「完全な回答」と見分けられるようにするのが主目的だが、この文字列は
- * 次の質問の文脈としてもそのまま送られるため、AI 側も回答が途切れたことを読み取れる。 */
-const TRUNCATED_ANSWER_SUFFIX = "\n\n（回答はここで中断されました）";
 
 /**
  * チャット画面のメインページコンポーネント
@@ -170,7 +168,9 @@ export default function Home() {
           // 成功・途中失敗のどちらでも、受信済みのテキストがあれば会話履歴に残す。
           // ここで確定させないと、途中でストリームが切れたときに受信済みの回答が
           // 消えたうえ、宙に浮いた吹き出しが次の送信まで表示され続けてしまう
-          if (accumulated) {
+          // 空白だけの回答は履歴に残さない。残すとサーバーの検証（本文が空）で
+          // 以降の送信がすべて 400 になり、往復が成立しないので窓からも抜けない
+          if (accumulated.trim()) {
             setMessages((prev) => [
               ...prev,
               {

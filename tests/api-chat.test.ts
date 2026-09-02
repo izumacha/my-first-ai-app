@@ -149,6 +149,8 @@ import { MissingApiKeyError } from "@/lib/anthropic";
 
 // テスト対象の POST ハンドラーをモック定義の後で読み込む
 import { POST } from "@/app/api/chat/route";
+// 完了の番兵（送信側と読み取り側で共有する定数）
+import { SSE_DONE_MARKER } from "@/lib/sse";
 
 /**
  * テスト用の POST リクエストを組み立てるヘルパー
@@ -680,6 +682,40 @@ describe("POST /api/chat の上流エラーマッピング", () => {
       // スパイを元に戻して他のテストへ影響させない
       errorSpy.mockRestore();
     }
+  });
+
+  it("max_tokens で打ち切られた回答を『完全な回答』として終わらせない", async () => {
+    // 上流が長さの上限で生成を止めた場合を模す（このアプリでいちばん起きやすい打ち切り理由）
+    createMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        // 中断用コントローラ（この試験では使われない）
+        controller: { abort: vi.fn() },
+        // デルタを 1 件流したあと、長さ上限で終わったことを伝えて正常終了する
+        async *[Symbol.asyncIterator]() {
+          // 途中までのデルタを返す
+          yield {
+            type: "content_block_delta",
+            delta: { type: "text_delta", text: "途中まで" },
+          };
+          // 生成が長さの上限で止まったことを伝えるイベントを返す
+          yield {
+            type: "message_delta",
+            delta: { stop_reason: "max_tokens", stop_sequence: null },
+          };
+        },
+      })
+    );
+    // 正常な形のリクエストを送る
+    const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
+    // 通信としては正常なので 200 のまま（エラーにすると届いている回答に障害の警告が出る）
+    expect(res.status).toBe(200);
+    // 応答本文を読み取って文字列にする
+    const body = await new Response(res.body).text();
+    // 受信済みのデルタは届いていることを確認する
+    expect(body).toContain("途中まで");
+    // 完了の番兵は送らない。送ると画面側が「完全な回答」として確定させ、
+    // 次のターンで欠けた回答が文脈として送り返される
+    expect(body).not.toContain(SSE_DONE_MARKER);
   });
 
   it("完了前に中断された配信を『完全な回答』として終わらせない", async () => {
