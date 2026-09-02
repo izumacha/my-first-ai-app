@@ -319,6 +319,42 @@ describe("チャット画面のストリーミング処理", () => {
     }
   });
 
+  it("1 文字も届かずに配信が切れた場合も接続の問題として伝えないこと", async () => {
+    // ヘッダは返ったが、最初の差分が届く前にサーバーが「完了前に終わった」ことを
+    // error で伝えてくる状況を模す（プラットフォームの実行時間上限など）
+    const brokenStream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.error(new Error("ストリーミングが完了前に中断されました"));
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response(brokenStream, { status: 200 }))
+    );
+    // この経路では障害ログを積み上げない（接続は成立している）
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => {});
+    try {
+      // チャット画面を描画してメッセージを送信する
+      render(<Home />);
+      sendMessage("テスト質問");
+
+      // 印付きの回答すら出ないぶん、文言の誤りがいちばん誤解を招く経路。
+      // 接続には問題が無いので「接続を確認してください」とは言わない
+      await waitFor(() => {
+        expect(screen.getByRole("alert")).toHaveTextContent(
+          "回答を最後まで受け取れませんでした"
+        );
+      });
+      expect(errorSpy).not.toHaveBeenCalled();
+      // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
+      await waitForIdle();
+    } finally {
+      errorSpy.mockRestore();
+      debugSpy.mockRestore();
+    }
+  });
+
   it("CRLF で区切られたストリームでも完全な回答として扱うこと", async () => {
     // 途中のプロキシが CRLF で流す場合を模す。行末の CR を落とし損ねると
     // 本文は届くのに [DONE] だけ一致せず、完全な回答に中断の印が付いてしまう

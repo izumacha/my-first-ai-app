@@ -194,29 +194,29 @@ export function trimHistoryForRequest(
     return lastUserMessage ? [capContent(lastUserMessage)] : [];
   }
 
+  // 「いま送ろうとしている質問」＝履歴全体の末尾にある user 発言。
+  // 窓の末尾で判定してはいけない: 末尾の assistant 発言を落とした結果として
+  // 窓の末尾に来た **過去の** user 発言まで「いま尋ねる質問」と見なされ、
+  // 上限を超えていても切り詰められずに送られてしまう（必ず 400 になる）
+  const currentQuestion = meaningful[meaningful.length - 1];
+
   // 過去の発言の本文は受付上限に収めて返す。
-  // 例外は末尾の user 発言（＝いま送ろうとしている質問）だけで、そこは削らない
-  return windowed.map((message, index) =>
-    isCurrentQuestion(message, index, windowed.length)
-      ? message
-      : capContent(message)
+  // 例外はいま送ろうとしている質問だけで、そこは削らない
+  return windowed.map((message) =>
+    isCurrentQuestion(message, currentQuestion) ? message : capContent(message)
   );
 }
 
 /**
  * その発言が「いま送ろうとしている質問」かを判定する。
  * @param message - 判定する発言
- * @param index - 窓の中での位置
- * @param length - 窓の件数
- * @returns 末尾の user 発言なら true
+ * @param latest - 履歴全体（空白だけの発言を除いたもの）の末尾にある発言
+ * @returns 履歴の末尾そのもので、かつ user 発言なら true
  */
-function isCurrentQuestion(
-  message: Message,
-  index: number,
-  length: number
-): boolean {
-  // 窓の末尾にある user 発言だけが「これから尋ねる質問」に当たる
-  return index === length - 1 && message.role === "user";
+function isCurrentQuestion(message: Message, latest: Message | undefined): boolean {
+  // 履歴の末尾そのもの（同じオブジェクト）で、かつ user 発言のときだけ
+  // 「これから尋ねる質問」に当たる
+  return message === latest && message.role === "user";
 }
 
 /**

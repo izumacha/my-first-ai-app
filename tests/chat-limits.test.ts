@@ -226,6 +226,23 @@ describe("本文が受付上限を超えるメッセージの扱い", () => {
     expect(trimmed[0].content).toBe(longQuestion);
   });
 
+  it("末尾の assistant 発言を落とした結果 窓の末尾に来た過去の質問も切り詰める", () => {
+    // 送信が失敗して回答だけが残った状態などで、末尾が assistant になっている履歴。
+    // 末尾の assistant を落とすと、上限を超える過去の user 発言が窓の末尾に来る
+    const history: Message[] = [
+      { role: "user", content: "あ".repeat(MAX_CONTENT_LENGTH + 500) },
+      { role: "assistant", content: "回答" },
+    ];
+    // 切り詰めを適用する
+    const trimmed = trimHistoryForRequest(history);
+    // 窓の末尾にあるだけで「いま尋ねる質問」と見なすと、上限を超えた本文が
+    // そのまま送られて必ず 400 になる（このモジュールが防ぐはずの状態）。
+    // 例外にしてよいのは履歴全体の末尾にある発言だけ
+    expect(trimmed[trimmed.length - 1].content.length).toBeLessThanOrEqual(
+      MAX_CONTENT_LENGTH
+    );
+  });
+
   it("過去の user 発言は切り詰める（復帰できない 400 を作らない）", () => {
     // 上限を超える user 発言が履歴に残っている状態を模す
     const history: Message[] = [

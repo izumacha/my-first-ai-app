@@ -172,12 +172,12 @@ export function createRateLimiter(options: RateLimiterOptions = {}): RateLimiter
       // ここで「now - t >= windowMs」と否定形を書き写すと、判定側と掃除側で
       // 規則が 2 か所に分かれ、片方だけ直したときに「判定はまだ数えている記録を
       // 掃除側が捨てる」＝その送信元が枠を丸ごと取り戻す（fail-open）ずれが起きる
-      if (keepWithinWindow(timestamps, (t) => t, now).length === 0) {
+      if (!hasWithinWindow(timestamps, (t) => t, now)) {
         buckets.delete(key);
       }
     }
     // 共有バケットも同じ規則で空にする（表の外に持っているので個別に見る）
-    if (keepWithinWindow(overflowRecords, (record) => record.at, now).length === 0) {
+    if (!hasWithinWindow(overflowRecords, (record) => record.at, now)) {
       overflowRecords = [];
     }
   }
@@ -199,8 +199,46 @@ export function createRateLimiter(options: RateLimiterOptions = {}): RateLimiter
     at: (entry: T) => number,
     now: number
   ): T[] {
-    // 経過時間がウィンドウ幅未満の記録だけを残す
-    return entries.filter((entry) => now - at(entry) < windowMs);
+    // ウィンドウ内の記録だけを残す（規則は isWithinWindow が唯一の参照元）
+    return entries.filter((entry) => isWithinWindow(at(entry), now));
+  }
+
+  /**
+   * ウィンドウ内の記録が 1 件でも残っているかを判定する。
+   *
+   * <p>掃除側は「1 件も残っていないか」しか見ないので、{@link keepWithinWindow} で
+   * 配列を作ってから長さを見るのは無駄が大きい（表が満杯なら 1 回の掃除で
+   * 1 万本の短命な配列を作ることになる）。`some` なら最初の 1 件で打ち切れる。
+   * 判定そのものは {@link isWithinWindow} を共有するので、規則は 1 か所のまま。
+   *
+   * @param entries - 判定対象の記録一覧
+   * @param at - 記録から時刻を取り出す関数
+   * @param now - 現在時刻（ミリ秒）
+   * @returns ウィンドウ内の記録が 1 件でもあれば true
+   */
+  function hasWithinWindow<T>(
+    entries: readonly T[],
+    at: (entry: T) => number,
+    now: number
+  ): boolean {
+    // ウィンドウ内の記録が見つかった時点で打ち切る
+    return entries.some((entry) => isWithinWindow(at(entry), now));
+  }
+
+  /**
+   * ある時刻の記録がまだウィンドウ内かを判定する。
+   *
+   * <p>**ウィンドウの規則はここが唯一の参照元。** 判定側と掃除側へ書き写すと、
+   * 規則を変えたときに片方だけ直して「判定はまだ数えている記録を掃除側が捨てる」
+   * ＝その送信元が枠を丸ごと取り戻す（fail-open）ずれが起きる。
+   *
+   * @param at - 記録の時刻（ミリ秒）
+   * @param now - 現在時刻（ミリ秒）
+   * @returns 経過時間がウィンドウ幅未満なら true
+   */
+  function isWithinWindow(at: number, now: number): boolean {
+    // 経過時間がウィンドウ幅未満ならまだ数える対象
+    return now - at < windowMs;
   }
 
   return {
