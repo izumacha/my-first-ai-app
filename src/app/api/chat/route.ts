@@ -54,6 +54,11 @@ const COMPLETE_STOP_REASONS: readonly Anthropic.StopReason[] = [
   "stop_sequence",
 ];
 
+/** 上流の Retry-After を中継するときの上限（秒）。1 時間。
+ * 上流が桁の大きな値を返しても、クライアントに事実上永久の待機を指示しない
+ * ための頭打ち（下限 1 秒と対称に置く）。 */
+const MAX_RELAYED_RETRY_AFTER_SECONDS = 3600;
+
 /** メッセージのロールとして受け付ける値の一覧（未知のロールを Claude へ転送しない） */
 const ALLOWED_ROLES: readonly Role[] = ["user", "assistant"];
 
@@ -184,8 +189,13 @@ function upstreamRetryAfterSeconds(error: InstanceType<typeof Anthropic.APIError
     return null;
   }
   // 最低でも 1 秒は待たせる。0 をそのまま伝えると「すぐ再試行してよい」の意味になり、
-  // 上流に弾かれ続けるリクエストで自前のレート制限の枠まで食い潰す
-  return String(Math.max(1, seconds));
+  // 上流に弾かれ続けるリクエストで自前のレート制限の枠まで食い潰す。
+  // 上側にも頭打ちを設ける: 桁の大きな値をそのまま中継すると、設定を誤った
+  // （あるいは意地の悪い）上流の一言で、クライアントがこのエンドポイントへ
+  // 事実上二度と再試行しなくなる。下限を設けているのと対称の理由
+  return String(
+    Math.min(MAX_RELAYED_RETRY_AFTER_SECONDS, Math.max(1, seconds))
+  );
 }
 
 /**

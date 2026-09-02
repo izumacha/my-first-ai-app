@@ -78,9 +78,6 @@ export default function Home() {
    */
   const handleSend = useCallback(
     async (content: string) => {
-      // エラー表示をクリアする
-      setError(null);
-
       // 上限を超える本文は履歴に積まない。積むとサーバーが 400 を返す一方で
       // 履歴には残り続け、以降のすべての送信が同じ 400 になって復帰できなくなる。
       // 入力欄側も同じ規則（findContentProblem）で先に弾くが、あちらは
@@ -104,15 +101,21 @@ export default function Home() {
       // 進行中の印を立てる（解除は下の finally で必ず行う）
       inFlightRef.current = true;
 
+      // ここまで来て初めて、前回の送信についての通知を消す。
+      // 先に消すと、重なった送信を上のガードで捨てたときに「前回の失敗の理由が
+      // 消えただけで何も起きない」画面になり、何が起きたのか分からなくなる
+      setError(null);
+
       // ユーザーのメッセージオブジェクトを作成する
       const userMessage: Message = { role: "user", content };
 
       // 会話履歴にユーザーメッセージを追加する。
-      // 更新は関数形式で行う: 直前の値を捕まえた配列をそのまま渡すと、再描画の前に
-      // 送信が 2 回重なったときに片方の発言が丸ごと消える（送信ボタンの無効化で
-      // today は防げているが、入力欄を経由しない送信経路が増えると効かない）
+      // 画面へ反映する配列と API へ送る配列は**同じもの**を使う。関数形式
+      // （previous => [...previous, userMessage]）にすると表示側だけが最新になり、
+      // 送信側は直前の値を捕まえた配列のままなので、両者が食い違う余地が残る。
+      // 重なった送信は上の inFlightRef で止めてあるので、この配列は常に最新
       const updatedMessages = [...messages, userMessage];
-      setMessages((previous) => [...previous, userMessage]);
+      setMessages(updatedMessages);
 
       // 応答の読み取りに入ったかどうか。外側の catch が「通信エラー」と
       // 断定してよいかの判断に使う。読み取りに入っていれば接続は成立して
@@ -183,7 +186,6 @@ export default function Home() {
           });
           // 完了したかを控える（例外で終わった場合はここへ来ないので false のまま）
           completed = answer.completed;
-
 
           // ここへ来たのは読み取りが例外なく終わったときだけ（＝通信は成功した）。
           // それでも 1 文字も受け取れていないなら、黙って何も起きなかったように

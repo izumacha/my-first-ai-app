@@ -36,7 +36,7 @@ export const MAX_CONTENT_LENGTH = 4000;
  * 3 バイト換算のままだと「上限内の履歴なのに 413」を見逃す。
  * 関係が崩れていないことは `tests/chat-limits.test.ts` が固定する
  * （係数が本当に最悪ケースかも、実際に JSON 化して確かめている）。 */
-export const MAX_BODY_BYTES = 1_500_000;
+export const MAX_BODY_BYTES = 1_250_000;
 
 /** 本文が上限を超えたときにユーザーへ見せる文言（§6 UI 文言は一元管理）。
  * サーバーの検証（`route.ts`）と、送信前に弾く入力欄（`ChatInput.tsx`）の両方が

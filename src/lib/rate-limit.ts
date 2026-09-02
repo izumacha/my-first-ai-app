@@ -259,7 +259,11 @@ export function createRateLimiter(options: RateLimiterOptions = {}): RateLimiter
       const sweepIsDue =
         // 時刻が巻き戻った場合も「間隔が空いた」とみなして掃除する（止まらないように）
         now < lastSweptAt || now - lastSweptAt >= sweepIntervalMs;
-      if (buckets.size >= maxTrackedClients && sweepIsDue) {
+      // 表が満杯かどうかは条件にしない。満杯を条件にすると、山を越えて件数が
+      // 上限に届かなくなった時点で掃除が二度と走らず、とっくに期限切れの
+      // バケットをプロセスが生きているあいだ抱え続ける（回収したいのはまさに
+      // その状態）。走査の費用は間隔で頭打ちになっている
+      if (sweepIsDue) {
         // 掃除した時刻と回数を記録する
         lastSweptAt = now;
         sweepCount += 1;

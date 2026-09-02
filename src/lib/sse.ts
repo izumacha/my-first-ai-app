@@ -43,6 +43,12 @@ export function parseSseDataLine(line: string): string | null {
   return line.slice(SSE_DATA_PREFIX.length);
 }
 
+/** 1 行として受け付ける最大文字数。
+ * 行区切りが来ないまま伸び続ける受信（応答を 1 本の終端されない行にまとめる
+ * プロキシなど）でメモリを抱え込まないための頭打ち。正規の差分 1 件は
+ * これよりはるかに短いので、通常の配信には影響しない。 */
+const MAX_SSE_LINE_LENGTH = 1_000_000;
+
 /** SSE の行区切り。仕様では CRLF・CR・LF のいずれも認められている。
  * LF だけで割ると、CR だけで区切るストリームでは 1 行も切り出せず応答が
  * 丸ごと捨てられ、CRLF では本文の末尾に \r が残って終端の番兵と一致しなくなる
@@ -123,6 +129,20 @@ export async function readSseAnswer(
 
     // バイナリデータを文字列にデコードし、持ち越し分と連結する
     lineBuffer += decoder.decode(value, { stream: true });
+
+    // 行区切りが一度も来ないまま伸び続ける受信への頭打ち。
+    // 途中のプロキシが応答を 1 本の終端されない行にまとめてしまうと、
+    // バッファだけが際限なく膨らみ、画面には何も出ないままタブが応答全体を
+    // 抱え込む。上限を超えたら持ち越しを捨て、「欠けがある」ことを記録する
+    // （次の区切り以降は再び読める）
+    if (lineBuffer.length > MAX_SSE_LINE_LENGTH) {
+      // 捨てた事実を最初の 1 件だけ記録する
+      if (!droppedFrame) {
+        console.debug("SSE の 1 行が上限を超えたため読み飛ばしました");
+      }
+      droppedFrame = true;
+      lineBuffer = "";
+    }
 
     // SSE 形式の行に切り分ける。未完の行は次のチャンクへ持ち越す
     const { lines, remainder } = splitSseLines(lineBuffer);

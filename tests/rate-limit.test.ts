@@ -143,24 +143,42 @@ describe("追跡表が満杯のときの挙動", () => {
       maxRequests: 100,
       maxTrackedClients: 2,
     });
-    // 2 件の送信元で表を満杯にする
+    // 最初の呼び出しで 1 回目の掃除が走る
     limiter.isRateLimited("a", 5_000);
-    limiter.isRateLimited("b", 5_000);
-    // 満杯になってから最初の呼び出しで 1 回目の掃除が走る
-    limiter.isRateLimited("a", 5_100);
     expect(limiter.sweepCount).toBe(1);
 
     // 同じ間隔（1000ms）の中で何度呼んでも掃除は増えない。
     // 毎リクエスト走査する実装だと、偽装キーで表を満杯にされた状態で
     // 全リクエストが 1 万件の走査を負担することになる
-    for (let t = 5_200; t < 6_100; t += 100) {
+    for (let t = 5_100; t < 6_000; t += 100) {
       limiter.isRateLimited("a", t);
     }
     expect(limiter.sweepCount).toBe(1);
 
     // 間隔を越えれば次の掃除が走る
-    limiter.isRateLimited("a", 6_101);
+    limiter.isRateLimited("a", 6_000);
     expect(limiter.sweepCount).toBe(2);
+  });
+
+  it("表が満杯でなくても期限切れのバケットを回収する", () => {
+    // 追跡枠に余裕がある状態を作る（4 件だけ使い、上限は 5 件）
+    const limiter = createRateLimiter({
+      windowMs: 1_000,
+      maxRequests: 5,
+      maxTrackedClients: 5,
+    });
+    for (const key of ["a", "b", "c", "d"]) {
+      limiter.isRateLimited(key, 0);
+    }
+    expect(limiter.trackedClientCount).toBe(4);
+
+    // ずっと後の 1 件（4 件はとっくに期限切れ）
+    limiter.isRateLimited("e", 100_000);
+
+    // 満杯を掃除の条件にすると、山を越えて件数が上限に届かなくなった時点で
+    // 掃除が二度と走らず、期限切れのバケットをプロセスが生きているあいだ
+    // 抱え続ける（回収したいのはまさにその状態）
+    expect(limiter.trackedClientCount).toBe(1);
   });
 
   it("期限切れになれば 1 間隔以内に回収する（次のウィンドウまで待たない）", () => {

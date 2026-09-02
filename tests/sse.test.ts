@@ -234,6 +234,25 @@ describe("readSseAnswer", () => {
     ).rejects.toBe(boom);
   });
 
+  it("行区切りが来ないまま伸び続ける受信は頭打ちにして未完了として扱う", async () => {
+    // 応答を 1 本の終端されない行にまとめるプロキシを模す。
+    // 頭打ちが無いと、画面には何も出ないままタブが応答全体を抱え込む
+    const encoder = new TextEncoder();
+    const huge = "x".repeat(600_000);
+    // 終端されない巨大な行のあとに、正常な終端の番兵が届く配信にする。
+    // 頭打ちが無いと巨大な行はバッファに溜まったまま番兵だけが解析され、
+    // 「何も捨てていない完全な回答」として確定してしまう
+    const reader = readerOf([
+      encoder.encode(huge),
+      encoder.encode(huge),
+      encoder.encode(`\n\n${formatSseFrame(SSE_DONE_MARKER)}`),
+    ]);
+    // 読み取りを実行する
+    const answer = await readSseAnswer(reader, () => {});
+    // 捨てた分があるので、番兵を受け取っていても完了として扱わない
+    expect(answer.completed).toBe(false);
+  });
+
   it("終端の番兵が来ないまま終わった配信は未完了として扱う", async () => {
     // 差分だけを流して番兵を送らずに終わる（多バイト文字の途中で切れた場合も
     // ここに含まれる。デコーダーに残ったバイト列があっても判定は変わらない）
