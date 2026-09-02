@@ -190,6 +190,49 @@ describe("追跡表が満杯のときの挙動", () => {
     expect(limiter.trackedClientCount).toBe(1);
   });
 
+  it("共有バケットで数えた分は、表に空きができても引き継ぐ", () => {
+    // 1 ウィンドウ 2 回まで、追跡できるのは 2 送信元までの制限器を作る
+    const limiter = createRateLimiter({
+      windowMs: 1000,
+      maxRequests: 2,
+      maxTrackedClients: 2,
+    });
+    // t=0 に 2 送信元で表を満杯にする（この記録は t=1000 に期限切れになる）
+    limiter.isRateLimited("a", 0);
+    limiter.isRateLimited("b", 0);
+
+    // 表が満杯の間、未追跡の k は共有バケットで数えられて 2 回通る
+    expect(limiter.isRateLimited("k", 900)).toBe(false);
+    expect(limiter.isRateLimited("k", 905)).toBe(false);
+    // 3 回目は共有の枠を使い切っているので弾かれる
+    expect(limiter.isRateLimited("k", 910)).toBe(true);
+
+    // t=1005 では a・b が期限切れになって回収され、表に空きができる。
+    // ここで k が空のバケットから始まると、900・905 の 2 回がリセットされ、
+    // 同じウィンドウ内（1005 - 900 = 105ms）で上限の 2 倍まで通れてしまう
+    expect(limiter.isRateLimited("k", 1005)).toBe(true);
+  });
+
+  it("共有バケットの引き継ぎは送信元ごとに絞る（他人の消費で弾かない）", () => {
+    // 上と同じ設定の制限器を作る
+    const limiter = createRateLimiter({
+      windowMs: 1000,
+      maxRequests: 2,
+      maxTrackedClients: 2,
+    });
+    // t=0 に 2 送信元で表を満杯にする
+    limiter.isRateLimited("a", 0);
+    limiter.isRateLimited("b", 0);
+    // 満杯の間に k が共有バケットの枠を使い切る
+    limiter.isRateLimited("k", 900);
+    limiter.isRateLimited("k", 905);
+
+    // 表に空きができたあと、共有バケットを一切使っていない新規の m は
+    // 自分のバケットを空から始められる。共有バケット全体を引き継ぐ実装だと、
+    // 他人（k）の消費で理由なく弾かれてしまう
+    expect(limiter.isRateLimited("m", 1005)).toBe(false);
+  });
+
   it("共有バケットは追跡表の外に持つ（上限を超えて表が膨らまない）", () => {
     // 1 件までしか追跡できない制限器を作る
     const limiter = createRateLimiter({

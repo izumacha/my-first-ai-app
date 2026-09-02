@@ -140,8 +140,11 @@ export function createRateLimiter(options: RateLimiterOptions = {}): RateLimiter
 
   // 送信元キーごとに、ウィンドウ内のリクエスト時刻を保持する表
   const buckets = new Map<string, number[]>();
-  // 表が満杯のときに新規送信元をまとめて数える共有バケット（表とは別に持つ。理由は上の注記）
-  let overflowTimestamps: number[] = [];
+  // 表が満杯のときに新規送信元をまとめて数える共有バケット（表とは別に持つ。理由は上の注記）。
+  // 時刻だけでなく「どの送信元の分か」も持つ: 表に空きができた瞬間に、その送信元が
+  // 共有バケットで使い切ったはずの枠がリセットされるのを防ぐため（下の注記）。
+  // 件数は maxRequests で頭打ちになるので、キーを持っても大きさは有界
+  let overflowRecords: { key: string; at: number }[] = [];
   // 最後に掃除を実行した時刻（まだ一度も掃除していないので、必ず 1 回目が走る値で初期化）
   let lastSweptAt = Number.NEGATIVE_INFINITY;
   // これまでに掃除を実行した回数（頻度が絞れているかを外から観測するために数える）
@@ -167,8 +170,8 @@ export function createRateLimiter(options: RateLimiterOptions = {}): RateLimiter
       }
     }
     // 共有バケットも同じ規則で空にする（表の外に持っているので個別に見る）
-    if (overflowTimestamps.every((t) => now - t >= windowMs)) {
-      overflowTimestamps = [];
+    if (overflowRecords.every((record) => now - record.at >= windowMs)) {
+      overflowRecords = [];
     }
   }
 
@@ -204,8 +207,40 @@ export function createRateLimiter(options: RateLimiterOptions = {}): RateLimiter
       const useOverflow =
         buckets.size >= maxTrackedClients && !buckets.has(clientKey);
 
-      // この送信元（または共有バケット）の過去のリクエスト時刻一覧を取得する
-      const timestamps = useOverflow ? overflowTimestamps : buckets.get(clientKey) ?? [];
+      // 共有バケットで数える場合。判定は「どの送信元の分か」を問わず全体で行うが、
+      // 記録には送信元キーを残す（下の引き継ぎに要る）。時刻だけの配列を扱う
+      // 通常経路と形が違うため、まとめずに分けている
+      if (useOverflow) {
+        // ウィンドウ内の記録だけを残す
+        const recentRecords = overflowRecords.filter(
+          (record) => now - record.at < windowMs
+        );
+        // 共有の枠を使い切っていれば制限超過と判定する（この回は数えない）
+        if (recentRecords.length >= maxRequests) {
+          return true;
+        }
+        // 今回のリクエストを、どの送信元の分かが分かる形で記録する
+        recentRecords.push({ key: clientKey, at: now });
+        // 共有バケットへ書き戻す
+        overflowRecords = recentRecords;
+        // 制限内なので false を返す
+        return false;
+      }
+
+      // この送信元の過去のリクエスト時刻一覧を取得する。
+      //
+      // 表にまだ無い送信元は、**共有バケットに残っている自分の分だけを引き継ぐ**。
+      // 空から始めると、表が満杯だった間に共有バケットで使い切ったはずの枠が
+      // 空きができた瞬間にリセットされ、同じ送信元が 1 ウィンドウ内に上限の
+      // 2 倍まで通れてしまう（送信元キーは偽装できるので、表を満杯にしてから
+      // この切り替わりを狙える）。引き継ぐ範囲を自分の分だけに絞るのが要点で、
+      // 共有バケット全体を引き継ぐと、無関係な新規クライアントが他人の消費で
+      // 弾かれる（掃除を間隔で絞ったのと同じ「理由なく 429」を作ってしまう）
+      const timestamps =
+        buckets.get(clientKey) ??
+        overflowRecords
+          .filter((record) => record.key === clientKey)
+          .map((record) => record.at);
 
       // ウィンドウ内のリクエストだけを残すようフィルタリングする
       const recentTimestamps = timestamps.filter((t) => now - t < windowMs);
@@ -218,12 +253,8 @@ export function createRateLimiter(options: RateLimiterOptions = {}): RateLimiter
       // 今回のリクエスト時刻を記録する
       recentTimestamps.push(now);
 
-      // 記録を書き戻す（共有バケットは表の外にあるので別の変数へ）
-      if (useOverflow) {
-        overflowTimestamps = recentTimestamps;
-      } else {
-        buckets.set(clientKey, recentTimestamps);
-      }
+      // この送信元のバケットへ書き戻す
+      buckets.set(clientKey, recentTimestamps);
 
       // 制限内なので false を返す
       return false;
