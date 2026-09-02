@@ -13,6 +13,8 @@ import {
 } from "@/lib/anthropic";
 import { getSystemPrompt, getMaxTokens, isCategoryId } from "@/lib/prompts";
 import { formatSseFrame, SSE_DONE_MARKER } from "@/lib/sse";
+// 入力上限はクライアントと共有する（唯一の参照元は @/lib/chat-limits）
+import { MAX_CONTENT_LENGTH, MAX_MESSAGE_COUNT } from "@/lib/chat-limits";
 import type { ChatErrorResponse, Message, Role } from "@/lib/types";
 
 /** レート制限用：IP ごとのリクエスト時刻を記録するマップ */
@@ -45,14 +47,6 @@ const MAX_BODY_BYTES = 1_000_000;
 /** 429 応答の Retry-After ヘッダに載せる待機秒数（レート制限ウィンドウと同じ長さ）。
  * クライアントが正しくバックオフできるよう、いつ再試行してよいかを明示する。 */
 const RETRY_AFTER_SECONDS = String(RATE_LIMIT_WINDOW_MS / 1000);
-
-/** 1 リクエストで受け付ける会話履歴の最大メッセージ数（無制限の履歴送信による
- * トークン浪費・リソース枯渇を防ぐ。通常のチャット利用では到達しない値）。 */
-const MAX_MESSAGE_COUNT = 50;
-
-/** 1 メッセージ本文の最大文字数（巨大ボディをそのまま Claude へ転送して
- * 課金・メモリを浪費させられないようにする入力上限）。 */
-const MAX_CONTENT_LENGTH = 4000;
 
 /** メッセージのロールとして受け付ける値の一覧（未知のロールを Claude へ転送しない） */
 const ALLOWED_ROLES: readonly Role[] = ["user", "assistant"];

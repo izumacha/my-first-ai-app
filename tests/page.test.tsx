@@ -19,6 +19,9 @@ import {
 import type { Mock } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import Home from "@/app/page";
+// 送信履歴の上限（画面とサーバーで共有する定数）を参照する
+import { MAX_MESSAGE_COUNT } from "@/lib/chat-limits";
+import type { Message } from "@/lib/types";
 
 /** テストで組み立てた ReadableStream の解放（cancel）を記録するためのスパイ置き場 */
 let cancelSpy: Mock<() => void>;
@@ -285,5 +288,51 @@ describe("チャット画面のストリーミング処理", () => {
     });
     // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
     await waitForIdle();
+  });
+
+  it("会話が続いても送信する履歴を受付上限以内に保つこと", async () => {
+    // 送信されたリクエストボディを順に記録する配列
+    const sentBodies: { messages: Message[] }[] = [];
+    // 呼び出しのたびに新しいストリームを返す（Response のボディは 1 度しか読めないため）
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation((_url: string, init: RequestInit) => {
+        // 送信されたボディを解析して記録する
+        sentBodies.push(JSON.parse(init.body as string));
+        // 1 件の差分と [DONE] を流す応答を返す
+        return Promise.resolve(
+          new Response(makeStream(['data: {"text":"回答"}\n\ndata: [DONE]\n\n']), {
+            status: 200,
+          })
+        );
+      })
+    );
+
+    // チャット画面を描画する
+    render(<Home />);
+
+    // 1 往復ごとに履歴が 2 件（user + assistant）増えるので、上限を必ず超える回数だけ往復する。
+    // 切り詰めが無いと、この回数に達した時点でサーバーが 400 を返し以降ずっと送信できなくなる
+    const exchanges = Math.ceil(MAX_MESSAGE_COUNT / 2) + 1;
+    for (let i = 0; i < exchanges; i += 1) {
+      // メッセージを送信する
+      sendMessage(`質問${i}`);
+      // 次の送信ができる状態に戻るまで待つ
+      await waitForIdle();
+    }
+
+    // 上限を超える履歴が積まれた後の送信であることを確認する（テスト自体が前提を満たすかの確認）
+    expect(sentBodies.length).toBe(exchanges);
+    // どの送信でも、サーバーが受け付ける件数を超えていないことを確認する
+    for (const body of sentBodies) {
+      expect(body.messages.length).toBeLessThanOrEqual(MAX_MESSAGE_COUNT);
+      // 上流 Claude API は最初のメッセージが user ロールであることを要求する
+      expect(body.messages[0].role).toBe("user");
+    }
+    // 最後の送信には、いま入力した最新の質問が含まれることを確認する（古い側だけが捨てられる）
+    const lastMessages = sentBodies[sentBodies.length - 1].messages;
+    expect(lastMessages[lastMessages.length - 1].content).toBe(
+      `質問${exchanges - 1}`
+    );
   });
 });

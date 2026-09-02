@@ -9,6 +9,8 @@ import ChatContainer from "@/components/ChatContainer";
 import ChatInput from "@/components/ChatInput";
 import CategoryChips from "@/components/CategoryChips";
 import { parseSseDataLine, SSE_DONE_MARKER } from "@/lib/sse";
+// 送信する会話履歴をサーバーの受付上限まで切り詰めるヘルパー（上限の定義元は @/lib/chat-limits）
+import { trimHistoryForRequest } from "@/lib/chat-limits";
 import type { Message, CategoryId } from "@/lib/types";
 
 /**
@@ -55,7 +57,10 @@ export default function Home() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            messages: updatedMessages,
+            // 画面には全履歴を残したまま、API へはサーバーが受け付ける件数まで
+            // 切り詰めた履歴だけを送る。切り詰めないと会話が続くほど履歴が伸び、
+            // 上限を超えた時点から以降のすべての送信が 400 になって会話を続けられなくなる
+            messages: trimHistoryForRequest(updatedMessages),
             category,
           }),
         });
