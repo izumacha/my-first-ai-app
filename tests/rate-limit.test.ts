@@ -145,6 +145,31 @@ describe("追跡表が満杯のときの挙動", () => {
   });
 });
 
+describe("上限値の検証（fail-closed）", () => {
+  it.each([
+    ["windowMs", { windowMs: 0 }],
+    ["windowMs（負数）", { windowMs: -1 }],
+    ["windowMs（整数でない）", { windowMs: 1.5 }],
+    ["maxRequests", { maxRequests: 0 }],
+    ["maxTrackedClients", { maxTrackedClients: 0 }],
+    ["NaN", { windowMs: Number.NaN }],
+  ])("%s が正の整数でなければ生成時に失敗する", (_name, options) => {
+    // 不正な上限値では制限器を作れないことを確認する。
+    // とくに windowMs が 0 だと「now - t < 0」が成立せず記録が常に空になり、
+    // レート制限が丸ごと無効になる（このアプリの DoS・課金対策はこれしか無い）
+    expect(() => createRateLimiter(options)).toThrow(RangeError);
+  });
+
+  it("正しい上限値なら生成できる", () => {
+    // 妥当な値では例外にならないことを確認する（検証が厳しすぎないことの確認）
+    expect(() =>
+      createRateLimiter({ windowMs: 1000, maxRequests: 1, maxTrackedClients: 1 })
+    ).not.toThrow();
+    // 既定値（引数なし）でも生成できることを確認する
+    expect(() => createRateLimiter()).not.toThrow();
+  });
+});
+
 describe("本番で使う既定値", () => {
   it("CLAUDE.md が定める『1 分あたり 20 リクエスト』と一致する", () => {
     // ウィンドウは 1 分であることを確認する

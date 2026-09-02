@@ -132,7 +132,7 @@ function hasJsonContentType(request: NextRequest): boolean {
  * リバースプロキシは受信した値の「後ろ」に実 IP を追記する）ため、先頭ではなく
  * 信頼できるプロキシが設定する X-Real-IP を優先し、無ければ末尾（最後のプロキシが
  * 追記した実際の接続元）を採用する。それでも直接公開構成では偽装が残るため、
- * マップ上限（MAX_TRACKED_CLIENTS）と共有バケットで資源枯渇を防いでいる。
+ * 追跡表の上限と共有バケット（@/lib/rate-limit）で資源枯渇を防いでいる。
  * @param request - 受信リクエスト
  * @returns レート制限のキーとして使う文字列
  */
@@ -292,9 +292,9 @@ type UpstreamStream = AsyncIterable<Anthropic.RawMessageStreamEvent> & {
  */
 function createSseStream(stream: UpstreamStream): ReadableStream<Uint8Array> {
   // 受信側が自分から切断した（cancel() が呼ばれた）かどうかを覚えておくフラグ。
-  // 切断後の失敗は「報告先がいないので記録しない」、それ以外の失敗は「記録して伝える」と
-  // 扱いが正反対になるため区別が要る。cancel() は controller が使えなくなるのと同時に
-  // 同期的に呼ばれるので、下の catch へ届く時点で必ず最新の値になっている
+  // 切断後は controller へ書けなくなるので、書き込みの前に必ずこれを確認する。
+  // cancel() は controller が使えなくなるのと同時に同期的に呼ばれ、確認と書き込みの
+  // 間には await を挟まないため、確認を通ったあとに切断が割り込むことはない
   let cancelledByConsumer = false;
   // SSE のチャンクを順次書き出す ReadableStream を組み立てて返す
   return new ReadableStream({
@@ -307,37 +307,48 @@ function createSseStream(stream: UpstreamStream): ReadableStream<Uint8Array> {
             event.type === "content_block_delta" &&
             event.delta.type === "text_delta"
           ) {
+            // 受信側が既に切断していれば、書く相手がいないのでここで終える。
+            // 書きに行くと「Invalid state: Controller is already closed」の
+            // TypeError になり、正常な切断が上流障害と見分けられなくなる
+            if (cancelledByConsumer) {
+              return;
+            }
             // テキスト差分を SSE 形式でエンコードして送信する（書式は @/lib/sse に集約）
             const data = JSON.stringify({ text: event.delta.text });
             controller.enqueue(sseEncoder.encode(formatSseFrame(data)));
           }
+        }
+        // 上流を読み切ったあとも、書く前に受信側が残っているかを確かめる。
+        // SDK は反復中の中断を throw せず正常終了する（core/streaming.js の
+        // 「abort されたら return する」）ため、切断はここへ普通に到達する
+        if (cancelledByConsumer) {
+          return;
         }
         // ストリーム終了を通知する（番兵の値は読み取り側と共有の定数を使う）
         controller.enqueue(sseEncoder.encode(formatSseFrame(SSE_DONE_MARKER)));
         // ストリームを閉じる
         controller.close();
       } catch (error) {
-        // 受信側が自分から切断したあとの失敗は、報告する相手がもういないので記録しない。
+        // ここへ来るのは上流の反復そのものが失敗した場合だけになる
+        // （受信側への書き込みは上の切断チェックで守られているため）。
+        // だから失敗の種類で分類してから、受信側の有無で後始末を変える。
         //
-        // これが最も頻度の高い経路である点に注意: SDK のストリームは反復中の中断を
-        // throw せず正常終了する（core/streaming.js の「abort されたら return する」）。
-        // そのため受信側が切断しても for-await は例外を出さずに抜け、切断は直後の
-        // 終端フレーム enqueue が「Invalid state: Controller is already closed」の
-        // TypeError になる形で初めて表面化する。これは正常な切断の結果であって
-        // 障害ではないため、下の console.error へ流すと通常のタブ閉じのたびに
-        // 障害ログが積まれ、本物の上流障害が埋もれてしまう
-        if (cancelledByConsumer) {
-          return;
-        }
-        // 中断由来のエラー（SDK の分類が変わった場合などの保険）も異常系ではないので
-        // エラー通知はしない。ただしここへ来るのは受信側が切断していない場合だけなので、
-        // まだ読み手がいる可能性がある。close() で終端を伝えないとストリームが完結も
-        // 失敗もしないまま宙吊りになり、読み手の read() が永久に解決しない
-        // （切断済みなら上の早期 return で抜けているので、この close() は必ず有効）
+        // 分類を先に行うのが重要: 上流の失敗と受信側の切断はネットワーク障害で
+        // 同時に起きうる。切断の有無を先に見て早期 return すると、その競合の
+        // ときだけ本物の上流障害が無記録で消え、いちばんログが欲しい場面で
+        // 記録が残らなくなる
+
+        // 中断由来のエラー（SDK の分類が変わった場合などの保険）は異常系ではないので
+        // 記録もエラー通知もしない
         if (isAbortError(error)) {
-          controller.close();
+          // 受信側がまだ読んでいるなら終端を伝える。何もせず抜けるとストリームが
+          // 完結も失敗もしないまま宙吊りになり、読み手の read() が永久に解決しない
+          if (!cancelledByConsumer) {
+            controller.close();
+          }
           return;
         }
+
         // 中断以外の失敗（上流の切断・overloaded 等）はサーバログに必ず残す。
         // この時点では既に 200 とヘッダを返し終えているため POST ハンドラーの
         // catch（mapErrorToResponse）へは戻らず、controller.error() は受信側を
@@ -347,8 +358,12 @@ function createSseStream(stream: UpstreamStream): ReadableStream<Uint8Array> {
           "チャット API のストリーミング中にエラーが発生しました:",
           error
         );
-        // 中断以外のストリーム中のエラーはコントローラーに伝える
-        controller.error(error);
+
+        // 受信側が残っているときだけエラーを伝える
+        // （cancel() 済みの controller へ error() を呼ぶ意味は無い）
+        if (!cancelledByConsumer) {
+          controller.error(error);
+        }
       }
     },
     cancel() {

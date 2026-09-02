@@ -52,9 +52,15 @@ function makeFailingStream(failure: unknown) {
  * 実 SDK と同じく「中断されたら throw せず正常終了する」ストリームのモックを生成する。
  * 実 SDK（core/streaming.js）の反復子は abort を捕まえて return するため、
  * 受信側が切断しても route の for-await は例外を出さずに抜ける。
- * @returns 1 件流したあと、中断されるまで待って静かに終わるモックストリーム
+ * @param options - `failWhenAborted` を渡すと、中断されたあとに静かに終わる代わりに
+ *                  そのエラーを投げる（切断と上流障害が同時に起きる状況の再現に使う）。
+ *                  `deltasAfterAbort` を渡すと、中断後もその件数だけデルタを流し続ける
+ *                  （上流がまだ切断に気づいていない状況の再現に使う）
+ * @returns 1 件流したあと、中断されるまで待って終わるモックストリーム
  */
-function makeAbortAwareStream() {
+function makeAbortAwareStream(
+  options: { failWhenAborted?: unknown; deltasAfterAbort?: number } = {}
+) {
   // 中断が要求されたかどうかを保持するフラグ
   let aborted = false;
   return {
@@ -76,7 +82,19 @@ function makeAbortAwareStream() {
       while (!aborted) {
         await new Promise((resolve) => setTimeout(resolve, 0));
       }
-      // 中断されたら throw せずに終了する（実 SDK と同じ挙動）
+      // 中断後もデルタを流し続ける指定があれば、その件数だけ流す
+      // （上流がまだ切断に気づいていない状況に相当する）
+      for (let i = 0; i < (options.deltasAfterAbort ?? 0); i += 1) {
+        yield {
+          type: "content_block_delta",
+          delta: { type: "text_delta", text: "にちは" },
+        };
+      }
+      // 上流障害を同時に起こす指定があれば、そのエラーを投げる
+      if (options.failWhenAborted !== undefined) {
+        throw options.failWhenAborted;
+      }
+      // 指定が無ければ throw せずに終了する（実 SDK の中断時と同じ挙動）
     },
   };
 }
@@ -655,6 +673,61 @@ describe("POST /api/chat の上流エラーマッピング", () => {
       // 切断後の書き込みは「Invalid state: Controller is already closed」の
       // TypeError になるため、切断の判定を誤ると毎回ここが障害ログになる
       expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      // スパイを元に戻して他のテストへ影響させない
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("切断後に上流がまだデルタを流してきてもサーバ障害としてログに残さない", async () => {
+    // 切断に上流がすぐ気づかず、デルタが続けて届く状況を作る。
+    // 切断済みの controller へ書きに行くと TypeError になるため、
+    // 書き込みの前に切断を確認していないとここで障害ログが出る
+    createMock.mockImplementationOnce(() =>
+      Promise.resolve(makeAbortAwareStream({ deltasAfterAbort: 3 }))
+    );
+    // サーバ障害ログが呼ばれないことを検証するためスパイを仕込む
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // 正常な形のリクエストを送る
+      const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
+      // 読み取り口を取得して 1 チャンク目まで読む
+      const reader = (res.body as ReadableStream<Uint8Array>).getReader();
+      await reader.read();
+      // 配信の途中でクライアントが切断した状況を作る
+      await reader.cancel();
+      // 切断後のデルタが処理されるまで待つ
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      // 切断後の書き込みを試みていなければ障害ログは出ない
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      // スパイを元に戻して他のテストへ影響させない
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("クライアント切断と同時に上流が失敗しても、上流の失敗はログに残る", async () => {
+    // 切断されたあとに上流側の障害が表面化する状況を作る。
+    // ネットワーク障害では上流の切断とブラウザの切断が同時に起きうるため、
+    // 切断の有無を先に見て早期 return すると、この競合でだけ本物の障害が消える
+    const failure = new Error("upstream connection lost");
+    createMock.mockImplementationOnce(() =>
+      Promise.resolve(makeAbortAwareStream({ failWhenAborted: failure }))
+    );
+    // サーバログへの記録を検証するためスパイを仕込む
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // 正常な形のリクエストを送る
+      const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
+      // 読み取り口を取得して 1 チャンク目まで読む
+      const reader = (res.body as ReadableStream<Uint8Array>).getReader();
+      await reader.read();
+      // クライアント切断と同時に上流も落ちた状況にする
+      await reader.cancel();
+      // 上流の失敗が表面化するまで待つ
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      // 切断と競合しても上流障害の記録は残る（いちばんログが欲しい場面なので）
+      expect(errorSpy).toHaveBeenCalledWith(expect.any(String), failure);
     } finally {
       // スパイを元に戻して他のテストへ影響させない
       errorSpy.mockRestore();

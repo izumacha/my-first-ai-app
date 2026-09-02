@@ -121,8 +121,9 @@ describe("本文が受付上限を超えるメッセージの扱い", () => {
     const history: Message[] = [{ role: "user", content: "短い質問" }];
     // 切り詰めを適用する
     const trimmed = trimHistoryForRequest(history);
-    // 中身が変わらないことを確認する
-    expect(trimmed[0]).toEqual(history[0]);
+    // 同じオブジェクトがそのまま返ることを確認する。
+    // toEqual だと構造の一致しか見ないので、複製する実装に変えても通ってしまう
+    expect(trimmed[0]).toBe(history[0]);
   });
 
   it("切り詰めでサロゲートペアを割らない", () => {

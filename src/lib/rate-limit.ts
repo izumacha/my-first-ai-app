@@ -60,13 +60,47 @@ export interface RateLimiter {
  * @param options - 上限値の差し替え（省略時は本番用の既定値）
  * @returns レート制限器
  */
+/**
+ * 上限値が正の整数であることを確かめ、そうでなければ即座に失敗させる。
+ *
+ * <p>`??` は null / undefined しか拾わないため、0 や負数はそのまま通ってしまう。
+ * とくに `windowMs` が 0 だと「now - t < 0」が決して成立せず記録が常に空になり、
+ * **レート制限が丸ごと無効になる**（実測: 0 を渡すと 10 連続で素通りする）。
+ * このアプリの DoS・課金対策はこのレート制限しか無いので、設定ミスで静かに
+ * 無効化されるより、その場で落ちるほうが安全（§9 fail-closed）。
+ *
+ * @param value - 検証する上限値
+ * @param name - エラーメッセージに出す設定名
+ * @returns 検証を通った値
+ * @throws {RangeError} 正の整数でない場合
+ */
+function requirePositiveInteger(value: number, name: string): number {
+  // 整数かつ 1 以上でなければ、その場で失敗させる
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new RangeError(
+      `レート制限の ${name} は 1 以上の整数で指定してください。現在値: ${value}`
+    );
+  }
+  // 検証を通った値をそのまま返す
+  return value;
+}
+
 export function createRateLimiter(options: RateLimiterOptions = {}): RateLimiter {
   // ウィンドウ幅を決める（指定が無ければ既定値）
-  const windowMs = options.windowMs ?? RATE_LIMIT_WINDOW_MS;
+  const windowMs = requirePositiveInteger(
+    options.windowMs ?? RATE_LIMIT_WINDOW_MS,
+    "windowMs"
+  );
   // 1 ウィンドウ内の許可件数を決める（指定が無ければ既定値）
-  const maxRequests = options.maxRequests ?? RATE_LIMIT_MAX_REQUESTS;
+  const maxRequests = requirePositiveInteger(
+    options.maxRequests ?? RATE_LIMIT_MAX_REQUESTS,
+    "maxRequests"
+  );
   // 追跡する送信元キーの上限を決める（指定が無ければ既定値）
-  const maxTrackedClients = options.maxTrackedClients ?? MAX_TRACKED_CLIENTS;
+  const maxTrackedClients = requirePositiveInteger(
+    options.maxTrackedClients ?? MAX_TRACKED_CLIENTS,
+    "maxTrackedClients"
+  );
 
   // 送信元キーごとに、ウィンドウ内のリクエスト時刻（昇順）を保持する表
   const buckets = new Map<string, number[]>();
@@ -100,9 +134,10 @@ export function createRateLimiter(options: RateLimiterOptions = {}): RateLimiter
       // （偽装キーを送り続けられている）状況では、絞らないと全リクエストが
       // 毎回 1 万件の走査を負担することになり、攻撃者が安価にサーバの CPU を
       // 消費させられてしまう（§8 重い処理でリクエスト処理をブロックしない）。
-      // 表のエントリは高々 1 ウィンドウで期限切れになるため、ウィンドウごとに
-      // 1 回掃除すれば回収漏れは起きない（回収が最大 1 ウィンドウ遅れるだけで、
-      // その間の新規送信元は共有バケットで数えられるので素通りにはならない）
+      // 掃除はウィンドウの境目ごとに走るので、あるエントリが期限切れになってから
+      // 回収されるまでの遅れは 1 ウィンドウ未満に収まる（エントリが表に残る時間で
+      // 数えると、最後のリクエストから最長 2 ウィンドウ弱）。回収漏れは起きず、
+      // 遅れている間の新規送信元も共有バケットで数えるので素通りにはならない
       if (buckets.size >= maxTrackedClients && lastSweptWindow !== currentWindow) {
         // このウィンドウでは掃除済みであることを記録する
         lastSweptWindow = currentWindow;
