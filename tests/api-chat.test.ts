@@ -49,6 +49,39 @@ function makeFailingStream(failure: unknown) {
 }
 
 /**
+ * 実 SDK と同じく「中断されたら throw せず正常終了する」ストリームのモックを生成する。
+ * 実 SDK（core/streaming.js）の反復子は abort を捕まえて return するため、
+ * 受信側が切断しても route の for-await は例外を出さずに抜ける。
+ * @returns 1 件流したあと、中断されるまで待って静かに終わるモックストリーム
+ */
+function makeAbortAwareStream() {
+  // 中断が要求されたかどうかを保持するフラグ
+  let aborted = false;
+  return {
+    // route が呼ぶ中断用コントローラ（呼び出しを記録しつつフラグを立てる）
+    controller: {
+      abort: vi.fn(() => {
+        // 中断が要求されたことを記録する
+        aborted = true;
+      }),
+    },
+    // 1 件流したあと、中断されるまで待ってから静かに終わる非同期イテレータ
+    async *[Symbol.asyncIterator]() {
+      // 正常なデルタを 1 件返す
+      yield {
+        type: "content_block_delta",
+        delta: { type: "text_delta", text: "こん" },
+      };
+      // 中断されるまで待つ（実 SDK が上流の受信を待っている状態に相当する）
+      while (!aborted) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+      // 中断されたら throw せずに終了する（実 SDK と同じ挙動）
+    },
+  };
+}
+
+/**
  * ストリームを最後まで（またはエラーになるまで）読み進める。
  * 反復中のエラーは start() の中で起きるため、ボディを実際に読まないと表面化しない。
  * @param body - 読み進めるレスポンスボディ
@@ -600,19 +633,48 @@ describe("POST /api/chat の上流エラーマッピング", () => {
     }
   });
 
-  it("ストリーム反復中の中断（クライアント切断）はサーバ障害としてログに残さない", async () => {
-    // 通常のクライアント切断を模して、SDK の中断エラーを反復中に投げるストリームを仕込む
+  it("配信中のクライアント切断をサーバ障害としてログに残さない", async () => {
+    // 実 SDK と同じ挙動のストリームを仕込む。
+    // SDK は反復中の中断を throw せず正常終了する（core/streaming.js の
+    // 「abort されたら return する」）。中断エラーを投げるモックでは実依存と
+    // 挙動が食い違い、本番で通る経路を検証できない
+    createMock.mockImplementationOnce(() => Promise.resolve(makeAbortAwareStream()));
+    // サーバ障害ログが呼ばれないことを検証するためスパイを仕込む
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // 正常な形のリクエストを送る
+      const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
+      // 読み取り口を取得して 1 チャンク目（正常デルタ）まで読む
+      const reader = (res.body as ReadableStream<Uint8Array>).getReader();
+      await reader.read();
+      // 配信の途中でクライアントが切断した状況を作る
+      await reader.cancel();
+      // 切断で上流の反復が終わり、終端フレームの書き込みが失敗するまで待つ
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      // 日常的に起きる切断でログを埋めない（本当の上流障害が埋もれるのを防ぐ）。
+      // 切断後の書き込みは「Invalid state: Controller is already closed」の
+      // TypeError になるため、切断の判定を誤ると毎回ここが障害ログになる
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      // スパイを元に戻して他のテストへ影響させない
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("中断エラーが反復中に投げられた場合もサーバ障害として扱わない（分類の保険）", async () => {
+    // 実 SDK は反復中に中断を投げないが、SDK の分類が変わった場合に備えた保険の経路。
+    // 受信側は切断していないので、cancelledByConsumer ではなく isAbortError で分類される
     createMock.mockImplementationOnce(() =>
       Promise.resolve(makeFailingStream(new Anthropic.APIUserAbortError()))
     );
     // サーバ障害ログが呼ばれないことを検証するためスパイを仕込む
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
-      // 正常な形のリクエストを送る（配信中にクライアントが切断した想定）
+      // 正常な形のリクエストを送る
       const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
       // 中断は異常系ではないので、ストリームはエラーにならず静かに終わる
       await drainBody(res.body as ReadableStream<Uint8Array>);
-      // 日常的に起きる切断でログを埋めない（本当の障害が埋もれるのを防ぐ）
+      // 中断は障害ではないので記録しない
       expect(errorSpy).not.toHaveBeenCalled();
     } finally {
       // スパイを元に戻して他のテストへ影響させない

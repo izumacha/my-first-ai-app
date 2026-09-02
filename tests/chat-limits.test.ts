@@ -96,6 +96,56 @@ describe("trimHistoryForRequest", () => {
   });
 });
 
+describe("本文が受付上限を超えるメッセージの扱い", () => {
+  it("上限を超える assistant 発言は切り詰めて送る（送信不能にしない）", () => {
+    // 上流の回答が上限を超えた場合を模した履歴を用意する。
+    // 入力欄には maxLength があるので user 側は超えないが、assistant 側は制御できない
+    const history: Message[] = [
+      { role: "user", content: "レシピを教えて" },
+      { role: "assistant", content: "あ".repeat(MAX_CONTENT_LENGTH + 500) },
+      { role: "user", content: "続きを教えて" },
+    ];
+    // 切り詰めを適用する
+    const trimmed = trimHistoryForRequest(history);
+    // 発言は捨てられず、ターン構成が保たれることを確認する
+    expect(trimmed).toHaveLength(3);
+    // どのメッセージもサーバーの検証を通る長さに収まっていることを確認する。
+    // 収まっていないと 400 になり、その発言が窓から抜けるまで会話を続けられない
+    for (const message of trimmed) {
+      expect(message.content.length).toBeLessThanOrEqual(MAX_CONTENT_LENGTH);
+    }
+  });
+
+  it("上限以内のメッセージは同じオブジェクトのまま返す（不要な複製をしない）", () => {
+    // 上限以内の履歴を用意する
+    const history: Message[] = [{ role: "user", content: "短い質問" }];
+    // 切り詰めを適用する
+    const trimmed = trimHistoryForRequest(history);
+    // 中身が変わらないことを確認する
+    expect(trimmed[0]).toEqual(history[0]);
+  });
+
+  it("切り詰めでサロゲートペアを割らない", () => {
+    // 上限の境界がちょうど絵文字（サロゲートペア）の途中に来る本文を作る。
+    // 上限より 1 文字短い部分＋絵文字にすると、上限位置がペアの真ん中になる
+    const emoji = "😀";
+    const content = "あ".repeat(MAX_CONTENT_LENGTH - 1) + emoji + "あ";
+    // その本文を持つ assistant 発言を含む履歴を用意する
+    const history: Message[] = [
+      { role: "user", content: "質問" },
+      { role: "assistant", content },
+    ];
+    // 切り詰めを適用する
+    const trimmed = trimHistoryForRequest(history);
+    // 上限以内に収まっていることを確認する
+    expect(trimmed[1].content.length).toBeLessThanOrEqual(MAX_CONTENT_LENGTH);
+    // 片割れだけのサロゲートが末尾に残っていないことを確認する。
+    // 残っていると文字として成立しない値を上流へ送ることになる
+    const lastCode = trimmed[1].content.charCodeAt(trimmed[1].content.length - 1);
+    expect(lastCode >= 0xd800 && lastCode <= 0xdbff).toBe(false);
+  });
+});
+
 describe("共有する入力上限", () => {
   it("本文の最大文字数は正の整数である", () => {
     // 画面の maxLength とサーバーの検証で共有するため、妥当な値であることを確認する

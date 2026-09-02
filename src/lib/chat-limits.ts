@@ -54,6 +54,51 @@ export function trimHistoryForRequest(
     start += 1;
   }
 
-  // user 発言から始まる部分だけを返す
-  return recent.slice(start);
+  // user 発言から始まる部分だけを取り出し、本文も受付上限に収めて返す
+  return recent.slice(start).map(capContent);
+}
+
+/**
+ * 1 件のメッセージ本文を受付上限の文字数に収める。
+ *
+ * <p>入力欄には maxLength を付けたので user 発言は上限を超えないが、**assistant 発言は
+ * 上流 Claude の回答なのでこちら側では長さを制御できない**。max_tokens を広げている
+ * カテゴリ（料理・手続き）では上限を超える回答が返りうる。それが履歴に入ると、
+ * サーバーの検証が「メッセージ本文が上限を超えています」で 400 を返し、しかもその
+ * 発言が 50 件の窓から抜けるには往復が必要なのに往復自体が全部 400 になるため、
+ * 件数上限のときとまったく同じ「再読み込みするまで復帰できない」状態になる。
+ *
+ * <p>発言ごと捨てず切り詰めるのは、会話のターン構成（誰がいつ何を言ったか）を
+ * 保ったまま送れるようにするため。画面に表示する履歴は切り詰めないので、
+ * ユーザーから見える回答が欠けることはない。
+ *
+ * @param message - 送信候補のメッセージ
+ * @returns 本文が上限以内に収まったメッセージ（元のオブジェクトは変更しない）
+ */
+function capContent(message: Message): Message {
+  // 上限以内ならそのまま使う（無駄なオブジェクト生成もしない）
+  if (message.content.length <= MAX_CONTENT_LENGTH) {
+    return message;
+  }
+
+  // 上限の位置で切る
+  let end = MAX_CONTENT_LENGTH;
+  // 切り口がサロゲートペア（絵文字など 2 単位で 1 文字を表す並び）の途中なら 1 つ手前で切る。
+  // 片割れだけ残すと文字として成立しない値を上流へ送ることになる
+  if (isHighSurrogate(message.content.charCodeAt(end - 1))) {
+    end -= 1;
+  }
+
+  // ロールはそのままに、本文だけを切り詰めた新しいメッセージを返す
+  return { role: message.role, content: message.content.slice(0, end) };
+}
+
+/**
+ * 文字コードがサロゲートペアの前半（上位サロゲート）かを判定する。
+ * @param code - 判定する UTF-16 の符号単位
+ * @returns 上位サロゲートなら true
+ */
+function isHighSurrogate(code: number): boolean {
+  // UTF-16 で上位サロゲートに割り当てられている範囲かを調べる
+  return code >= 0xd800 && code <= 0xdbff;
 }

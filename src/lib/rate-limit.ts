@@ -23,8 +23,10 @@ export const RATE_LIMIT_MAX_REQUESTS = 20;
 export const MAX_TRACKED_CLIENTS = 10_000;
 
 /** 追跡表が満杯のときに未追跡の新規送信元をまとめて数える共有バケットのキー。
- * IP アドレスに現れない文字で構成し、実クライアントのキーと衝突しないようにする。 */
-export const OVERFLOW_KEY = "__overflow__";
+ * IP アドレスに現れない文字で構成し、実クライアントのキーと衝突しないようにする。
+ * このモジュールの内部でしか使わないので export しない（外から差し替えられる
+ * 設定値だと誤解させないため）。 */
+const OVERFLOW_KEY = "__overflow__";
 
 /** レート制限の上限値（テストから小さい値を注入するために差し替え可能にする） */
 export interface RateLimiterOptions {

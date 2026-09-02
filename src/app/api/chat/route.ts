@@ -292,9 +292,9 @@ type UpstreamStream = AsyncIterable<Anthropic.RawMessageStreamEvent> & {
  */
 function createSseStream(stream: UpstreamStream): ReadableStream<Uint8Array> {
   // 受信側が自分から切断した（cancel() が呼ばれた）かどうかを覚えておくフラグ。
-  // 中断の原因が「受信側の切断」か「リクエストそのものの中断（request.signal）」かで
-  // 後始末が変わるため区別する。cancel() は controller が使えなくなる前に同期的に
-  // 呼ばれるので、下の catch へ届く時点で必ず最新の値になっている
+  // 切断後の失敗は「報告先がいないので記録しない」、それ以外の失敗は「記録して伝える」と
+  // 扱いが正反対になるため区別が要る。cancel() は controller が使えなくなるのと同時に
+  // 同期的に呼ばれるので、下の catch へ届く時点で必ず最新の値になっている
   let cancelledByConsumer = false;
   // SSE のチャンクを順次書き出す ReadableStream を組み立てて返す
   return new ReadableStream({
@@ -317,16 +317,25 @@ function createSseStream(stream: UpstreamStream): ReadableStream<Uint8Array> {
         // ストリームを閉じる
         controller.close();
       } catch (error) {
-        // クライアント切断による中断は異常系ではないため、エラー通知はせず静かに終える
+        // 受信側が自分から切断したあとの失敗は、報告する相手がもういないので記録しない。
+        //
+        // これが最も頻度の高い経路である点に注意: SDK のストリームは反復中の中断を
+        // throw せず正常終了する（core/streaming.js の「abort されたら return する」）。
+        // そのため受信側が切断しても for-await は例外を出さずに抜け、切断は直後の
+        // 終端フレーム enqueue が「Invalid state: Controller is already closed」の
+        // TypeError になる形で初めて表面化する。これは正常な切断の結果であって
+        // 障害ではないため、下の console.error へ流すと通常のタブ閉じのたびに
+        // 障害ログが積まれ、本物の上流障害が埋もれてしまう
+        if (cancelledByConsumer) {
+          return;
+        }
+        // 中断由来のエラー（SDK の分類が変わった場合などの保険）も異常系ではないので
+        // エラー通知はしない。ただしここへ来るのは受信側が切断していない場合だけなので、
+        // まだ読み手がいる可能性がある。close() で終端を伝えないとストリームが完結も
+        // 失敗もしないまま宙吊りになり、読み手の read() が永久に解決しない
+        // （切断済みなら上の早期 return で抜けているので、この close() は必ず有効）
         if (isAbortError(error)) {
-          // 受信側が自分から切断していれば controller はもう使えないので何もしない
-          // （cancel() 済みのストリームを close() すると TypeError になる）。
-          // 一方 request.signal 由来の中断では受信側がまだ読んでいる可能性があり、
-          // ここで何もせずに抜けるとストリームが完結も失敗もしないまま宙吊りになり、
-          // 読み手の read() が永久に解決しない（§8 リソースを確実に解放する）
-          if (!cancelledByConsumer) {
-            controller.close();
-          }
+          controller.close();
           return;
         }
         // 中断以外の失敗（上流の切断・overloaded 等）はサーバログに必ず残す。
