@@ -10,6 +10,12 @@ import ChatMessage from "@/components/ChatMessage";
 import ChatInput from "@/components/ChatInput";
 import CategoryChips from "@/components/CategoryChips";
 import ChatContainer from "@/components/ChatContainer";
+// 送信前の検証で使う上限と文言（定義元は @/lib/chat-limits）
+import {
+  CONTENT_EMPTY_MESSAGE,
+  CONTENT_TOO_LONG_MESSAGE,
+  MAX_CONTENT_LENGTH,
+} from "@/lib/chat-limits";
 
 describe("ChatMessage", () => {
   // ユーザーメッセージが正しく表示されることを確認する
@@ -38,14 +44,14 @@ describe("ChatMessage", () => {
 describe("ChatInput", () => {
   // 送信ボタンが表示されることを確認する
   it("送信ボタンが表示されること", () => {
-    render(<ChatInput onSend={vi.fn()} isLoading={false} />);
+    render(<ChatInput onSend={vi.fn().mockReturnValue(true)} onClearError={vi.fn()} isLoading={false} />);
     // 送信ボタンがドキュメント内に存在することを確認する
     expect(screen.getByText("送信")).toBeInTheDocument();
   });
 
   // ローディング中は「送信中...」と表示されることを確認する
   it("ローディング中は送信中と表示されること", () => {
-    render(<ChatInput onSend={vi.fn()} isLoading={true} />);
+    render(<ChatInput onSend={vi.fn().mockReturnValue(true)} onClearError={vi.fn()} isLoading={true} />);
     // 「送信中...」がドキュメント内に存在することを確認する
     expect(screen.getByText("送信中...")).toBeInTheDocument();
   });
@@ -53,8 +59,8 @@ describe("ChatInput", () => {
   // テキスト入力後に送信でコールバックが呼ばれることを確認する
   it("テキスト入力後に送信で onSend が呼ばれること", () => {
     // モック関数を作成する
-    const mockOnSend = vi.fn();
-    render(<ChatInput onSend={mockOnSend} isLoading={false} />);
+    const mockOnSend = vi.fn().mockReturnValue(true);
+    render(<ChatInput onSend={mockOnSend} onClearError={vi.fn()} isLoading={false} />);
 
     // テキスト入力欄を取得する
     const input = screen.getByPlaceholderText("メッセージを入力...");
@@ -67,17 +73,174 @@ describe("ChatInput", () => {
     expect(mockOnSend).toHaveBeenCalledWith("こんにちは");
   });
 
-  // 空文字では送信されないことを確認する
-  it("空文字では onSend が呼ばれないこと", () => {
-    const mockOnSend = vi.fn();
-    render(<ChatInput onSend={mockOnSend} isLoading={false} />);
+  // 空文字・空白だけの入力では、そもそも送信操作ができないことを確認する
+  it("空白だけの入力では送信ボタンが押せないこと", () => {
+    const mockOnSend = vi.fn().mockReturnValue(true);
+    render(<ChatInput onSend={mockOnSend} onClearError={vi.fn()} isLoading={false} />);
 
-    // フォームをそのまま送信する（入力なし）
+    // 空白だけを入力する
+    const input = screen.getByPlaceholderText("メッセージを入力...");
+    fireEvent.change(input, { target: { value: "   " } });
+
+    // 送信ボタンが無効であることを確認する。実ブラウザではボタンが無効だと
+    // Enter による暗黙の送信も起きないので、これが「空の送信」に対する
+    // ユーザーから見た唯一の振る舞いになる
+    expect(screen.getByText("送信")).toBeDisabled();
+    // クリックしても何も起きないことを確認する
+    fireEvent.click(screen.getByText("送信"));
+    expect(mockOnSend).not.toHaveBeenCalled();
+  });
+
+  it("送信イベントが直接届いても、空の本文は理由を表示して止めること", () => {
+    const mockOnSend = vi.fn().mockReturnValue(true);
+    const mockClearError = vi.fn();
+    render(
+      <ChatInput
+        onSend={mockOnSend}
+        onClearError={mockClearError}
+        isLoading={false}
+      />
+    );
+
+    // 送信ボタンを介さずフォームの submit を直接起こす。実ブラウザではボタンが
+    // 無効なのでこの経路には来ないが、無効化を外した／別の送信手段が増えた
+    // ときに「空の本文が黙って無視される」状態へ戻らないよう固定しておく
+    // （判定は共有の規則 findContentProblem が持つ。手前で早期 return すると
+    //   その規則の「空の本文」の分岐がこの層から到達不能になる）
     const input = screen.getByPlaceholderText("メッセージを入力...");
     fireEvent.submit(input.closest("form")!);
 
     // onSend が呼ばれていないことを確認する
     expect(mockOnSend).not.toHaveBeenCalled();
+    // 何も表示せずに黙って無視しないことを確認する
+    expect(screen.getByRole("alert")).toHaveTextContent(CONTENT_EMPTY_MESSAGE);
+    // 前回の送信についての通知も消していることを確認する
+    expect(mockClearError).toHaveBeenCalled();
+  });
+
+  it("送信が受け付けられなかったときは入力を消さないこと", () => {
+    // 受け付けなかった（false を返す）親を模す
+    const mockOnSend = vi.fn().mockReturnValue(false);
+    render(<ChatInput onSend={mockOnSend} onClearError={vi.fn()} isLoading={false} />);
+
+    // 妥当な本文を入力して送信する
+    const input = screen.getByPlaceholderText("メッセージを入力...");
+    fireEvent.change(input, { target: { value: "こんにちは" } });
+    fireEvent.submit(input.closest("form")!);
+
+    // 呼び出しはされるが受け付けられていない
+    expect(mockOnSend).toHaveBeenCalledWith("こんにちは");
+    // 入力が残ることを確認する。消してしまうと、送られも残りもせず理由も出ない
+    // まま打った文章だけが消える（進行中の送信に重なった場合など）
+    expect(input).toHaveValue("こんにちは");
+  });
+
+  it("上限を超える本文は送信せず、理由を表示して入力も残すこと", () => {
+    // モック関数を作成する
+    const mockOnSend = vi.fn().mockReturnValue(true);
+    render(<ChatInput onSend={mockOnSend} onClearError={vi.fn()} isLoading={false} />);
+
+    // 上限を超える長文を入力する
+    const tooLong = "あ".repeat(MAX_CONTENT_LENGTH + 1);
+    const input = screen.getByPlaceholderText("メッセージを入力...");
+    fireEvent.change(input, { target: { value: tooLong } });
+    // フォームを送信する
+    fireEvent.submit(input.closest("form")!);
+
+    // 送信していないことを確認する。送るとサーバーは 400 を返す一方で会話履歴には
+    // 残るため、以降のすべての送信が同じ 400 になり会話を続けられなくなる
+    expect(mockOnSend).not.toHaveBeenCalled();
+    // なぜ送られなかったのかが画面に出ることを確認する（§7 状態はテキストで伝える）
+    expect(screen.getByRole("alert")).toHaveTextContent(CONTENT_TOO_LONG_MESSAGE);
+    // 入力した文章が消えていないことを確認する（消すと長文を貼った人が文章ごと失う）
+    expect(input).toHaveValue(tooLong);
+  });
+
+  it("送信を止めたときは前回の送信についての通知を消すこと", () => {
+    // 画面上部の通知を消すコールバックを記録するモックを用意する
+    const mockClearError = vi.fn();
+    render(
+      <ChatInput
+        onSend={vi.fn().mockReturnValue(true)}
+        onClearError={mockClearError}
+        isLoading={false}
+      />
+    );
+
+    // 上限を超える長文で送信を止めさせる
+    const input = screen.getByPlaceholderText("メッセージを入力...");
+    fireEvent.change(input, {
+      target: { value: "あ".repeat(MAX_CONTENT_LENGTH + 1) },
+    });
+    fireEvent.submit(input.closest("form")!);
+
+    // 前回の送信の通知（429 など）を消していることを確認する。消さないと
+    // 画面上部の古い通知と入力欄の下の理由が role="alert" として 2 つ並び、
+    // いま行った操作と関係の無い理由まで読み上げられてしまう
+    expect(mockClearError).toHaveBeenCalled();
+  });
+
+  it("同じ本文で再び弾かれたときも警告を出し直すこと", () => {
+    // モック関数を作成する
+    const mockOnSend = vi.fn().mockReturnValue(true);
+    render(<ChatInput onSend={mockOnSend} onClearError={vi.fn()} isLoading={false} />);
+
+    // 上限を超える長文を入力して送信する
+    const input = screen.getByPlaceholderText("メッセージを入力...");
+    fireEvent.change(input, { target: { value: "あ".repeat(MAX_CONTENT_LENGTH + 1) } });
+    fireEvent.submit(input.closest("form")!);
+    // 1 回目の警告要素を控えておく
+    const firstAlert = screen.getByRole("alert");
+
+    // 何も直さずにもう一度送信する（「反応が無い」と思った人が取る自然な操作）
+    fireEvent.submit(input.closest("form")!);
+
+    // 警告要素が作り直されていることを確認する。同じ文言を入れ直すだけだと
+    // React が再描画を省くため要素はそのまま残り、スクリーンリーダーには
+    // 何も読み上げられない＝2 回目の操作に対する反応がゼロになる
+    expect(screen.getByRole("alert")).not.toBe(firstAlert);
+  });
+
+  it("入力を直し始めた時点で上限超過の警告が消えること", () => {
+    // モック関数を作成する
+    const mockOnSend = vi.fn().mockReturnValue(true);
+    render(<ChatInput onSend={mockOnSend} onClearError={vi.fn()} isLoading={false} />);
+
+    // まず上限を超える長文で弾かれる状態を作る
+    const input = screen.getByPlaceholderText("メッセージを入力...");
+    fireEvent.change(input, { target: { value: "あ".repeat(MAX_CONTENT_LENGTH + 1) } });
+    fireEvent.submit(input.closest("form")!);
+    // 警告が出ていることを確認する（前提の確認）
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+
+    // 送信せずに短く直す（ユーザーが指摘を受けて修正している最中の状態）
+    fireEvent.change(input, { target: { value: "短い質問" } });
+
+    // 妥当な入力に直した時点で警告が消えることを確認する。
+    // 残っていると、正しい入力が「不正な入力」として読み上げられ続ける
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    // 支援技術向けの不正フラグも下りることを確認する
+    expect(input).toHaveAttribute("aria-invalid", "false");
+  });
+
+  it("上限を超えた後に短く直せば送信できること", () => {
+    // モック関数を作成する
+    const mockOnSend = vi.fn().mockReturnValue(true);
+    render(<ChatInput onSend={mockOnSend} onClearError={vi.fn()} isLoading={false} />);
+
+    // まず上限を超える長文で弾かれる状態を作る
+    const input = screen.getByPlaceholderText("メッセージを入力...");
+    fireEvent.change(input, { target: { value: "あ".repeat(MAX_CONTENT_LENGTH + 1) } });
+    fireEvent.submit(input.closest("form")!);
+
+    // 短い文章に直して送信する
+    fireEvent.change(input, { target: { value: "短い質問" } });
+    fireEvent.submit(input.closest("form")!);
+
+    // 送信できることを確認する
+    expect(mockOnSend).toHaveBeenCalledWith("短い質問");
+    // 直したら理由の表示も消えることを確認する（古い警告が残り続けない）
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 });
 

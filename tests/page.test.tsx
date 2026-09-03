@@ -17,8 +17,11 @@ import {
   afterEach,
 } from "vitest";
 import type { Mock } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import Home from "@/app/page";
+// 送信履歴の上限（画面とサーバーで共有する定数）を参照する
+import { MAX_CONTENT_LENGTH, MAX_MESSAGE_COUNT } from "@/lib/chat-limits";
+import type { Message } from "@/lib/types";
 
 /** テストで組み立てた ReadableStream の解放（cancel）を記録するためのスパイ置き場 */
 let cancelSpy: Mock<() => void>;
@@ -270,20 +273,477 @@ describe("チャット画面のストリーミング処理", () => {
       vi.fn().mockResolvedValue(new Response(brokenStream, { status: 200 }))
     );
 
+    // 例外そのものがコンソールへ残ることも確かめる（握り潰すと、画面には
+    // 「通信エラー」としか出ないまま原因を追う手がかりが消える）
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    // 途切れた配信は warn に落とすので、そちらも観測できるようにする
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // 途中で失敗しても必ずスパイを戻すため try/finally で囲む。
+    // 戻し忘れると console.error がモックのまま後続のテストへ漏れ、
+    // それらの診断出力が黙って飲み込まれる
+    try {
+      // チャット画面を描画する
+      render(<Home />);
+      // メッセージを送信する
+      sendMessage("テスト質問");
+
+      // 受信済みのテキストが宙に浮かず、会話履歴の吹き出しとして残ることを確認する。
+      // ただし完全な回答と見分けが付くよう、中断された印が付いた状態で残る
+      await waitFor(() => {
+        expect(screen.getByText(/途中まで/)).toBeInTheDocument();
+      });
+      // 途切れている印が付くことを確認する。印が無いと画面上は完全な回答と区別が付かず、
+      // 次の質問ではこの欠けた回答が文脈として送り返されてしまう
+      await waitFor(() => {
+        expect(screen.getByText(/途切れています/)).toBeInTheDocument();
+      });
+      // 「最後まで受け取れなかった」ことを伝える通知が出ることを確認する。
+      // ここで「通信エラー…接続を確認してください」と出してはいけない:
+      // サーバーは完了前に終わったことを error で伝えるが、その原因は
+      // プラットフォームの実行時間上限などで、接続には問題が無いことがある
+      await waitFor(() => {
+        expect(screen.getByRole("alert")).toHaveTextContent(
+          "回答を最後まで受け取れませんでした"
+        );
+      });
+      // 障害としては積み上げない（長い回答では日常的に起こる）。ただし捨てもしない:
+      // debug だとブラウザの既定のログレベルでは見えず、ここへ紛れ込む実装の
+      // 不具合が誰にも見えなくなるので、既定で見える warn に残す
+      expect(errorSpy).not.toHaveBeenCalled();
+      expect(warnSpy).toHaveBeenCalled();
+      // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
+      await waitForIdle();
+    } finally {
+      // スパイを元に戻して他のテストへ影響させない
+      errorSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("1 文字も届かずに配信が切れた場合も接続の問題として伝えないこと", async () => {
+    // ヘッダは返ったが、最初の差分が届く前にサーバーが「完了前に終わった」ことを
+    // error で伝えてくる状況を模す（プラットフォームの実行時間上限など）
+    const brokenStream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.error(new Error("ストリーミングが完了前に中断されました"));
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response(brokenStream, { status: 200 }))
+    );
+    // この経路では障害ログを積み上げない（接続は成立している）
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => {});
+    try {
+      // チャット画面を描画してメッセージを送信する
+      render(<Home />);
+      sendMessage("テスト質問");
+
+      // 印付きの回答すら出ないぶん、文言の誤りがいちばん誤解を招く経路。
+      // 接続には問題が無いので「接続を確認してください」とは言わない
+      await waitFor(() => {
+        expect(screen.getByRole("alert")).toHaveTextContent(
+          "回答を最後まで受け取れませんでした"
+        );
+      });
+      expect(errorSpy).not.toHaveBeenCalled();
+      // 既定のログレベルで見える形では残す
+      expect(warnSpy).toHaveBeenCalled();
+      // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
+      await waitForIdle();
+    } finally {
+      errorSpy.mockRestore();
+      warnSpy.mockRestore();
+      debugSpy.mockRestore();
+    }
+  });
+
+  it("本文が 1 文字も無いまま完了しなかった配信は「受け取れませんでした」と言わないこと", async () => {
+    // 差分を 1 件も流さず、終端の番兵も送らずに正常終了するストリームを模す
+    // （上流が本文を出す前に途切れた場合。サーバーは番兵を送らずに閉じる）
+    const encoder = new TextEncoder();
+    const silentStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(": ping\n\n"));
+        controller.close();
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response(silentStream, { status: 200 }))
+    );
+
+    // チャット画面を描画してメッセージを送信する
+    render(<Home />);
+    sendMessage("テスト質問");
+
+    // 「回答を受け取れませんでした」だと何も送られなかったように見えるが、
+    // 実際は途中で終わっている。完了したかで文言を分ける
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "回答を最後まで受け取れませんでした"
+      );
+    });
+    // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
+    await waitForIdle();
+  });
+
+  it("送信中は次の送信を受け付けず、送った履歴が画面と一致すること", async () => {
+    // 応答を保留したままにして「送信中」の状態を作るストリームを用意する
+    const encoder = new TextEncoder();
+    const fetchMock = vi.fn().mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          // 少しだけ遅らせて、2 回目の送信が重なる余地を作る
+          setTimeout(() => {
+            const stream = new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(
+                  encoder.encode('data: {"text":"回答"}\n\ndata: [DONE]\n\n')
+                );
+                controller.close();
+              },
+            });
+            resolve(new Response(stream, { status: 200 }));
+          }, 20);
+        })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    // チャット画面を描画する
+    render(<Home />);
+    // 1 回目の送信を始める（応答は保留中）
+    sendMessage("1 つ目の質問");
+
+    // 応答が返るまでの間、送信操作そのものができないことを確認する
+    // （ハンドラー側にも進行中のガードがあるが、そちらは入力欄を経由しない
+    //   送信経路が増えたときのための防御で、通常はここで止まる）
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "送信中..." })).toBeDisabled();
+    });
+
+    // 1 回目の応答が返るまで待つ
+    await waitFor(() => {
+      expect(screen.getByText("回答")).toBeInTheDocument();
+    });
+
+    // 送信は 1 回だけで、送った履歴の末尾が画面の質問と一致することを確認する。
+    // （進行中に重なった送信は理由を表示して捨てる。その経路は入力欄を
+    //   経由しない送信のためのものなので、ここでは件数と内容だけを見る）
+    // 重なった送信を許すと、2 回目が「1 回目の追加が反映される前の履歴」を送り、
+    // 画面には並んでいる質問が API 側から抜け落ちる
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(
+      (fetchMock.mock.calls[0][1] as { body: string }).body
+    ) as { messages: { role: string; content: string }[] };
+    expect(body.messages[body.messages.length - 1].content).toBe("1 つ目の質問");
+    // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
+    await waitForIdle();
+  });
+
+  it("進行中に重なった送信は、黙って捨てず理由を表示すること", async () => {
+    // 応答を保留したままにして「送信中」の状態を作る（1 回目を終わらせない）
+    const encoder = new TextEncoder();
+    const fetchMock = vi.fn().mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          // 少し遅らせて、2 回目の送信が重なる余地を作る
+          setTimeout(() => {
+            const stream = new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(
+                  encoder.encode('data: {"text":"回答"}\n\ndata: [DONE]\n\n')
+                );
+                controller.close();
+              },
+            });
+            resolve(new Response(stream, { status: 200 }));
+          }, 20);
+        })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    // チャット画面を描画する
+    render(<Home />);
+
+    // 入力欄とフォームを取得する
+    const input = screen.getByLabelText("メッセージを入力");
+    const form = input.closest("form");
+    // フォームが取得できることを確かめる（取得できなければ以降の検証が意味を失う）
+    expect(form).not.toBeNull();
+
+    // 本文を入力する
+    fireEvent.change(input, { target: { value: "重なる質問" } });
+
+    // 同じ act の中で 2 回続けて送信する。ボタンの無効化（isLoading）は再描画を
+    // 待つため、この時点ではまだ効かない＝ハンドラー側の進行中ガードへ到達できる。
+    // 入力欄経由では通常止まる経路なので、ここだけが「黙って捨てない」ことを
+    // 確かめられる唯一の入口になる
+    act(() => {
+      fireEvent.submit(form as HTMLFormElement);
+      fireEvent.submit(form as HTMLFormElement);
+    });
+
+    // 2 回目は受け付けられず、理由が画面に出ることを確認する。
+    // 表示しないと、入力は残るのに何も起きない画面になり、
+    // 何が起きたのか（あるいは何も起きていないのか）が分からない
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "送信中です。応答を待ってからもう一度お試しください。"
+      );
+    });
+
+    // 実際に送信されたのは 1 回だけであることも確かめる
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
+    await waitForIdle();
+  });
+
+  it("CRLF で区切られたストリームでも完全な回答として扱うこと", async () => {
+    // 途中のプロキシが CRLF で流す場合を模す。行末の CR を落とし損ねると
+    // 本文は届くのに [DONE] だけ一致せず、完全な回答に中断の印が付いてしまう
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValue(
+          new Response(
+            makeStream(['data: {"text":"完全な回答"}\r\n\r\ndata: [DONE]\r\n\r\n']),
+            { status: 200 }
+          )
+        )
+    );
+
     // チャット画面を描画する
     render(<Home />);
     // メッセージを送信する
     sendMessage("テスト質問");
 
-    // 受信済みのテキストが宙に浮かず、会話履歴の吹き出しとして残ることを確認する
+    // 回答が確定するまで待つ
     await waitFor(() => {
-      expect(screen.getByText("途中まで")).toBeInTheDocument();
+      expect(screen.getByText("完全な回答")).toBeInTheDocument();
     });
-    // 通信エラーの通知も併せて表示されることを確認する
+    // 途切れている印が付いていないことを確認する
+    expect(screen.queryByText(/途切れています/)).not.toBeInTheDocument();
+    // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
+    await waitForIdle();
+  });
+
+  it("解析できない差分があった回答には途切れている印を付けること", async () => {
+    // 壊れた差分が 1 件混じるが [DONE] は普通に届く場合を模す。
+    // 読み飛ばした事実を覚えていないと、欠けのある回答が完全な回答として確定する
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          makeStream([
+            'data: {"text":"前半"}\n\ndata: {壊れた\n\ndata: [DONE]\n\n',
+          ]),
+          { status: 200 }
+        )
+      )
+    );
+
+    // チャット画面を描画する
+    render(<Home />);
+    // メッセージを送信する
+    sendMessage("テスト質問");
+
+    // 受け取れた分が表示されることを確認する
     await waitFor(() => {
-      expect(screen.getByRole("alert")).toHaveTextContent("通信エラー");
+      expect(screen.getByText(/前半/)).toBeInTheDocument();
+    });
+    // 欠けがあるので途切れている印が付くことを確認する
+    await waitFor(() => {
+      expect(screen.getByText(/途切れています/)).toBeInTheDocument();
     });
     // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
     await waitForIdle();
+  });
+
+  it("形は正しいが中身が想定外の差分も『欠け』として扱うこと", async () => {
+    // JSON としては解析できるが text が文字列でない差分を混ぜる。
+    // 型を確かめずに足すと "undefined" が本文へ紛れ込み、しかも解析は
+    // 成功しているので完全な回答として確定してしまう
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          makeStream([
+            'data: {"text":"前半"}\n\ndata: {"txt":"あ"}\n\ndata: [DONE]\n\n',
+          ]),
+          { status: 200 }
+        )
+      )
+    );
+
+    // チャット画面を描画する
+    render(<Home />);
+    // メッセージを送信する
+    sendMessage("テスト質問");
+
+    // 欠けがあるので途切れている印が付くことを確認する
+    await waitFor(() => {
+      expect(screen.getByText(/途切れています/)).toBeInTheDocument();
+    });
+    // "undefined" が本文へ紛れ込んでいないことを確認する
+    expect(screen.queryByText(/undefined/)).not.toBeInTheDocument();
+    // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
+    await waitForIdle();
+  });
+
+  it("CR だけで区切られたストリームでも回答を組み立てること", async () => {
+    // 行区切りが CR だけの場合を模す。LF だけで割る実装だと 1 行も切り出せず、
+    // 応答全体がバッファに溜まったまま捨てられて回答が丸ごと消える
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValue(
+          new Response(
+            makeStream(['data: {"text":"CR 区切りの回答"}\r\rdata: [DONE]\r\r']),
+            { status: 200 }
+          )
+        )
+    );
+
+    // チャット画面を描画する
+    render(<Home />);
+    // メッセージを送信する
+    sendMessage("テスト質問");
+
+    // 回答が組み立てられることを確認する
+    await waitFor(() => {
+      expect(screen.getByText("CR 区切りの回答")).toBeInTheDocument();
+    });
+    // 完了も検出できているので途切れている印は付かない
+    expect(screen.queryByText(/途切れています/)).not.toBeInTheDocument();
+    // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
+    await waitForIdle();
+  });
+
+  it("回答を 1 文字も受け取れなかったときは理由を表示すること", async () => {
+    // 上流が本文を返さずに正常終了した場合を模す（長さ上限に本文なしで達した等）
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValue(
+          new Response(makeStream(["data: [DONE]\n\n"]), { status: 200 })
+        )
+    );
+
+    // チャット画面を描画する
+    render(<Home />);
+    // メッセージを送信する
+    sendMessage("テスト質問");
+
+    // 何も起きなかったように終わらせず、理由が表示されることを確認する。
+    // 黙って終わると、ユーザーは失敗に気づかず再送して上流の呼び出しを重ねる
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent("回答を受け取れませんでした");
+    });
+    // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
+    await waitForIdle();
+  });
+
+  it("最後まで届いた回答には途切れている印を付けないこと", async () => {
+    // 差分と [DONE] を正常に流すストリームを返す
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValue(
+          new Response(
+            makeStream(['data: {"text":"完全な回答"}\n\ndata: [DONE]\n\n']),
+            { status: 200 }
+          )
+        )
+    );
+
+    // チャット画面を描画する
+    render(<Home />);
+    // メッセージを送信する
+    sendMessage("テスト質問");
+
+    // 回答が確定するまで待つ
+    await waitFor(() => {
+      expect(screen.getByText("完全な回答")).toBeInTheDocument();
+    });
+    // 正常に完了した回答に途切れている印が付いていないことを確認する
+    // （付いてしまうと、毎回の回答に誤った注意書きが残る）
+    expect(screen.queryByText(/途切れています/)).not.toBeInTheDocument();
+    // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
+    await waitForIdle();
+  });
+
+  it("上限を超える本文は送信も履歴への追加もしないこと（画面全体の契約）", async () => {
+    // fetch が呼ばれないことを確かめるためモックを差し替える
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    // チャット画面を描画する
+    render(<Home />);
+    // 上限を超える長文を送信する。
+    // 止めているのは入力欄側の検証だが、ここで確かめたいのは層ではなく
+    // 「画面から長すぎる本文を送っても、リクエストも履歴も汚れない」という結果
+    sendMessage("あ".repeat(MAX_CONTENT_LENGTH + 1));
+
+    // 送信していないことを確認する（サーバーの 400 を待たずに止める）
+    await waitFor(() => {
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+    // 履歴にも積まれていないことを確認する。積むと以降のすべての送信が
+    // 同じ 400 になり、往復が成立しないので窓からも抜けず復帰できなくなる
+    expect(screen.queryByText(/^あ+$/)).not.toBeInTheDocument();
+  });
+
+  it("会話が続いても送信する履歴を受付上限以内に保つこと", async () => {
+    // 送信されたリクエストボディを順に記録する配列
+    const sentBodies: { messages: Message[] }[] = [];
+    // 呼び出しのたびに新しいストリームを返す（Response のボディは 1 度しか読めないため）
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation((_url: string, init: RequestInit) => {
+        // 送信されたボディを解析して記録する
+        sentBodies.push(JSON.parse(init.body as string));
+        // 1 件の差分と [DONE] を流す応答を返す
+        return Promise.resolve(
+          new Response(makeStream(['data: {"text":"回答"}\n\ndata: [DONE]\n\n']), {
+            status: 200,
+          })
+        );
+      })
+    );
+
+    // チャット画面を描画する
+    render(<Home />);
+
+    // 1 往復ごとに履歴が 2 件（user + assistant）増えるので、上限を必ず超える回数だけ往復する。
+    // 切り詰めが無いと、この回数に達した時点でサーバーが 400 を返し以降ずっと送信できなくなる
+    const exchanges = Math.ceil(MAX_MESSAGE_COUNT / 2) + 1;
+    for (let i = 0; i < exchanges; i += 1) {
+      // メッセージを送信する
+      sendMessage(`質問${i}`);
+      // 次の送信ができる状態に戻るまで待つ
+      await waitForIdle();
+    }
+
+    // 上限を超える履歴が積まれた後の送信であることを確認する（テスト自体が前提を満たすかの確認）
+    expect(sentBodies.length).toBe(exchanges);
+    // どの送信でも、サーバーが受け付ける件数を超えていないことを確認する
+    for (const body of sentBodies) {
+      expect(body.messages.length).toBeLessThanOrEqual(MAX_MESSAGE_COUNT);
+      // 上流 Claude API は最初のメッセージが user ロールであることを要求する
+      expect(body.messages[0].role).toBe("user");
+    }
+    // 最後の送信には、いま入力した最新の質問が含まれることを確認する（古い側だけが捨てられる）
+    const lastMessages = sentBodies[sentBodies.length - 1].messages;
+    expect(lastMessages[lastMessages.length - 1].content).toBe(
+      `質問${exchanges - 1}`
+    );
   });
 });

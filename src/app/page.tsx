@@ -4,12 +4,47 @@
  */
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef } from "react";
 import ChatContainer from "@/components/ChatContainer";
 import ChatInput from "@/components/ChatInput";
 import CategoryChips from "@/components/CategoryChips";
-import { parseSseDataLine, SSE_DONE_MARKER } from "@/lib/sse";
+import { readSseAnswer } from "@/lib/sse";
+// 送信する会話履歴をサーバーの受付上限まで切り詰めるヘルパー（上限の定義元は @/lib/chat-limits）
+import {
+  findContentProblem,
+  TRUNCATED_ANSWER_SUFFIX,
+  trimHistoryForRequest,
+} from "@/lib/chat-limits";
 import type { Message, CategoryId } from "@/lib/types";
+
+/** 画面に表示する文言（§6 UI 文言は一元管理）。
+ *
+ * <p>ここに置くのは**表示専用**の文言だけ。サーバーと値や文言を共有するもの
+ * （入力上限の超過・履歴に付ける印）は `@/lib/chat-limits` にあり、
+ * サーバーが返す文言は `route.ts` の `ERROR_MESSAGES` にある。
+ * 「誰と共有するか」で置き場所を分け、同じ種類の文言が散らばらないようにする。 */
+const MESSAGES = {
+  /** サーバーが JSON でないエラー応答を返したときの汎用文言 */
+  genericError: "エラーが発生しました。もう一度お試しください。",
+  /** レスポンスボディの読み取り口が得られなかったときの文言 */
+  streamStartFailed: "ストリーミングの開始に失敗しました。",
+  /** 通信そのものが失敗したときの文言 */
+  networkError: "通信エラーが発生しました。接続を確認してください。",
+  /** 回答を 1 文字も受け取れなかったときの文言。
+   * 上流が本文を返さずに正常終了する（長さ上限に本文なしで達した等）ことは起こりうる。 */
+  emptyAnswer: "回答を受け取れませんでした。もう一度お試しください。",
+  /** 配信が最後まで届かなかったときの文言（1 文字も届かなかった場合も含む）。
+   * サーバーは「完了前に終わった」ことを error として伝えるが、その原因は
+   * 通信障害とは限らない（プラットフォームの実行時間上限で打ち切られる等）。
+   * ここで networkError（「接続を確認してください」）を出すと、接続に問題が
+   * 無いのに無関係な確認を促すことになる（`TRUNCATED_ANSWER_SUFFIX` が
+   * 「中断」という語を避けているのと同じ理由）。 */
+  answerInterrupted: "回答を最後まで受け取れませんでした。もう一度お試しください。",
+  /** 送信が既に進行中で、今回の送信を受け付けられなかったときの文言。
+   * 黙って捨てると、入力は残るのに何も起きない画面になり、
+   * 何が起きたのか（あるいは何も起きていないのか）が分からない。 */
+  sendInProgress: "送信中です。応答を待ってからもう一度お試しください。",
+} as const;
 
 /**
  * チャット画面のメインページコンポーネント
@@ -28,34 +63,48 @@ export default function Home() {
   // エラーメッセージを管理する state
   const [error, setError] = useState<string | null>(null);
 
+  // 送信が進行中かどうかを保持する参照。isLoading（state）は再描画されるまで
+  // 更新が見えないため、重なった送信を止める用途には使えない
+  const inFlightRef = useRef(false);
+
   /**
-   * メッセージ送信処理
-   * ユーザーのメッセージを会話履歴に追加し、API にストリーミングリクエストを送る。
+   * 画面上部の通知（前回の送信の結果）を消す処理
+   * 入力欄が送信を止めたときに呼ばれ、関係の無い古い通知が残らないようにする。
    */
-  const handleSend = useCallback(
-    async (content: string) => {
-      // エラー表示をクリアする
-      setError(null);
+  const clearError = useCallback(() => {
+    // エラー表示を消す
+    setError(null);
+  }, []);
 
-      // ユーザーのメッセージオブジェクトを作成する
-      const userMessage: Message = { role: "user", content };
-
-      // 会話履歴にユーザーメッセージを追加する
-      const updatedMessages = [...messages, userMessage];
-      setMessages(updatedMessages);
-
-      // ローディング状態を開始する
-      setIsLoading(true);
-      // ストリーミングテキストを空にリセットする
-      setStreamingText("");
+  /**
+   * 送信した会話履歴で API を呼び、ストリーミング応答を画面へ反映する処理
+   * @param history - API へ送る会話履歴（末尾が今回の質問）
+   */
+  const runRequest = useCallback(
+    async (history: Message[]) => {
+      // 応答の読み取りに入ったかどうか。外側の catch が「通信エラー」と
+      // 断定してよいかの判断に使う。読み取りに入っていれば接続は成立して
+      // いるので、そこから先の失敗は「配信が最後まで届かなかった」であって
+      // 接続の問題とは限らない（プラットフォームの実行時間上限など）
+      let startedStreaming = false;
 
       try {
+        // ローディング状態を開始する。**try の中で行う**: 外に置くと、ここで
+        // 投げられたときに下の finally が走らず、進行中の印が立ったままになって
+        // 以降の送信がすべて（表示も出ないまま）拒否され続ける
+        setIsLoading(true);
+        // ストリーミングテキストを空にリセットする
+        setStreamingText("");
+
         // チャット API にリクエストを送信する
         const response = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            messages: updatedMessages,
+            // 画面には全履歴を残したまま、API へはサーバーが受け付ける件数まで
+            // 切り詰めた履歴だけを送る。切り詰めないと会話が続くほど履歴が伸び、
+            // 上限を超えた時点から以降のすべての送信が 400 になって会話を続けられなくなる
+            messages: trimHistoryForRequest(history),
             category,
           }),
         });
@@ -70,7 +119,7 @@ export default function Home() {
           setError(
             typeof errorData?.error === "string"
               ? errorData.error
-              : "エラーが発生しました。もう一度お試しください。"
+              : MESSAGES.genericError
           );
           // 早期リターンする（ローディング解除は finally が行う）
           return;
@@ -81,71 +130,51 @@ export default function Home() {
 
         // リーダーが取得できない場合はエラー
         if (!reader) {
-          setError("ストリーミングの開始に失敗しました。");
+          setError(MESSAGES.streamStartFailed);
           // 早期リターンする（ローディング解除は finally が行う）
           return;
         }
 
-        // テキストデコーダーを準備する
-        const decoder = new TextDecoder();
-        // ストリーミングで受信したテキストを蓄積する変数
-        let accumulated = "";
-        // チャンクの切れ目で分断された「行の途中」を次のチャンクまで持ち越すバッファ。
-        // reader.read() は行境界と無関係な位置でデータを区切るため、バッファ無しだと
-        // 分断された JSON がパース失敗として捨てられ、回答の文字が欠落してしまう
-        let lineBuffer = "";
-        // 終了マーカー [DONE] を受信したかどうかのフラグ（外側の読み取りループも止めるため）
-        let sawDone = false;
+        // ここまで来たら応答の読み取りに入る（接続は成立している）
+        startedStreaming = true;
+
+        // 受信済みの本文を保持する（途中で切れても画面に残せるよう、読み取り側から
+        // コールバックで受け取る。読み取りが例外で終わると戻り値は得られない）
+        let received = "";
+        // 完了として扱ってよいか（終端の番兵を受け取り、読み飛ばしも無かったか）
+        let completed = false;
 
         try {
-          // ストリームからデータを順次読み取るループ
-          while (!sawDone) {
-            // チャンクを読み取る
-            const { done, value } = await reader.read();
+          // SSE の読み取りは @/lib/sse に集約している（書式・行区切りと同じ場所）。
+          // 本文が伸びるたびに受け取り、画面の途中表示を更新する
+          const answer = await readSseAnswer(reader, (text) => {
+            received = text;
+            setStreamingText(text);
+          });
+          // 完了したかを控える（例外で終わった場合はここへ来ないので false のまま）
+          completed = answer.completed;
 
-            // ストリーム終了なら停止する
-            if (done) break;
-
-            // バイナリデータを文字列にデコードし、持ち越し分と連結する
-            lineBuffer += decoder.decode(value, { stream: true });
-
-            // SSE 形式の行を分割する（最後の要素は「行の途中」の可能性がある）
-            const lines = lineBuffer.split("\n");
-            // 最後の要素は未完の行として次のチャンクへ持ち越す（完結行だけを処理する）
-            lineBuffer = lines.pop() ?? "";
-
-            for (const line of lines) {
-              // データ行なら本文を取り出す（データ行でなければ null が返る。書式は @/lib/sse に集約）
-              const data = parseSseDataLine(line);
-
-              // データ行でない行（フレーム区切りの空行など）は読み飛ばす
-              if (data === null) {
-                continue;
-              }
-
-              // ストリーム終了マーカーなら読み取り全体を完了させる
-              if (data === SSE_DONE_MARKER) {
-                sawDone = true;
-                break;
-              }
-
-              try {
-                // JSON をパースしてテキスト差分を取得する
-                const parsed = JSON.parse(data) as { text: string };
-                // 蓄積テキストに差分を追加する
-                accumulated += parsed.text;
-                // ストリーミング表示を更新する
-                setStreamingText(accumulated);
-              } catch {
-                // JSON パースに失敗した行は無視する
-              }
-            }
+          // ここへ来たのは読み取りが例外なく終わったときだけ（＝通信は成功した）。
+          // それでも 1 文字も受け取れていないなら、黙って何も起きなかったように
+          // 終わらせない。ローディングだけ止まって画面に何も出ないと、
+          // ユーザーは失敗に気づかず再送して上流の呼び出しを重ねる。
+          // finally 側で判定すると失敗経路でも走り、外側の catch が上書きする順序に
+          // 依存した「たまたま正しい」状態になる
+          if (!received.trim()) {
+            // 1 文字も受け取れなかった理由は 2 通りある。完了していれば
+            // 「本文の無い回答が返った」、完了していなければ「途中で終わった」で、
+            // 後者に「回答を受け取れませんでした」と出すと、何も送られなかったように
+            // 見えて実際（途中で切れた）と食い違う
+            setError(
+              completed ? MESSAGES.emptyAnswer : MESSAGES.answerInterrupted
+            );
           }
         } finally {
-          // 読み取りを終えた reader を必ず解放する。[DONE] を受信して while を抜けた
-          // 場合、レスポンスボディは reader にロックされたまま未消費として残るため、
-          // ブラウザが HTTP コネクションを再利用できず握ったままになる。成功・失敗の
-          // どちらの経路でも通るこの finally で解放する（§8 リソースを確実に解放する）
+          // 読み取りを終えた reader を必ず解放する。[DONE] を受信して読み取りを
+          // 終えた場合、レスポンスボディは reader にロックされたまま未消費として
+          // 残るため、ブラウザが HTTP コネクションを再利用できず握ったままになる。
+          // 成功・失敗のどちらの経路でも通るこの finally で解放する
+          // （§8 リソースを確実に解放する）
           await reader.cancel().catch((cancelError: unknown) => {
             // 既にエラーで終了したストリームの cancel は reject するが、目的は解放なので
             // 失敗しても実害は無い。それでも黙って捨てず debug ログには残す（§6）
@@ -153,25 +182,117 @@ export default function Home() {
           });
           // 成功・途中失敗のどちらでも、受信済みのテキストがあれば会話履歴に残す。
           // ここで確定させないと、途中でストリームが切れたときに受信済みの回答が
-          // 消えたうえ、宙に浮いた吹き出しが次の送信まで表示され続けてしまう
-          if (accumulated) {
+          // 消えたうえ、宙に浮いた吹き出しが次の送信まで表示され続けてしまう。
+          // 空白だけの回答は残さない。残すとサーバーの検証（本文が空）で以降の
+          // 送信がすべて 400 になり、往復が成立しないので窓からも抜けない
+          if (received.trim()) {
             setMessages((prev) => [
               ...prev,
-              { role: "assistant", content: accumulated },
+              {
+                role: "assistant",
+                // 途中で切れた回答には印を付ける。印が無いと画面上は完全な回答と
+                // 見分けが付かず、しかも次の質問でこの欠けた回答が文脈として
+                // 送り返され、AI は続きがある前提で答えてしまう
+                content: completed
+                  ? received
+                  : `${received}${TRUNCATED_ANSWER_SUFFIX}`,
+              },
             ]);
           }
           // ストリーミング表示を必ずクリアする（エラー時の吹き出し残留を防ぐ）
           setStreamingText("");
         }
-      } catch {
-        // ネットワークエラーなどの場合にメッセージを表示する
-        setError("通信エラーが発生しました。接続を確認してください。");
+      } catch (requestError) {
+        // 読み取りに入ったあとの失敗は、サーバーが「完了前に終わった」ことを
+        // error で伝えてきただけかもしれない（プラットフォームの実行時間上限
+        // などで、接続そのものは正常）。1 文字も届いていない場合も同じで、
+        // むしろ画面に印付きの回答すら出ないぶん誤解を招きやすい。
+        // ここで「接続を確認してください」と出すと問題の無い接続を疑わせるので、
+        // 接続が成立する前の失敗（fetch 自体の失敗）とだけ文言を分ける
+        setError(
+          startedStreaming ? MESSAGES.answerInterrupted : MESSAGES.networkError
+        );
+        // 例外そのものは握り潰さずブラウザのコンソールへ残す（§6）。
+        // ここへ来るのは通信の失敗（オフライン等）だけとは限らず、try の中の
+        // 不具合もすべて同じ文言に化ける。中身を捨てると、画面に出る文言だけが
+        // 残って原因を追う手がかりが消える。
+        // ただし途切れは日常的に起こるので error では積み上げない。debug だと
+        // ブラウザの既定のログレベルでは表示されず、ここへ紛れ込む実装の不具合
+        // （try の中で投げられた TypeError 等）が誰にも見えないまま
+        // 「回答を最後まで受け取れませんでした」だけが出続ける。既定で見える warn にする
+        if (startedStreaming) {
+          console.warn("配信が完了前に終わりました:", requestError);
+        } else {
+          console.error("チャットのリクエストに失敗しました:", requestError);
+        }
       } finally {
         // ローディング状態を終了する
         setIsLoading(false);
+        // 進行中の印を下ろす（次の送信を受け付ける）
+        inFlightRef.current = false;
       }
     },
-    [messages, category]
+    [category]
+  );
+
+  /**
+   * メッセージ送信処理
+   * 送ってよい本文かを確かめ、会話履歴へ積んでから送信を開始する。
+   * @param content - 送信しようとしている本文
+   * @returns 送信を受け付けたら true（false のとき入力欄は入力を消さない）
+   */
+  const handleSend = useCallback(
+    (content: string): boolean => {
+      // 上限を超える本文は履歴に積まない。積むとサーバーが 400 を返す一方で
+      // 履歴には残り続け、以降のすべての送信が同じ 400 になって復帰できなくなる。
+      // 入力欄側も同じ規則（findContentProblem）で先に弾くが、あちらは
+      // 「入力を消さずに理由を見せる」表示のための検証で、履歴を守るのはこの層。
+      // 入力欄を経由しない送信経路が増えても、必ずここを通る
+      const contentProblem = findContentProblem(content);
+      if (contentProblem) {
+        setError(contentProblem);
+        return false;
+      }
+
+      // 送信が既に進行中なら何もしない。
+      // 重なると、2 回目が「1 回目の追加が反映される前の履歴」を読んでしまい、
+      // 画面には両方の質問が並ぶのに API へ送る履歴からは直前の質問が抜ける
+      // （表示と送信内容が食い違い、しかもどこにもエラーが出ない）。
+      // 送信ボタンは送信中に無効化されるが、入力欄を経由しない送信経路が
+      // 増えても必ずここを通るよう、この層でも止める
+      if (inFlightRef.current) {
+        // 黙って捨てない（入力は残るのに何も起きない画面にしない）
+        setError(MESSAGES.sendInProgress);
+        return false;
+      }
+      // 進行中の印を立てる（解除は下の finally で必ず行う）
+      inFlightRef.current = true;
+
+      // ここまで来て初めて、前回の送信についての通知を消す。
+      // 先に消すと、重なった送信を上のガードで捨てたときに「前回の失敗の理由が
+      // 消えただけで何も起きない」画面になり、何が起きたのか分からなくなる
+      setError(null);
+
+      // ユーザーのメッセージオブジェクトを作成する
+      const userMessage: Message = { role: "user", content };
+
+      // 会話履歴にユーザーメッセージを追加する。
+      // 画面へ反映する配列と API へ送る配列は**同じもの**を使う。関数形式
+      // （previous => [...previous, userMessage]）にすると表示側だけが最新になり、
+      // 送信側は直前の値を捕まえた配列のままなので、両者が食い違う余地が残る。
+      // 重なった送信は上の inFlightRef で止めてあるので、この配列は常に最新
+      const updatedMessages = [...messages, userMessage];
+      setMessages(updatedMessages);
+
+      // 実際の送受信は非同期に進める。呼び出し元（入力欄）へは「受け付けたか」だけを
+      // その場で返す: 受け付けていない送信で入力欄を空にすると、送られも残りもせず
+      // 理由も出ないまま、打った文章だけが消える
+      void runRequest(updatedMessages);
+
+      // 送信を受け付けたことを伝える（入力欄はここで初めて空になる）
+      return true;
+    },
+    [messages, runRequest]
   );
 
   return (
@@ -199,7 +320,11 @@ export default function Home() {
       <ChatContainer messages={messages} streamingText={streamingText} />
 
       {/* メッセージ入力フォームを表示する */}
-      <ChatInput onSend={handleSend} isLoading={isLoading} />
+      <ChatInput
+        onSend={handleSend}
+        onClearError={clearError}
+        isLoading={isLoading}
+      />
     </div>
   );
 }

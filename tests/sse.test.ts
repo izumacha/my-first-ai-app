@@ -10,6 +10,8 @@ import { NextRequest } from "next/server";
 import {
   formatSseFrame,
   parseSseDataLine,
+  readSseAnswer,
+  splitSseLines,
   SSE_DATA_PREFIX,
   SSE_DONE_MARKER,
 } from "@/lib/sse";
@@ -28,6 +30,13 @@ function makeMockStream() {
       for (const text of UPSTREAM_DELTAS) {
         yield { type: "content_block_delta", delta: { type: "text_delta", text } };
       }
+      // 最後まで話し終えたことを伝えるイベントを返す（実ストリームは必ず終了理由を
+      // 伝えて終わる。省くと「本文が途中で途切れたストリーム」を模すことになり、
+      // サーバーは完了の番兵を送らない＝正常系の契約テストにならない）
+      yield {
+        type: "message_delta",
+        delta: { stop_reason: "end_turn", stop_sequence: null },
+      };
     },
   };
 }
@@ -152,5 +161,127 @@ describe("SSE のサーバー↔クライアント契約", () => {
     expect(restored).toBe(UPSTREAM_DELTAS.join(""));
     // 終了マーカーが最後に流れていることを確認する（受信側はこれで読み取りを終える）
     expect(sawDone).toBe(true);
+  });
+});
+
+describe("splitSseLines", () => {
+  it("LF で区切られた行を切り出し、未完の行を持ち越す", () => {
+    // 最後の要素は行の途中の可能性があるので持ち越す
+    expect(splitSseLines("a\nb\nc")).toEqual({ lines: ["a", "b"], remainder: "c" });
+  });
+
+  it("CRLF で区切られた行から CR を残さない", () => {
+    // CR が残ると本文の末尾に付き、終端の番兵と文字列比較したときに一致しない。
+    // JSON としては CR は空白なので解析は通ってしまい、「本文は届くのに完了だけ
+    // 検出できない」＝完全な回答が毎回「中断された」と誤判定される
+    expect(splitSseLines("a\r\nb\r\n").lines).toEqual(["a", "b"]);
+  });
+
+  it("CR だけで区切られた行も切り出す", () => {
+    // LF だけで割ると 1 行も切り出せず、応答全体がバッファに溜まったまま捨てられる
+    expect(splitSseLines("a\rb\rc")).toEqual({ lines: ["a", "b"], remainder: "c" });
+  });
+
+  it("区切りが 1 つも無ければ全体を持ち越す", () => {
+    // 行の途中で読み取りが区切られた場合に、次の受信と連結できるようにする
+    expect(splitSseLines("data: {\"te")).toEqual({
+      lines: [],
+      remainder: 'data: {"te',
+    });
+  });
+
+  it("切り出した行はそのままデータ行として解析できる", () => {
+    // 行区切りの処理と data 行の解析が噛み合っていることを確かめる
+    const { lines } = splitSseLines(
+      `${SSE_DATA_PREFIX}${SSE_DONE_MARKER}\r\n\r\n`
+    );
+    expect(parseSseDataLine(lines[0])).toBe(SSE_DONE_MARKER);
+  });
+});
+
+describe("readSseAnswer", () => {
+  /**
+   * 指定したバイト列を順に流す読み取り口を作る。
+   * @param chunks - 流すバイト列（読み終えたら done になる）
+   * @returns readSseAnswer に渡せる読み取り口
+   */
+  function readerOf(chunks: Uint8Array[]): ReadableStreamDefaultReader<Uint8Array> {
+    // 与えられたかたまりを順に流すストリームを組み立てる
+    return new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(chunk);
+        controller.close();
+      },
+    }).getReader();
+  }
+
+  it("呼び出し元のコールバックが投げた例外はそのまま伝わる", async () => {
+    // 差分 1 件と終端の番兵を流す（本来なら完了として扱われる配信）
+    const encoder = new TextEncoder();
+    const reader = readerOf([
+      encoder.encode(formatSseFrame(JSON.stringify({ text: "こんにちは" }))),
+      encoder.encode(formatSseFrame(SSE_DONE_MARKER)),
+    ]);
+    // 表示側の不具合を模して、コールバックで例外を投げる
+    const boom = new Error("表示側の不具合");
+    // 例外が握り潰されず呼び出し元へ届くことを確認する。
+    // 中で握り潰すと「壊れた差分」として分類され、完全な回答が
+    // 「途切れています」の印付きで確定してしまう
+    await expect(
+      readSseAnswer(reader, () => {
+        throw boom;
+      })
+    ).rejects.toBe(boom);
+  });
+
+  it("行区切りが来ないまま伸び続ける受信は頭打ちにして未完了として扱う", async () => {
+    // 応答を 1 本の終端されない行にまとめるプロキシを模す。
+    // 頭打ちが無いと、画面には何も出ないままタブが応答全体を抱え込む
+    const encoder = new TextEncoder();
+    const huge = "x".repeat(600_000);
+    // 終端されない巨大な行のあとに、正常な終端の番兵が届く配信にする。
+    // 頭打ちが無いと巨大な行はバッファに溜まったまま番兵だけが解析され、
+    // 「何も捨てていない完全な回答」として確定してしまう
+    const reader = readerOf([
+      encoder.encode(huge),
+      encoder.encode(huge),
+      encoder.encode(`\n\n${formatSseFrame(SSE_DONE_MARKER)}`),
+    ]);
+    // 読み取りを実行する
+    const answer = await readSseAnswer(reader, () => {});
+    // 捨てた分があるので、番兵を受け取っていても完了として扱わない
+    expect(answer.completed).toBe(false);
+  });
+
+  it("頭打ちで捨てるのは持ち越し分だけで、同じかたまりの完結した行は残す", async () => {
+    // 巨大な未完の行と、完結した差分の行が同じかたまりに入って届く場合を模す
+    const encoder = new TextEncoder();
+    const received: string[] = [];
+    const reader = readerOf([
+      encoder.encode(
+        `${formatSseFrame(JSON.stringify({ text: "届いた差分" }))}${"x".repeat(1_100_000)}`
+      ),
+      encoder.encode(`\n\n${formatSseFrame(SSE_DONE_MARKER)}`),
+    ]);
+    // 読み取りを実行する
+    const answer = await readSseAnswer(reader, (text) => received.push(text));
+    // 切り分ける前に捨てると、そのまま使えるはずの差分まで巻き添えで消える
+    expect(received[received.length - 1]).toBe("届いた差分");
+    // 捨てた分はあるので完了としては扱わない
+    expect(answer.completed).toBe(false);
+  });
+
+  it("終端の番兵が来ないまま終わった配信は未完了として扱う", async () => {
+    // 差分だけを流して番兵を送らずに終わる（多バイト文字の途中で切れた場合も
+    // ここに含まれる。デコーダーに残ったバイト列があっても判定は変わらない）
+    const encoder = new TextEncoder();
+    const reader = readerOf([
+      encoder.encode(formatSseFrame(JSON.stringify({ text: "途中まで" }))),
+      encoder.encode("あ").slice(0, 2),
+    ]);
+    // 読み取りを実行する
+    const answer = await readSseAnswer(reader, () => {});
+    // 番兵を受け取っていないので完了として扱わない（画面は印を付けて履歴に残す）
+    expect(answer.completed).toBe(false);
   });
 });

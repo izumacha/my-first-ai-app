@@ -13,46 +13,51 @@ import {
 } from "@/lib/anthropic";
 import { getSystemPrompt, getMaxTokens, isCategoryId } from "@/lib/prompts";
 import { formatSseFrame, SSE_DONE_MARKER } from "@/lib/sse";
+// 入力上限はクライアントと共有する（唯一の参照元は @/lib/chat-limits）
+import {
+  CONTENT_EMPTY_MESSAGE,
+  CONTENT_TOO_LONG_MESSAGE,
+  MAX_BODY_BYTES,
+  MAX_CONTENT_LENGTH,
+  MAX_MESSAGE_COUNT,
+  TOO_MANY_MESSAGES_MESSAGE,
+} from "@/lib/chat-limits";
+// レート制限の判定ロジックと上限値（唯一の参照元は @/lib/rate-limit）
+import { createRateLimiter } from "@/lib/rate-limit";
 import type { ChatErrorResponse, Message, Role } from "@/lib/types";
 
-/** レート制限用：IP ごとのリクエスト時刻を記録するマップ */
-const rateLimitMap = new Map<string, number[]>();
-
-/** レート制限の設定値 */
-const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1分間のウィンドウ
-const RATE_LIMIT_MAX_REQUESTS = 20; // ウィンドウ内の最大リクエスト数
-
-/** 追跡する送信元キーの上限数。X-Forwarded-For は送信元が偽装できるため、
- * 毎回異なる値を送ってマップを際限なく成長させるメモリ枯渇攻撃が成立してしまう。
- * 上限に達したら期限切れエントリを掃除し、それでも満杯なら新規送信元は
- * 共有バケットへまとめて計上して全体流量を頭打ちにする（fail-safe）。 */
-const MAX_TRACKED_CLIENTS = 10_000;
-
-/** 追跡テーブル満杯時に未追跡の新規送信元をまとめて数える共有バケットのキー。
- * IP アドレスに現れない文字で構成し、実クライアントのキーと衝突しないようにする。 */
-const OVERFLOW_KEY = "__overflow__";
+/** 送信元ごとのレート制限器（判定ロジックと状態は @/lib/rate-limit に集約）。
+ * モジュールスコープで 1 つだけ作り、同じインスタンス上のリクエスト間で状態を共有する。 */
+const rateLimiter = createRateLimiter();
 
 /** レート制限キーとして受け付ける最大文字数（IPv6 でも 45 文字以内。
  * 偽装ヘッダ由来の巨大文字列をそのままキーに使ってメモリを消費しないための上限）。 */
 const MAX_CLIENT_KEY_LENGTH = 64;
 
-/** リクエストボディの最大バイト数（本文上限 4000 文字 × 50 件 ＋ JSON 構造の余裕分）。
- * Content-Length ヘッダは自己申告に過ぎず、チャンク転送ではそもそも付かないため、
- * ヘッダ検査（速い前段の目安）に加えて実際の読み取りバイト数でも同じ上限を強制する
- * （readBodyWithinLimit）。これにより検証前の巨大ボディでメモリを消費させられない。 */
-const MAX_BODY_BYTES = 1_000_000;
+/** 429 応答の Retry-After ヘッダに載せる待機秒数。
+ * クライアントが正しくバックオフできるよう、いつ再試行してよいかを明示する。
+ * 既定値ではなく**実際に使っている制限器のウィンドウ幅**から導く。既定値を読むと、
+ * 上限を差し替えたときにヘッダだけが古い値のまま残り、クライアントが誤った時間だけ
+ * 待つ（または閉じたままの窓へ再試行して 429 を重ねる）ずれが起きる。
+ * 秒への換算（RFC 9110 の delay-seconds は整数）は制限器側が担う。 */
+const RETRY_AFTER_SECONDS = String(rateLimiter.retryAfterSeconds);
 
-/** 429 応答の Retry-After ヘッダに載せる待機秒数（レート制限ウィンドウと同じ長さ）。
- * クライアントが正しくバックオフできるよう、いつ再試行してよいかを明示する。 */
-const RETRY_AFTER_SECONDS = String(RATE_LIMIT_WINDOW_MS / 1000);
+/** 「回答を最後まで話し終えた」ことを表す終了理由。これ以外はすべて途中終了として扱う。
+ * 列挙するのを「完了の理由」側にしているのが要点で、打ち切りの理由（max_tokens /
+ * model_context_window_exceeded / refusal 等）を列挙する向きにすると、
+ * 上流に新しい打ち切り理由が増えたときに黙って「完全な回答」に化ける。
+ * 型を `string[]` ではなく SDK の `StopReason` にしているのは、綴り違い
+ * （"end-turn" 等）を型チェックで落とすため。素の文字列だとどの理由とも
+ * 一致しなくなり、**すべての回答が「途切れています」の印付きで確定する**。 */
+const COMPLETE_STOP_REASONS: readonly Anthropic.StopReason[] = [
+  "end_turn",
+  "stop_sequence",
+];
 
-/** 1 リクエストで受け付ける会話履歴の最大メッセージ数（無制限の履歴送信による
- * トークン浪費・リソース枯渇を防ぐ。通常のチャット利用では到達しない値）。 */
-const MAX_MESSAGE_COUNT = 50;
-
-/** 1 メッセージ本文の最大文字数（巨大ボディをそのまま Claude へ転送して
- * 課金・メモリを浪費させられないようにする入力上限）。 */
-const MAX_CONTENT_LENGTH = 4000;
+/** 上流の Retry-After を中継するときの上限（秒）。1 時間。
+ * 上流が桁の大きな値を返しても、クライアントに事実上永久の待機を指示しない
+ * ための頭打ち（下限 1 秒と対称に置く）。 */
+const MAX_RELAYED_RETRY_AFTER_SECONDS = 3600;
 
 /** メッセージのロールとして受け付ける値の一覧（未知のロールを Claude へ転送しない） */
 const ALLOWED_ROLES: readonly Role[] = ["user", "assistant"];
@@ -91,12 +96,32 @@ const ERROR_MESSAGES = {
   invalidApiKey: "API キーが無効です。設定を確認してください。",
   /** 想定外のエラーで返す汎用文言 */
   internal: "サーバーエラーが発生しました。",
+  /** messages フィールドそのものが無い・配列でないときの文言 */
+  messagesRequired: "messages フィールドが必要です。",
+  /** メッセージが 1 件も入っていないときの文言 */
+  messagesEmpty: "メッセージを 1 件以上指定してください。",
+  /** 配列の要素がメッセージの形をしていないときの文言 */
+  messageShapeInvalid: "メッセージの形式が正しくありません。",
+  /** ロールが許可リストに無いときの文言 */
+  messageRoleInvalid: "メッセージのロールが正しくありません。",
+  /** 本文が文字列でない・空のときの文言（画面側の送信前検証と共有する。
+   * 書き写すと、片方だけ直したときに同じ拒否理由が 2 つの文言で現れる） */
+  messageContentEmpty: CONTENT_EMPTY_MESSAGE,
+  /** 会話履歴が user 発言で始まっていないときの文言 */
+  messagesMustStartWithUser: "会話履歴は user の発言から始めてください。",
+  /** 会話履歴が user 発言で終わっていないときの文言 */
+  messagesMustEndWithUser: "会話履歴は user の発言で終えてください。",
 } as const;
 
 /** SSE のチャンクを組み立てる際に使い回すエンコーダ。
  * イベントごとに new TextEncoder() すると生成コストが無駄に積み上がるため 1 つを共有する
  * （TextEncoder は状態を持たず、使い回しても安全）。 */
 const sseEncoder = new TextEncoder();
+
+/** リクエストボディのバイト列を文字列へ戻すときに使い回すデコーダ。
+ * リクエストごとに new TextDecoder() する必要は無い（1 回の decode で完結する
+ * 使い方では状態を持たない）ので、上の sseEncoder と同じ理由で 1 つを共有する。 */
+const bodyDecoder = new TextDecoder();
 
 /**
  * エラー応答（JSON）を組み立てる共通ヘルパー。
@@ -120,11 +145,57 @@ function jsonError(
  * 自前のレート制限と上流 429 の両方で同じ応答を返すため共通化する（§6 DRY）。
  * @returns Retry-After ヘッダ付きの 429 レスポンス
  */
-function rateLimitedResponse(): NextResponse<ChatErrorResponse> {
+function rateLimitedResponse(retryAfterSeconds: string = RETRY_AFTER_SECONDS): NextResponse<ChatErrorResponse> {
   // 再試行までの待機秒数を Retry-After で明示して 429 を返す
   return jsonError(ERROR_MESSAGES.rateLimited, 429, {
-    "Retry-After": RETRY_AFTER_SECONDS,
+    "Retry-After": retryAfterSeconds,
   });
+}
+
+/**
+ * 上流が返した Retry-After ヘッダから待機秒数を取り出す。
+ *
+ * <p>上流のレート制限を 429 として中継するとき、自前の制限器の待機時間
+ * （既定 60 秒）をそのまま載せてはいけない。上流が「300 秒待て」と言っている
+ * のに 60 秒と伝えると、クライアントは成功しえない再試行を繰り返して自前の
+ * 枠まで食い潰す。逆に上流が「2 秒」のときは不要に 60 秒待たせることになる。
+ *
+ * @param error - 上流から受け取った API エラー
+ * @returns 秒数の文字列。ヘッダが無い・10 進数字だけの形でない場合は null
+ */
+function upstreamRetryAfterSeconds(error: InstanceType<typeof Anthropic.APIError>): string | null {
+  // ヘッダは実装によって形が異なるため、取得できないときは素直に諦める
+  const raw = error.headers?.get?.("retry-after");
+  // ヘッダが無ければ使えない
+  if (!raw) {
+    return null;
+  }
+  // 秒数（RFC 9110 の delay-seconds は 10 進数字だけ）の形かを厳密に確かめる。
+  // Number() の変換規則に任せると、空白だけの値が 0 に、"0x10" が 16 に、
+  // "1e3" が 1000 になってしまう。とくに空白だけの値は下の切り上げで 1 秒に化け、
+  // 成功しえない再試行を 1 秒後に促して自前の枠まで食い潰す
+  // （この関数が防ぎたいことそのもの）。RFC 9110 は HTTP-date も許すが、
+  // その形は数字だけではないのでここで弾かれ、自前の待機時間へ倒れる
+  if (!/^\d+$/.test(raw.trim())) {
+    return null;
+  }
+  // 数字だけであることが確かめられたので秒数へ変換する
+  const seconds = Number(raw.trim());
+  // 桁が多すぎる値は信用せず、自前の待機時間へ倒す。
+  // 「有限かどうか」だけでは足りない: 1e21 以上の数値は String() が指数表記
+  // （"1e+25"）を返すため、数字だけを確かめて通したのに RFC 9110 の
+  // delay-seconds ではないヘッダを送り出すことになる（この関数が防ぎたい形そのもの）
+  if (!Number.isSafeInteger(seconds)) {
+    return null;
+  }
+  // 最低でも 1 秒は待たせる。0 をそのまま伝えると「すぐ再試行してよい」の意味になり、
+  // 上流に弾かれ続けるリクエストで自前のレート制限の枠まで食い潰す。
+  // 上側にも頭打ちを設ける: 桁の大きな値をそのまま中継すると、設定を誤った
+  // （あるいは意地の悪い）上流の一言で、クライアントがこのエンドポイントへ
+  // 事実上二度と再試行しなくなる。下限を設けているのと対称の理由
+  return String(
+    Math.min(MAX_RELAYED_RETRY_AFTER_SECONDS, Math.max(1, seconds))
+  );
 }
 
 /**
@@ -149,7 +220,7 @@ function hasJsonContentType(request: NextRequest): boolean {
  * リバースプロキシは受信した値の「後ろ」に実 IP を追記する）ため、先頭ではなく
  * 信頼できるプロキシが設定する X-Real-IP を優先し、無ければ末尾（最後のプロキシが
  * 追記した実際の接続元）を採用する。それでも直接公開構成では偽装が残るため、
- * マップ上限（MAX_TRACKED_CLIENTS）と共有バケットで資源枯渇を防いでいる。
+ * 追跡表の上限と共有バケット（@/lib/rate-limit）で資源枯渇を防いでいる。
  * @param request - 受信リクエスト
  * @returns レート制限のキーとして使う文字列
  */
@@ -175,57 +246,6 @@ function resolveClientKey(request: NextRequest): string {
   }
   // 妥当な長さのクライアント IP をキーとして返す
   return lastHop;
-}
-
-/**
- * IP ベースの簡易レート制限チェック
- * @param clientKey - リクエスト元を識別するキー
- * @returns true ならレート制限超過
- */
-function isRateLimited(clientKey: string): boolean {
-  // 現在時刻を取得する
-  const now = Date.now();
-
-  // 追跡テーブルが上限に達していたら、期限切れの送信元エントリをまとめて掃除する
-  if (rateLimitMap.size >= MAX_TRACKED_CLIENTS) {
-    // すべてのエントリを確認して、ウィンドウ外のものだけを削除する
-    for (const [key, timestamps] of rateLimitMap) {
-      // 最後のリクエストがウィンドウ外なら、この送信元の記録は不要なので削除する
-      if (timestamps.every((t) => now - t >= RATE_LIMIT_WINDOW_MS)) {
-        rateLimitMap.delete(key);
-      }
-    }
-  }
-
-  // 掃除後も満杯で、かつ未追跡の新規送信元なら共有バケットに振り替える。
-  // 素通しにすると偽装キーの使い捨てで制限を無効化できてしまうため、
-  // 満杯時の新規送信元はまとめて数えて全体流量を必ず頭打ちにする（fail-safe）
-  const effectiveKey =
-    rateLimitMap.size >= MAX_TRACKED_CLIENTS && !rateLimitMap.has(clientKey)
-      ? OVERFLOW_KEY
-      : clientKey;
-
-  // この送信元の過去のリクエスト時刻一覧を取得する（なければ空配列）
-  const timestamps = rateLimitMap.get(effectiveKey) ?? [];
-
-  // ウィンドウ内のリクエストだけを残すようフィルタリングする
-  const recentTimestamps = timestamps.filter(
-    (t) => now - t < RATE_LIMIT_WINDOW_MS
-  );
-
-  // リクエスト数が上限に達していたら制限超過と判定する
-  if (recentTimestamps.length >= RATE_LIMIT_MAX_REQUESTS) {
-    return true;
-  }
-
-  // 今回のリクエスト時刻を記録する
-  recentTimestamps.push(now);
-
-  // マップを更新する
-  rateLimitMap.set(effectiveKey, recentTimestamps);
-
-  // 制限内なので false を返す
-  return false;
 }
 
 /**
@@ -278,8 +298,13 @@ async function readBodyWithinLimit(
     total += value.byteLength;
     // 合計が上限を超えたら、それ以上読まずに打ち切って「超過」を知らせる
     if (total > limitBytes) {
-      // 残りのボディの受信を中止する（読み続けてメモリを消費しない）
-      await reader.cancel();
+      // 残りのボディの受信を中止する（読み続けてメモリを消費しない）。
+      // 既にエラーで終わっているストリームの cancel は reject するため、
+      // 捕まえずに待つと 413 のつもりが「想定外のエラー」の 500 に化ける
+      // （目的は解放なので、失敗しても実害は無い。debug には残す）
+      await reader.cancel().catch((cancelError: unknown) => {
+        console.debug("リクエストボディの解放に失敗しました:", cancelError);
+      });
       return null;
     }
     // 上限内のチャンクを配列に追加する
@@ -295,8 +320,8 @@ async function readBodyWithinLimit(
     // 次のコピー開始位置をチャンク分だけ進める
     offset += chunk.byteLength;
   }
-  // バイト列を UTF-8 文字列に変換して返す
-  return new TextDecoder().decode(merged);
+  // バイト列を UTF-8 文字列に変換して返す（デコーダはモジュールで共有する）
+  return bodyDecoder.decode(merged);
 }
 
 /**
@@ -309,36 +334,53 @@ async function readBodyWithinLimit(
 function validateMessages(messages: unknown): string | null {
   // 配列でない場合は形式エラーとする
   if (!Array.isArray(messages)) {
-    return "messages フィールドが必要です。";
+    return ERROR_MESSAGES.messagesRequired;
   }
   // 空配列は Claude API 側でエラーになるため、ここで 400 として弾く
   if (messages.length === 0) {
-    return "メッセージを 1 件以上指定してください。";
+    return ERROR_MESSAGES.messagesEmpty;
   }
   // 件数上限を超える履歴は受け付けない（トークン浪費・リソース枯渇防止）
   if (messages.length > MAX_MESSAGE_COUNT) {
-    return `メッセージ数が上限（${MAX_MESSAGE_COUNT} 件）を超えています。`;
+    return TOO_MANY_MESSAGES_MESSAGE;
   }
   // 各メッセージの中身（ロール・本文）を検証する
   for (const message of messages) {
     // オブジェクトでない要素（null・文字列など）は形式エラーとする
     if (typeof message !== "object" || message === null) {
-      return "メッセージの形式が正しくありません。";
+      return ERROR_MESSAGES.messageShapeInvalid;
     }
     // 検証のためにロールと本文を取り出す（この時点では未検証の unknown として扱う）
     const { role, content } = message as { role?: unknown; content?: unknown };
     // ロールが許可リストに無い場合は弾く（"system" 等を Claude へ転送させない）
     if (!ALLOWED_ROLES.includes(role as Role)) {
-      return "メッセージのロールが正しくありません。";
+      return ERROR_MESSAGES.messageRoleInvalid;
     }
     // 本文が文字列でない・空文字列の場合は弾く
     if (typeof content !== "string" || content.trim() === "") {
-      return "メッセージ本文を入力してください。";
+      return ERROR_MESSAGES.messageContentEmpty;
     }
     // 本文が上限文字数を超える場合は弾く（巨大ボディの転送防止）
     if (content.length > MAX_CONTENT_LENGTH) {
-      return `メッセージ本文が上限（${MAX_CONTENT_LENGTH} 文字）を超えています。`;
+      return CONTENT_TOO_LONG_MESSAGE;
     }
+  }
+  // 先頭が user 発言でない履歴は上流 Claude が必ず 400 で拒否するため、ここで弾く。
+  // 画面側（trimHistoryForRequest）は窓の先頭が user になるまで古い側を捨てて
+  // この形を保証しているが、保証を送信側だけに置くと上流を 1 往復むだに呼ぶ
+  // （課金と待ち時間が発生する）うえ、画面以外の呼び出し元では保証が消える。
+  // 検証はこの層（入力は信用しない境界）に置く
+  if ((messages[0] as Message).role !== "user") {
+    return ERROR_MESSAGES.messagesMustStartWithUser;
+  }
+  // 末尾も user 発言でなければ弾く。assistant 発言で終わる履歴を送ると、上流は
+  // 「その続きを書く」ため、送り主が置いた assistant の書き出しをモデルが
+  // そのまま引き継いでしまう（カテゴリ別のシステムプロンプトによる制約より、
+  // 送り主が書いた文章のほうが強く効く形になる）。認証の無い従量課金の
+  // エンドポイントなので、この形は受け付けない。画面側は必ず末尾に今回の
+  // ユーザー入力を積むので、正規の利用では起こらない
+  if ((messages[messages.length - 1] as Message).role !== "user") {
+    return ERROR_MESSAGES.messagesMustEndWithUser;
   }
   // すべての検証を通過したら問題なし（null）を返す
   return null;
@@ -356,40 +398,135 @@ type UpstreamStream = AsyncIterable<Anthropic.RawMessageStreamEvent> & {
  * 上流の Claude ストリームを、ブラウザへ返す SSE 形式の ReadableStream に変換する。
  * POST ハンドラーから切り出して「SSE への変換」という単一の責務に閉じ込める（§6 単一責務）。
  * @param stream - 上流 Claude API のイベントストリーム
+ * @param requestSignal - リクエストの中断シグナル。SDK は中断でも throw せず正常終了するため、
+ *                        ループが終わった理由（流し切った／中断された）はこれでしか区別できない
  * @returns SSE のバイト列を流す ReadableStream
  */
-function createSseStream(stream: UpstreamStream): ReadableStream<Uint8Array> {
+function createSseStream(
+  stream: UpstreamStream,
+  requestSignal: AbortSignal
+): ReadableStream<Uint8Array> {
+  // 受信側が自分から切断した（cancel() が呼ばれた）かどうかを覚えておくフラグ。
+  // 切断後は controller へ書けなくなるので、書き込みの前に必ずこれを確認する。
+  // cancel() は controller が使えなくなるのと同時に同期的に呼ばれ、確認と書き込みの
+  // 間には await を挟まないため、確認を通ったあとに切断が割り込むことはない
+  let cancelledByConsumer = false;
   // SSE のチャンクを順次書き出す ReadableStream を組み立てて返す
   return new ReadableStream({
     async start(controller) {
+      // 上流が伝えてきた生成の終了理由（届かなければ null のまま）。
+      // 「打ち切りの理由を列挙して弾く」のではなく「最後まで話し終えた理由だけを
+      // 完了とみなす」向きで判定する。SDK の StopReason には max_tokens 以外にも
+      // model_context_window_exceeded や refusal といった途中終了があり、
+      // 列挙側で持つと新しい理由が増えるたびに黙って「完全な回答」に化ける
+      let finalStopReason: Anthropic.StopReason | null = null;
       try {
         // テキストデルタイベントを順次読み出す
         for await (const event of stream) {
+          // 生成の終了理由を伝えるイベントなら、その理由を控える
+          if (event.type === "message_delta" && event.delta.stop_reason) {
+            finalStopReason = event.delta.stop_reason;
+          }
           // content_block_delta イベントからテキスト差分を取得する
           if (
             event.type === "content_block_delta" &&
             event.delta.type === "text_delta"
           ) {
+            // 受信側が既に切断していれば、書く相手がいないのでここで終える。
+            // 書きに行くと「Invalid state: Controller is already closed」の
+            // TypeError になり、正常な切断が上流障害と見分けられなくなる
+            if (cancelledByConsumer) {
+              return;
+            }
             // テキスト差分を SSE 形式でエンコードして送信する（書式は @/lib/sse に集約）
             const data = JSON.stringify({ text: event.delta.text });
             controller.enqueue(sseEncoder.encode(formatSseFrame(data)));
           }
+        }
+        // 上流を読み切ったあとも、書く前に受信側が残っているかを確かめる。
+        // SDK は反復中の中断を throw せず正常終了する（core/streaming.js の
+        // 「abort されたら return する」）ため、切断はここへ普通に到達する
+        if (cancelledByConsumer) {
+          return;
+        }
+        // ループが例外なく終わったことは「上流が最後まで流し切った」ことを意味しない。
+        // SDK は中断でも throw せず return するので、プラットフォームの実行時間上限や
+        // ゲートウェイのアイドルタイムアウトで request.signal が中断された場合も
+        // ここへ普通に到達する。区別せず [DONE] を送ると、途中で切れた回答が
+        // 「完全な回答」としてクライアントに確定・保存され、次のターンでは
+        // 欠けたままの回答が文脈として送り返される（しかもサーバには何も残らない）
+        //
+        // ここではログを出さない: 中断の理由が「クライアントがタブを閉じた」のか
+        // 「プラットフォームが実行時間上限で打ち切った」のかは区別できない。
+        // タブ閉じでも request.signal は中断され、cancel() が届く順序は保証が無いので、
+        // ログを出すと通常の離脱のたびに障害ログが積まれて本物の障害が埋もれる。
+        // 上流そのものの失敗（下の console.error）は別経路なので記録は失われない
+        if (requestSignal.aborted) {
+          // 受信側には「完了していない」ことを伝える（正常完了と見分けられるようにする）
+          controller.error(new Error("ストリーミングが完了前に中断されました"));
+          return;
+        }
+        // 最後まで話し終えた理由でなければ「完了」ではないので終端の番兵を送らない。
+        // 受信側は [DONE] を受け取れなかった読み取りを「途中で切れた回答」として
+        // 扱い、印を付けて履歴に残す。通信としては正常なのでエラーにはしない
+        // （エラーにすると、実際には届いている回答に通信障害の警告が出てしまう）。
+        //
+        // 終了理由が 1 度も届かなかった場合（null）も完了ではない。上流の応答本文が
+        // message_delta を出す前に途切れると、SDK は途切れを例外にせず反復を終える
+        // ため、ここには「理由なしの正常終了」として現れる。null を完了側へ倒すと、
+        // その途切れた回答だけが唯一「完全な回答」として確定してしまい、既知の
+        // 打ち切り理由に対する扱い（完了の理由だけを完了とみなす）と正反対になる
+        if (
+          finalStopReason === null ||
+          !COMPLETE_STOP_REASONS.includes(finalStopReason)
+        ) {
+          controller.close();
+          return;
         }
         // ストリーム終了を通知する（番兵の値は読み取り側と共有の定数を使う）
         controller.enqueue(sseEncoder.encode(formatSseFrame(SSE_DONE_MARKER)));
         // ストリームを閉じる
         controller.close();
       } catch (error) {
-        // クライアント切断による中断は異常系ではないため、静かに終了する
-        // （cancel() 後の controller はもう使えず、エラー通知の意味も無い）
+        // ここへ来るのは上流の反復そのものが失敗した場合だけになる
+        // （受信側への書き込みは上の切断チェックで守られているため）。
+        // だから失敗の種類で分類してから、受信側の有無で後始末を変える。
+        //
+        // 分類を先に行うのが重要: 上流の失敗と受信側の切断はネットワーク障害で
+        // 同時に起きうる。切断の有無を先に見て早期 return すると、その競合の
+        // ときだけ本物の上流障害が無記録で消え、いちばんログが欲しい場面で
+        // 記録が残らなくなる
+
+        // 中断由来のエラー（SDK の分類が変わった場合などの保険）はサーバの障害では
+        // ないので記録しない。ただし受信側がまだ読んでいるなら、回答は途中で切れて
+        // いるので黙って閉じてはいけない。[DONE] なしで close() すると、読み手は
+        // done で抜けて「完全な回答」として確定させてしまい、正常完了と区別が付かない。
+        // error() なら終端も伝わる（宙吊りにならない）うえ、切れたことも伝わる
+        // なお、受信側が既に切断していれば error() は仕様上その場で戻る（何も起きない）
+        // ので、切断の有無で呼び分ける必要はない。呼び分けが要るのは enqueue() /
+        // close() のほうで、あちらは切断後に呼ぶと TypeError になる
         if (isAbortError(error)) {
+          controller.error(error);
           return;
         }
-        // 中断以外のストリーム中のエラーはコントローラーに伝える
+
+        // 中断以外の失敗（上流の切断・overloaded 等）はサーバログに必ず残す。
+        // この時点では既に 200 とヘッダを返し終えているため POST ハンドラーの
+        // catch（mapErrorToResponse）へは戻らず、controller.error() は受信側を
+        // reject させるだけでサーバ側には何の記録も残らない。ログを出さないと
+        // 上流障害が繰り返し起きても運用者が気づけない（§6 エラーを握り潰さない）
+        console.error(
+          "チャット API のストリーミング中にエラーが発生しました:",
+          error
+        );
+
+        // 受信側へ失敗を伝える（切断済みなら上と同じく何も起きない）
         controller.error(error);
       }
     },
     cancel() {
+      // 受信側が自分から切断したことを記録する（上の catch が後始末を分岐するのに使う）
+      cancelledByConsumer = true;
       // 受信側（クライアント）が切断したら上流の Claude ストリームも中断する。
       // 放置すると切断後も上流の生成が続き、トークンが課金され続けてしまう
       stream.controller.abort();
@@ -419,9 +556,11 @@ function mapErrorToResponse(error: unknown): NextResponse<ChatErrorResponse> | R
     if (error.status === 401) {
       return jsonError(ERROR_MESSAGES.invalidApiKey, 401);
     }
-    // 上流のレート制限（429）はそのまま 429 として返す（CLAUDE.md のステータス契約）
+    // 上流のレート制限（429）はそのまま 429 として返す（CLAUDE.md のステータス契約）。
+    // 待機時間は上流が指定していればそれに従う（自前の待機時間は上流の都合を知らない）
     if (error.status === 429) {
-      return rateLimitedResponse();
+      // 上流の指定が無ければ引数を省略し、既定（自前の待機時間）を 1 か所に保つ
+      return rateLimitedResponse(upstreamRetryAfterSeconds(error) ?? undefined);
     }
     // 上流の 400（リクエスト内容起因のエラー）はクライアントエラーとして 400 で返す。
     // 500 に倒すとクライアント起因の問題がサーバ障害として誤って記録・表示されてしまう
@@ -477,7 +616,7 @@ export async function POST(
     const clientKey = resolveClientKey(request);
 
     // レート制限チェックを行う
-    if (isRateLimited(clientKey)) {
+    if (rateLimiter.isRateLimited(clientKey)) {
       // 制限超過の場合は 429 を返す（Retry-After で再試行までの待機秒数を伝える）
       return rateLimitedResponse();
     }
@@ -505,6 +644,14 @@ export async function POST(
     } catch {
       // JSON として不正なボディは 400（クライアント起因のエラー）を返す
       return jsonError(ERROR_MESSAGES.invalidJson, 400);
+    }
+
+    // JSON として正しくてもオブジェクトとは限らない（"null" / "1" / "[]" / 文字列も
+    // 正しい JSON）。null のまま次の行で body.messages を読むと TypeError になり、
+    // 入力の誤りが 500 と「想定外のエラー」のサーバログに化ける。
+    // 入力検証の誤りは 400 で返す契約なので、ここで形を確かめる
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+      return jsonError(ERROR_MESSAGES.messagesRequired, 400);
     }
 
     // メッセージ配列を検証する（件数・ロール・本文の型と長さまで確認する）
@@ -555,8 +702,9 @@ export async function POST(
       }
     );
 
-    // 上流ストリームを SSE 形式の ReadableStream に変換する
-    const readableStream = createSseStream(stream);
+    // 上流ストリームを SSE へ変換する。リクエストの中断シグナルも渡し、
+    // 「上流が流し切った」のか「途中で中断された」のかを区別できるようにする
+    const readableStream = createSseStream(stream, request.signal);
 
     // SSE レスポンスを返す
     return new Response(readableStream, {
