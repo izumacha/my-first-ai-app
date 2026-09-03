@@ -40,6 +40,10 @@ const MESSAGES = {
    * 無いのに無関係な確認を促すことになる（`TRUNCATED_ANSWER_SUFFIX` が
    * 「中断」という語を避けているのと同じ理由）。 */
   answerInterrupted: "回答を最後まで受け取れませんでした。もう一度お試しください。",
+  /** 送信が既に進行中で、今回の送信を受け付けられなかったときの文言。
+   * 黙って捨てると、入力は残るのに何も起きない画面になり、
+   * 何が起きたのか（あるいは何も起きていないのか）が分からない。 */
+  sendInProgress: "送信中です。応答を待ってからもう一度お試しください。",
 } as const;
 
 /**
@@ -84,12 +88,14 @@ export default function Home() {
       // 接続の問題とは限らない（プラットフォームの実行時間上限など）
       let startedStreaming = false;
 
-      // ローディング状態を開始する
-      setIsLoading(true);
-      // ストリーミングテキストを空にリセットする
-      setStreamingText("");
-
       try {
+        // ローディング状態を開始する。**try の中で行う**: 外に置くと、ここで
+        // 投げられたときに下の finally が走らず、進行中の印が立ったままになって
+        // 以降の送信がすべて（表示も出ないまま）拒否され続ける
+        setIsLoading(true);
+        // ストリーミングテキストを空にリセットする
+        setStreamingText("");
+
         // チャット API にリクエストを送信する
         const response = await fetch("/api/chat", {
           method: "POST",
@@ -255,6 +261,8 @@ export default function Home() {
       // 送信ボタンは送信中に無効化されるが、入力欄を経由しない送信経路が
       // 増えても必ずここを通るよう、この層でも止める
       if (inFlightRef.current) {
+        // 黙って捨てない（入力は残るのに何も起きない画面にしない）
+        setError(MESSAGES.sendInProgress);
         return false;
       }
       // 進行中の印を立てる（解除は下の finally で必ず行う）
