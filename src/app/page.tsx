@@ -73,50 +73,11 @@ export default function Home() {
   }, []);
 
   /**
-   * メッセージ送信処理
-   * ユーザーのメッセージを会話履歴に追加し、API にストリーミングリクエストを送る。
+   * 送信した会話履歴で API を呼び、ストリーミング応答を画面へ反映する処理
+   * @param history - API へ送る会話履歴（末尾が今回の質問）
    */
-  const handleSend = useCallback(
-    async (content: string) => {
-      // 上限を超える本文は履歴に積まない。積むとサーバーが 400 を返す一方で
-      // 履歴には残り続け、以降のすべての送信が同じ 400 になって復帰できなくなる。
-      // 入力欄側も同じ規則（findContentProblem）で先に弾くが、あちらは
-      // 「入力を消さずに理由を見せる」表示のための検証で、履歴を守るのはこの層。
-      // 入力欄を経由しない送信経路が増えても、必ずここを通る
-      const contentProblem = findContentProblem(content);
-      if (contentProblem) {
-        setError(contentProblem);
-        return;
-      }
-
-      // 送信が既に進行中なら何もしない。
-      // 重なると、2 回目が「1 回目の追加が反映される前の履歴」を読んでしまい、
-      // 画面には両方の質問が並ぶのに API へ送る履歴からは直前の質問が抜ける
-      // （表示と送信内容が食い違い、しかもどこにもエラーが出ない）。
-      // 送信ボタンは送信中に無効化されるが、入力欄を経由しない送信経路が
-      // 増えても必ずここを通るよう、この層でも止める
-      if (inFlightRef.current) {
-        return;
-      }
-      // 進行中の印を立てる（解除は下の finally で必ず行う）
-      inFlightRef.current = true;
-
-      // ここまで来て初めて、前回の送信についての通知を消す。
-      // 先に消すと、重なった送信を上のガードで捨てたときに「前回の失敗の理由が
-      // 消えただけで何も起きない」画面になり、何が起きたのか分からなくなる
-      setError(null);
-
-      // ユーザーのメッセージオブジェクトを作成する
-      const userMessage: Message = { role: "user", content };
-
-      // 会話履歴にユーザーメッセージを追加する。
-      // 画面へ反映する配列と API へ送る配列は**同じもの**を使う。関数形式
-      // （previous => [...previous, userMessage]）にすると表示側だけが最新になり、
-      // 送信側は直前の値を捕まえた配列のままなので、両者が食い違う余地が残る。
-      // 重なった送信は上の inFlightRef で止めてあるので、この配列は常に最新
-      const updatedMessages = [...messages, userMessage];
-      setMessages(updatedMessages);
-
+  const runRequest = useCallback(
+    async (history: Message[]) => {
       // 応答の読み取りに入ったかどうか。外側の catch が「通信エラー」と
       // 断定してよいかの判断に使う。読み取りに入っていれば接続は成立して
       // いるので、そこから先の失敗は「配信が最後まで届かなかった」であって
@@ -137,7 +98,7 @@ export default function Home() {
             // 画面には全履歴を残したまま、API へはサーバーが受け付ける件数まで
             // 切り詰めた履歴だけを送る。切り詰めないと会話が続くほど履歴が伸び、
             // 上限を超えた時点から以降のすべての送信が 400 になって会話を続けられなくなる
-            messages: trimHistoryForRequest(updatedMessages),
+            messages: trimHistoryForRequest(history),
             category,
           }),
         });
@@ -265,7 +226,65 @@ export default function Home() {
         inFlightRef.current = false;
       }
     },
-    [messages, category]
+    [category]
+  );
+
+  /**
+   * メッセージ送信処理
+   * 送ってよい本文かを確かめ、会話履歴へ積んでから送信を開始する。
+   * @param content - 送信しようとしている本文
+   * @returns 送信を受け付けたら true（false のとき入力欄は入力を消さない）
+   */
+  const handleSend = useCallback(
+    (content: string): boolean => {
+      // 上限を超える本文は履歴に積まない。積むとサーバーが 400 を返す一方で
+      // 履歴には残り続け、以降のすべての送信が同じ 400 になって復帰できなくなる。
+      // 入力欄側も同じ規則（findContentProblem）で先に弾くが、あちらは
+      // 「入力を消さずに理由を見せる」表示のための検証で、履歴を守るのはこの層。
+      // 入力欄を経由しない送信経路が増えても、必ずここを通る
+      const contentProblem = findContentProblem(content);
+      if (contentProblem) {
+        setError(contentProblem);
+        return false;
+      }
+
+      // 送信が既に進行中なら何もしない。
+      // 重なると、2 回目が「1 回目の追加が反映される前の履歴」を読んでしまい、
+      // 画面には両方の質問が並ぶのに API へ送る履歴からは直前の質問が抜ける
+      // （表示と送信内容が食い違い、しかもどこにもエラーが出ない）。
+      // 送信ボタンは送信中に無効化されるが、入力欄を経由しない送信経路が
+      // 増えても必ずここを通るよう、この層でも止める
+      if (inFlightRef.current) {
+        return false;
+      }
+      // 進行中の印を立てる（解除は下の finally で必ず行う）
+      inFlightRef.current = true;
+
+      // ここまで来て初めて、前回の送信についての通知を消す。
+      // 先に消すと、重なった送信を上のガードで捨てたときに「前回の失敗の理由が
+      // 消えただけで何も起きない」画面になり、何が起きたのか分からなくなる
+      setError(null);
+
+      // ユーザーのメッセージオブジェクトを作成する
+      const userMessage: Message = { role: "user", content };
+
+      // 会話履歴にユーザーメッセージを追加する。
+      // 画面へ反映する配列と API へ送る配列は**同じもの**を使う。関数形式
+      // （previous => [...previous, userMessage]）にすると表示側だけが最新になり、
+      // 送信側は直前の値を捕まえた配列のままなので、両者が食い違う余地が残る。
+      // 重なった送信は上の inFlightRef で止めてあるので、この配列は常に最新
+      const updatedMessages = [...messages, userMessage];
+      setMessages(updatedMessages);
+
+      // 実際の送受信は非同期に進める。呼び出し元（入力欄）へは「受け付けたか」だけを
+      // その場で返す: 受け付けていない送信で入力欄を空にすると、送られも残りもせず
+      // 理由も出ないまま、打った文章だけが消える
+      void runRequest(updatedMessages);
+
+      // 送信を受け付けたことを伝える（入力欄はここで初めて空になる）
+      return true;
+    },
+    [messages, runRequest]
   );
 
   return (

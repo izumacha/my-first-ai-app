@@ -253,6 +253,24 @@ describe("readSseAnswer", () => {
     expect(answer.completed).toBe(false);
   });
 
+  it("頭打ちで捨てるのは持ち越し分だけで、同じかたまりの完結した行は残す", async () => {
+    // 巨大な未完の行と、完結した差分の行が同じかたまりに入って届く場合を模す
+    const encoder = new TextEncoder();
+    const received: string[] = [];
+    const reader = readerOf([
+      encoder.encode(
+        `${formatSseFrame(JSON.stringify({ text: "届いた差分" }))}${"x".repeat(1_100_000)}`
+      ),
+      encoder.encode(`\n\n${formatSseFrame(SSE_DONE_MARKER)}`),
+    ]);
+    // 読み取りを実行する
+    const answer = await readSseAnswer(reader, (text) => received.push(text));
+    // 切り分ける前に捨てると、そのまま使えるはずの差分まで巻き添えで消える
+    expect(received[received.length - 1]).toBe("届いた差分");
+    // 捨てた分はあるので完了としては扱わない
+    expect(answer.completed).toBe(false);
+  });
+
   it("終端の番兵が来ないまま終わった配信は未完了として扱う", async () => {
     // 差分だけを流して番兵を送らずに終わる（多バイト文字の途中で切れた場合も
     // ここに含まれる。デコーダーに残ったバイト列があっても判定は変わらない）

@@ -44,14 +44,14 @@ describe("ChatMessage", () => {
 describe("ChatInput", () => {
   // 送信ボタンが表示されることを確認する
   it("送信ボタンが表示されること", () => {
-    render(<ChatInput onSend={vi.fn()} onClearError={vi.fn()} isLoading={false} />);
+    render(<ChatInput onSend={vi.fn().mockReturnValue(true)} onClearError={vi.fn()} isLoading={false} />);
     // 送信ボタンがドキュメント内に存在することを確認する
     expect(screen.getByText("送信")).toBeInTheDocument();
   });
 
   // ローディング中は「送信中...」と表示されることを確認する
   it("ローディング中は送信中と表示されること", () => {
-    render(<ChatInput onSend={vi.fn()} onClearError={vi.fn()} isLoading={true} />);
+    render(<ChatInput onSend={vi.fn().mockReturnValue(true)} onClearError={vi.fn()} isLoading={true} />);
     // 「送信中...」がドキュメント内に存在することを確認する
     expect(screen.getByText("送信中...")).toBeInTheDocument();
   });
@@ -59,7 +59,7 @@ describe("ChatInput", () => {
   // テキスト入力後に送信でコールバックが呼ばれることを確認する
   it("テキスト入力後に送信で onSend が呼ばれること", () => {
     // モック関数を作成する
-    const mockOnSend = vi.fn();
+    const mockOnSend = vi.fn().mockReturnValue(true);
     render(<ChatInput onSend={mockOnSend} onClearError={vi.fn()} isLoading={false} />);
 
     // テキスト入力欄を取得する
@@ -75,7 +75,7 @@ describe("ChatInput", () => {
 
   // 空文字・空白だけの入力では、そもそも送信操作ができないことを確認する
   it("空白だけの入力では送信ボタンが押せないこと", () => {
-    const mockOnSend = vi.fn();
+    const mockOnSend = vi.fn().mockReturnValue(true);
     render(<ChatInput onSend={mockOnSend} onClearError={vi.fn()} isLoading={false} />);
 
     // 空白だけを入力する
@@ -92,7 +92,7 @@ describe("ChatInput", () => {
   });
 
   it("送信イベントが直接届いても、空の本文は理由を表示して止めること", () => {
-    const mockOnSend = vi.fn();
+    const mockOnSend = vi.fn().mockReturnValue(true);
     const mockClearError = vi.fn();
     render(
       <ChatInput
@@ -118,9 +118,26 @@ describe("ChatInput", () => {
     expect(mockClearError).toHaveBeenCalled();
   });
 
+  it("送信が受け付けられなかったときは入力を消さないこと", () => {
+    // 受け付けなかった（false を返す）親を模す
+    const mockOnSend = vi.fn().mockReturnValue(false);
+    render(<ChatInput onSend={mockOnSend} onClearError={vi.fn()} isLoading={false} />);
+
+    // 妥当な本文を入力して送信する
+    const input = screen.getByPlaceholderText("メッセージを入力...");
+    fireEvent.change(input, { target: { value: "こんにちは" } });
+    fireEvent.submit(input.closest("form")!);
+
+    // 呼び出しはされるが受け付けられていない
+    expect(mockOnSend).toHaveBeenCalledWith("こんにちは");
+    // 入力が残ることを確認する。消してしまうと、送られも残りもせず理由も出ない
+    // まま打った文章だけが消える（進行中の送信に重なった場合など）
+    expect(input).toHaveValue("こんにちは");
+  });
+
   it("上限を超える本文は送信せず、理由を表示して入力も残すこと", () => {
     // モック関数を作成する
-    const mockOnSend = vi.fn();
+    const mockOnSend = vi.fn().mockReturnValue(true);
     render(<ChatInput onSend={mockOnSend} onClearError={vi.fn()} isLoading={false} />);
 
     // 上限を超える長文を入力する
@@ -144,7 +161,7 @@ describe("ChatInput", () => {
     const mockClearError = vi.fn();
     render(
       <ChatInput
-        onSend={vi.fn()}
+        onSend={vi.fn().mockReturnValue(true)}
         onClearError={mockClearError}
         isLoading={false}
       />
@@ -165,7 +182,7 @@ describe("ChatInput", () => {
 
   it("同じ本文で再び弾かれたときも警告を出し直すこと", () => {
     // モック関数を作成する
-    const mockOnSend = vi.fn();
+    const mockOnSend = vi.fn().mockReturnValue(true);
     render(<ChatInput onSend={mockOnSend} onClearError={vi.fn()} isLoading={false} />);
 
     // 上限を超える長文を入力して送信する
@@ -186,7 +203,7 @@ describe("ChatInput", () => {
 
   it("入力を直し始めた時点で上限超過の警告が消えること", () => {
     // モック関数を作成する
-    const mockOnSend = vi.fn();
+    const mockOnSend = vi.fn().mockReturnValue(true);
     render(<ChatInput onSend={mockOnSend} onClearError={vi.fn()} isLoading={false} />);
 
     // まず上限を超える長文で弾かれる状態を作る
@@ -208,7 +225,7 @@ describe("ChatInput", () => {
 
   it("上限を超えた後に短く直せば送信できること", () => {
     // モック関数を作成する
-    const mockOnSend = vi.fn();
+    const mockOnSend = vi.fn().mockReturnValue(true);
     render(<ChatInput onSend={mockOnSend} onClearError={vi.fn()} isLoading={false} />);
 
     // まず上限を超える長文で弾かれる状態を作る

@@ -130,11 +130,19 @@ export async function readSseAnswer(
     // バイナリデータを文字列にデコードし、持ち越し分と連結する
     lineBuffer += decoder.decode(value, { stream: true });
 
+    // SSE 形式の行に切り分ける。未完の行は次のチャンクへ持ち越す
+    const { lines, remainder } = splitSseLines(lineBuffer);
+    lineBuffer = remainder;
+
     // 行区切りが一度も来ないまま伸び続ける受信への頭打ち。
     // 途中のプロキシが応答を 1 本の終端されない行にまとめてしまうと、
     // バッファだけが際限なく膨らみ、画面には何も出ないままタブが応答全体を
     // 抱え込む。上限を超えたら持ち越しを捨て、「欠けがある」ことを記録する
-    // （次の区切り以降は再び読める）
+    // （次の区切り以降は再び読める）。
+    //
+    // **切り分けたあとに見る**のが要点: 切り分ける前に捨てると、同じかたまりに
+    // 入っていた完結した行（＝そのまま使える差分）まで巻き添えで消える。
+    // 際限なく伸びうるのは持ち越し分だけなので、見るのもそこだけでよい
     if (lineBuffer.length > MAX_SSE_LINE_LENGTH) {
       // 捨てた事実を最初の 1 件だけ記録する
       if (!droppedFrame) {
@@ -143,10 +151,6 @@ export async function readSseAnswer(
       droppedFrame = true;
       lineBuffer = "";
     }
-
-    // SSE 形式の行に切り分ける。未完の行は次のチャンクへ持ち越す
-    const { lines, remainder } = splitSseLines(lineBuffer);
-    lineBuffer = remainder;
 
     // 完結した行を順に処理する
     for (const line of lines) {

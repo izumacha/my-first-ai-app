@@ -10,8 +10,11 @@ import { findContentProblem } from "@/lib/chat-limits";
 
 /** ChatInput コンポーネントの Props */
 interface ChatInputProps {
-  /** メッセージ送信時に呼ばれるコールバック関数 */
-  onSend: (message: string) => void;
+  /** メッセージ送信時に呼ばれるコールバック関数。
+   * **受け付けたかどうかを返す。** false のとき入力欄は入力を消さない:
+   * 受け付けていない送信で入力を消すと、送られも残りもせず理由も出ないまま
+   * 打った文章だけが消える */
+  onSend: (message: string) => boolean;
   /** 直前の送信についての通知（画面上部のエラー）を消すコールバック関数。
    * 送信を止めたときに呼ぶ。呼ばないと、前回の失敗の通知（429 など）が
    * 残ったまま入力欄の下にも別の理由が出て、role="alert" が 2 つ同時に並び、
@@ -81,8 +84,13 @@ export default function ChatInput({
     // 検証を通ったので、前回の理由表示があれば消す
     setInputError(null);
 
-    // 親コンポーネントにメッセージを渡す
-    onSend(trimmed);
+    // 親コンポーネントにメッセージを渡し、受け付けられたかを受け取る
+    const accepted = onSend(trimmed);
+
+    // 受け付けられなかった場合は入力を残す（打った文章を失わせない）
+    if (!accepted) {
+      return;
+    }
 
     // 入力欄を空にする
     setInput("");
