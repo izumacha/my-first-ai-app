@@ -58,14 +58,15 @@ const SSE_LINE_SEPARATOR = /\r\n|\r|\n/;
 /**
  * 文字列に SSE の行区切りが含まれるかを判定する。
  *
- * <p>区切りの規則を {@link splitSseLines} と共有するために置く。受信のたびに
+ * <p>このモジュールの中だけで使う（区切りの規則を {@link splitSseLines} と
+ * 共有するために関数として切り出す）。受信のたびに
  * バッファ全体を割り直さずに済ませる（届いた分に区切りが無ければ、完結した行は
  * 増えていない）ための先読みに使う。
  *
  * @param text - 判定する文字列
  * @returns 行区切りを含むなら true
  */
-export function hasSseLineSeparator(text: string): boolean {
+function hasSseLineSeparator(text: string): boolean {
   // 区切りの規則は SSE_LINE_SEPARATOR が唯一の参照元（フラグ無しなので状態を持たない）
   return SSE_LINE_SEPARATOR.test(text);
 }
@@ -157,7 +158,9 @@ export async function readSseAnswer(
     if (hasSseLineSeparator(decoded)) {
       // SSE 形式の行に切り分ける。未完の行は次のチャンクへ持ち越す
       const split = splitSseLines(lineBuffer);
+      // 完結した行を今回の処理対象にする
       lines = split.lines;
+      // 未完の行は次のチャンクへ持ち越す
       lineBuffer = split.remainder;
     }
 

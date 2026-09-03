@@ -253,15 +253,16 @@ describe("readSseAnswer", () => {
     expect(answer.completed).toBe(false);
   });
 
-  it("区切りが届いていないあいだはバッファを割り直さない", async () => {
+  it("チャンクの切れ目で分断された行を正しく組み立て直す", async () => {
     // 区切りの無いかたまりを分けて流し、そのあとで区切りと番兵を送る。
-    // 毎回バッファ全体を割り直す実装だと、区切りが来ないまま伸び続ける配信で
-    // 走査量と確保量が二乗に膨らむ（上限は保持量しか抑えない）
+    // 「届いた分に区切りが無ければ割り直さない」先読みを入れても、
+    // 持ち越しの組み立てが壊れないことを固定する（先読み自体は出力に現れない
+    // 純粋な性能改善なので、テストで検出できるのはここまで）
     const encoder = new TextEncoder();
     const received: string[] = [];
     const reader = readerOf([
       encoder.encode(`${SSE_DATA_PREFIX}{"text":"前`),
-      encoder.encode('半'),
+      encoder.encode("半"),
       encoder.encode(`後半"}\n\n${formatSseFrame(SSE_DONE_MARKER)}`),
     ]);
     // 読み取りを実行する

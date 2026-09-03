@@ -61,7 +61,17 @@ export default function Home() {
   // ローディング状態を管理する state
   const [isLoading, setIsLoading] = useState(false);
   // エラーメッセージを管理する state
-  const [error, setError] = useState<string | null>(null);
+  // エラーメッセージを管理する state。
+  // 文言そのものに加えて「一時的な状態を説明する文言か」を持たせる。
+  // 進行中を伝える文言はその状態が終われば成り立たなくなるので消す必要があるが、
+  // 消す側で文言を名指しして比べると、2 つ目の一時的な文言を足した人が
+  // その比較式を直し忘れた時点で、静かに「消えない通知」が戻ってくる
+  const [error, setError] = useState<{
+    /** 画面に出す文言 */
+    text: string;
+    /** 進行中などの一時的な状態を説明する文言か（その状態が終わったら消す） */
+    transient: boolean;
+  } | null>(null);
 
   // 送信が進行中かどうかを保持する参照。isLoading（state）は再描画されるまで
   // 更新が見えないため、重なった送信を止める用途には使えない
@@ -116,11 +126,13 @@ export default function Home() {
             error?: unknown;
           } | null;
           // サーバの日本語メッセージが文字列で得られればそれを、無ければ汎用文言を表示する
-          setError(
-            typeof errorData?.error === "string"
-              ? errorData.error
-              : MESSAGES.genericError
-          );
+          setError({
+            text:
+              typeof errorData?.error === "string"
+                ? errorData.error
+                : MESSAGES.genericError,
+            transient: false,
+          });
           // 早期リターンする（ローディング解除は finally が行う）
           return;
         }
@@ -130,7 +142,7 @@ export default function Home() {
 
         // リーダーが取得できない場合はエラー
         if (!reader) {
-          setError(MESSAGES.streamStartFailed);
+          setError({ text: MESSAGES.streamStartFailed, transient: false });
           // 早期リターンする（ローディング解除は finally が行う）
           return;
         }
@@ -165,9 +177,12 @@ export default function Home() {
             // 「本文の無い回答が返った」、完了していなければ「途中で終わった」で、
             // 後者に「回答を受け取れませんでした」と出すと、何も送られなかったように
             // 見えて実際（途中で切れた）と食い違う
-            setError(
-              completed ? MESSAGES.emptyAnswer : MESSAGES.answerInterrupted
-            );
+            setError({
+              text: completed
+                ? MESSAGES.emptyAnswer
+                : MESSAGES.answerInterrupted,
+              transient: false,
+            });
           }
         } finally {
           // 読み取りを終えた reader を必ず解放する。[DONE] を受信して読み取りを
@@ -209,9 +224,12 @@ export default function Home() {
         // むしろ画面に印付きの回答すら出ないぶん誤解を招きやすい。
         // ここで「接続を確認してください」と出すと問題の無い接続を疑わせるので、
         // 接続が成立する前の失敗（fetch 自体の失敗）とだけ文言を分ける
-        setError(
-          startedStreaming ? MESSAGES.answerInterrupted : MESSAGES.networkError
-        );
+        setError({
+          text: startedStreaming
+            ? MESSAGES.answerInterrupted
+            : MESSAGES.networkError,
+          transient: false,
+        });
         // 例外そのものは握り潰さずブラウザのコンソールへ残す（§6）。
         // ここへ来るのは通信の失敗（オフライン等）だけとは限らず、try の中の
         // 不具合もすべて同じ文言に化ける。中身を捨てると、画面に出る文言だけが
@@ -230,14 +248,11 @@ export default function Home() {
         setIsLoading(false);
         // 進行中の印を下ろす（次の送信を受け付ける）
         inFlightRef.current = false;
-        // 「送信中です」の通知が出ていたら消す。これは進行中という**一時的な状態**を
-        // 説明する文言なので、その状態が終わったあとも残ると、完了した会話の上に
-        // 成り立たない案内が貼り付いたままになる（他の文言は直前の送信の
-        // 結果を説明するものなので残ってよい）。今出ている文言が何かは
-        // 関数形式で確かめる — 直前の値を捕まえた変数を見ると取り違える
-        setError((previous) =>
-          previous === MESSAGES.sendInProgress ? null : previous
-        );
+        // 一時的な状態を説明する通知が出ていたら消す。その状態はもう終わって
+        // いるので、残すと完了した会話の上に成り立たない案内が貼り付いたままに
+        // なる（直前の送信の結果を説明する文言は残ってよい）。今出ている通知が
+        // 何かは関数形式で確かめる — 直前の値を捕まえた変数を見ると取り違える
+        setError((previous) => (previous?.transient ? null : previous));
       }
     },
     [category]
@@ -258,7 +273,7 @@ export default function Home() {
       // 入力欄を経由しない送信経路が増えても、必ずここを通る
       const contentProblem = findContentProblem(content);
       if (contentProblem) {
-        setError(contentProblem);
+        setError({ text: contentProblem, transient: false });
         return false;
       }
 
@@ -270,7 +285,11 @@ export default function Home() {
       // 増えても必ずここを通るよう、この層でも止める
       if (inFlightRef.current) {
         // 黙って捨てない（入力は残るのに何も起きない画面にしない）
-        setError(MESSAGES.sendInProgress);
+        setError({
+          // 進行中という一時的な状態を説明する文言（終わったら消える）
+          text: MESSAGES.sendInProgress,
+          transient: true,
+        });
         return false;
       }
       // 進行中の印を立てる（解除は下の finally で必ず行う）
@@ -320,7 +339,7 @@ export default function Home() {
           role="alert"
           className="mx-4 mt-2 rounded-lg bg-red-50 dark:bg-red-900/30 p-3 text-sm text-red-700 dark:text-red-300"
         >
-          {error}
+          {error.text}
         </div>
       )}
 

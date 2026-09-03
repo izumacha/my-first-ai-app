@@ -17,7 +17,7 @@ import {
   afterEach,
 } from "vitest";
 import type { Mock } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import Home from "@/app/page";
 // 送信履歴の上限（画面とサーバーで共有する定数）を参照する
 import { MAX_CONTENT_LENGTH, MAX_MESSAGE_COUNT } from "@/lib/chat-limits";
@@ -450,37 +450,41 @@ describe("チャット画面のストリーミング処理", () => {
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockImplementation(async () => {
-        await gate;
-        const stream = new ReadableStream<Uint8Array>({
-          start(controller) {
-            controller.enqueue(
-              encoder.encode('data: {"text":"回答"}\n\ndata: [DONE]\n\n')
-            );
-            controller.close();
-          },
-        });
-        return new Response(stream, { status: 200 });
-      })
-    );
-
-    // チャット画面を描画して 1 回目の送信を始める（応答は保留中）
-    render(<Home />);
-    sendMessage("1 つ目の質問");
-
-    // 送信中であることを確認する（前提の確認）
-    await waitFor(() => {
-      expect(screen.getByRole("button", { name: "送信中..." })).toBeDisabled();
+    // 呼び出しごとに違う本文を返す。同じ本文だと、2 本目が出ても画面上は
+    // 見分けが付かず「二重送信が起きていない」ことを確かめられない
+    let callCount = 0;
+    const fetchMock = vi.fn().mockImplementation(async () => {
+      callCount += 1;
+      const answer = `${callCount} 回目の回答`;
+      await gate;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({ text: answer })}\n\ndata: [DONE]\n\n`
+            )
+          );
+          controller.close();
+        },
+      });
+      return new Response(stream, { status: 200 });
     });
+    vi.stubGlobal("fetch", fetchMock);
 
-    // 入力欄を経由しない送信経路を模して、フォームの submit を直接起こす。
-    // 実ブラウザでは送信ボタンが無効なのでここへは来ないが、そうした経路が
-    // 増えたときに「入力は残るのに何も起きない」画面へ戻らないよう固定する
+    // チャット画面を描画する
+    render(<Home />);
+
+    // **同じ tick の中で 2 回続けて送信する。** ガードが ref なのはこのためで、
+    // isLoading（state）は再描画されるまで更新が見えない。再描画を待ってから
+    // 2 回目を撃つと、state でも止められる状況しか試したことにならない。
+    // 実ブラウザでは送信ボタンが無効なのでこの経路には来ないが、入力欄を
+    // 経由しない送信経路が増えたときの防御なので、ここで固定しておく
     const input = screen.getByLabelText("メッセージを入力");
-    fireEvent.change(input, { target: { value: "重なった質問" } });
-    fireEvent.submit(input.closest("form")!);
+    act(() => {
+      fireEvent.change(input, { target: { value: "1 つ目の質問" } });
+      fireEvent.submit(input.closest("form")!);
+      fireEvent.submit(input.closest("form")!);
+    });
 
     // 黙って捨てず、理由が表示されることを確認する
     await waitFor(() => {
@@ -492,8 +496,14 @@ describe("チャット画面のストリーミング処理", () => {
 
     // 応答が届いたことを確認する
     await waitFor(() => {
-      expect(screen.getByText("回答")).toBeInTheDocument();
+      expect(screen.getByText("1 回目の回答")).toBeInTheDocument();
     });
+
+    // 2 本目のリクエストが出ていないことを確認する。出てしまうと、画面に並ぶ
+    // 履歴と API へ送った履歴が食い違う（呼び出しごとに違う本文を返すモックに
+    // してあるので、2 本目が出れば別の回答としてここで表面化する）
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("2 回目の回答")).not.toBeInTheDocument();
 
     // 「送信中です」は進行中という一時的な状態を説明する文言なので、
     // 状態が終わったあとも残ると、完了した会話の上に成り立たない案内が
