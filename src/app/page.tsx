@@ -60,7 +60,6 @@ export default function Home() {
   const [streamingText, setStreamingText] = useState("");
   // ローディング状態を管理する state
   const [isLoading, setIsLoading] = useState(false);
-  // エラーメッセージを管理する state
   // エラーメッセージを管理する state。
   // 文言そのものに加えて「一時的な状態を説明する文言か」を持たせる。
   // 進行中を伝える文言はその状態が終われば成り立たなくなるので消す必要があるが、
