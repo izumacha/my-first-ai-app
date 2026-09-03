@@ -253,6 +253,26 @@ describe("readSseAnswer", () => {
     expect(answer.completed).toBe(false);
   });
 
+  it("チャンクの切れ目で分断された行を正しく組み立て直す", async () => {
+    // 区切りの無いかたまりを分けて流し、そのあとで区切りと番兵を送る。
+    // 「届いた分に区切りが無ければ割り直さない」先読みを入れても、
+    // 持ち越しの組み立てが壊れないことを固定する（先読み自体は出力に現れない
+    // 純粋な性能改善なので、テストで検出できるのはここまで）
+    const encoder = new TextEncoder();
+    const received: string[] = [];
+    const reader = readerOf([
+      encoder.encode(`${SSE_DATA_PREFIX}{"text":"前`),
+      encoder.encode("半"),
+      encoder.encode(`後半"}\n\n${formatSseFrame(SSE_DONE_MARKER)}`),
+    ]);
+    // 読み取りを実行する
+    const answer = await readSseAnswer(reader, (text) => received.push(text));
+    // 分断された行が正しく組み立て直されることを確認する（先読みで壊さない）
+    expect(received).toEqual(["前半後半"]);
+    // 番兵まで届いているので完了として扱う
+    expect(answer.completed).toBe(true);
+  });
+
   it("頭打ちで捨てるのは持ち越し分だけで、同じかたまりの完結した行は残す", async () => {
     // 巨大な未完の行と、完結した差分の行が同じかたまりに入って届く場合を模す
     const encoder = new TextEncoder();

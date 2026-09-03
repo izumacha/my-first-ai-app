@@ -443,61 +443,74 @@ describe("チャット画面のストリーミング処理", () => {
     await waitForIdle();
   });
 
-  it("進行中に重なった送信は、黙って捨てず理由を表示すること", async () => {
-    // 応答を保留したままにして「送信中」の状態を作る（1 回目を終わらせない）
+  it("進行中に重なった送信は理由を表示し、応答後にその通知を残さないこと", async () => {
+    // 応答を保留したままにして「送信中」の状態を作る
     const encoder = new TextEncoder();
-    const fetchMock = vi.fn().mockImplementation(
-      () =>
-        new Promise((resolve) => {
-          // 少し遅らせて、2 回目の送信が重なる余地を作る
-          setTimeout(() => {
-            const stream = new ReadableStream<Uint8Array>({
-              start(controller) {
-                controller.enqueue(
-                  encoder.encode('data: {"text":"回答"}\n\ndata: [DONE]\n\n')
-                );
-                controller.close();
-              },
-            });
-            resolve(new Response(stream, { status: 200 }));
-          }, 20);
-        })
-    );
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // 呼び出しごとに違う本文を返す。同じ本文だと、2 本目が出ても画面上は
+    // 見分けが付かず「二重送信が起きていない」ことを確かめられない
+    let callCount = 0;
+    const fetchMock = vi.fn().mockImplementation(async () => {
+      callCount += 1;
+      const answer = `${callCount} 回目の回答`;
+      await gate;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({ text: answer })}\n\ndata: [DONE]\n\n`
+            )
+          );
+          controller.close();
+        },
+      });
+      return new Response(stream, { status: 200 });
+    });
     vi.stubGlobal("fetch", fetchMock);
 
     // チャット画面を描画する
     render(<Home />);
 
-    // 入力欄とフォームを取得する
+    // **同じ tick の中で 2 回続けて送信する。** ガードが ref なのはこのためで、
+    // isLoading（state）は再描画されるまで更新が見えない。再描画を待ってから
+    // 2 回目を撃つと、state でも止められる状況しか試したことにならない。
+    // 実ブラウザでは送信ボタンが無効なのでこの経路には来ないが、入力欄を
+    // 経由しない送信経路が増えたときの防御なので、ここで固定しておく
     const input = screen.getByLabelText("メッセージを入力");
-    const form = input.closest("form");
-    // フォームが取得できることを確かめる（取得できなければ以降の検証が意味を失う）
-    expect(form).not.toBeNull();
-
-    // 本文を入力する
-    fireEvent.change(input, { target: { value: "重なる質問" } });
-
-    // 同じ act の中で 2 回続けて送信する。ボタンの無効化（isLoading）は再描画を
-    // 待つため、この時点ではまだ効かない＝ハンドラー側の進行中ガードへ到達できる。
-    // 入力欄経由では通常止まる経路なので、ここだけが「黙って捨てない」ことを
-    // 確かめられる唯一の入口になる
     act(() => {
-      fireEvent.submit(form as HTMLFormElement);
-      fireEvent.submit(form as HTMLFormElement);
+      fireEvent.change(input, { target: { value: "1 つ目の質問" } });
+      fireEvent.submit(input.closest("form")!);
+      fireEvent.submit(input.closest("form")!);
     });
 
-    // 2 回目は受け付けられず、理由が画面に出ることを確認する。
-    // 表示しないと、入力は残るのに何も起きない画面になり、
-    // 何が起きたのか（あるいは何も起きていないのか）が分からない
+    // 黙って捨てず、理由が表示されることを確認する
     await waitFor(() => {
-      expect(screen.getByRole("alert")).toHaveTextContent(
-        "送信中です。応答を待ってからもう一度お試しください。"
-      );
+      expect(screen.getByRole("alert")).toHaveTextContent("送信中です");
     });
 
-    // 実際に送信されたのは 1 回だけであることも確かめる
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    // 1 回目の応答を返す
+    release?.();
 
+    // 応答が届いたことを確認する
+    await waitFor(() => {
+      expect(screen.getByText("1 回目の回答")).toBeInTheDocument();
+    });
+
+    // 2 本目のリクエストが出ていないことを確認する。出てしまうと、画面に並ぶ
+    // 履歴と API へ送った履歴が食い違う（呼び出しごとに違う本文を返すモックに
+    // してあるので、2 本目が出れば別の回答としてここで表面化する）
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("2 回目の回答")).not.toBeInTheDocument();
+
+    // 「送信中です」は進行中という一時的な状態を説明する文言なので、
+    // 状態が終わったあとも残ると、完了した会話の上に成り立たない案内が
+    // 貼り付いたままになる
+    await waitFor(() => {
+      expect(screen.queryByText(/送信中です/)).not.toBeInTheDocument();
+    });
     // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
     await waitForIdle();
   });
