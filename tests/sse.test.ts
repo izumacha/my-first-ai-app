@@ -253,6 +253,25 @@ describe("readSseAnswer", () => {
     expect(answer.completed).toBe(false);
   });
 
+  it("区切りが届いていないあいだはバッファを割り直さない", async () => {
+    // 区切りの無いかたまりを分けて流し、そのあとで区切りと番兵を送る。
+    // 毎回バッファ全体を割り直す実装だと、区切りが来ないまま伸び続ける配信で
+    // 走査量と確保量が二乗に膨らむ（上限は保持量しか抑えない）
+    const encoder = new TextEncoder();
+    const received: string[] = [];
+    const reader = readerOf([
+      encoder.encode(`${SSE_DATA_PREFIX}{"text":"前`),
+      encoder.encode('半'),
+      encoder.encode(`後半"}\n\n${formatSseFrame(SSE_DONE_MARKER)}`),
+    ]);
+    // 読み取りを実行する
+    const answer = await readSseAnswer(reader, (text) => received.push(text));
+    // 分断された行が正しく組み立て直されることを確認する（先読みで壊さない）
+    expect(received).toEqual(["前半後半"]);
+    // 番兵まで届いているので完了として扱う
+    expect(answer.completed).toBe(true);
+  });
+
   it("頭打ちで捨てるのは持ち越し分だけで、同じかたまりの完結した行は残す", async () => {
     // 巨大な未完の行と、完結した差分の行が同じかたまりに入って届く場合を模す
     const encoder = new TextEncoder();

@@ -230,6 +230,14 @@ export default function Home() {
         setIsLoading(false);
         // 進行中の印を下ろす（次の送信を受け付ける）
         inFlightRef.current = false;
+        // 「送信中です」の通知が出ていたら消す。これは進行中という**一時的な状態**を
+        // 説明する文言なので、その状態が終わったあとも残ると、完了した会話の上に
+        // 成り立たない案内が貼り付いたままになる（他の文言は直前の送信の
+        // 結果を説明するものなので残ってよい）。今出ている文言が何かは
+        // 関数形式で確かめる — 直前の値を捕まえた変数を見ると取り違える
+        setError((previous) =>
+          previous === MESSAGES.sendInProgress ? null : previous
+        );
       }
     },
     [category]

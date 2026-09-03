@@ -56,6 +56,21 @@ const MAX_SSE_LINE_LENGTH = 1_000_000;
 const SSE_LINE_SEPARATOR = /\r\n|\r|\n/;
 
 /**
+ * 文字列に SSE の行区切りが含まれるかを判定する。
+ *
+ * <p>区切りの規則を {@link splitSseLines} と共有するために置く。受信のたびに
+ * バッファ全体を割り直さずに済ませる（届いた分に区切りが無ければ、完結した行は
+ * 増えていない）ための先読みに使う。
+ *
+ * @param text - 判定する文字列
+ * @returns 行区切りを含むなら true
+ */
+export function hasSseLineSeparator(text: string): boolean {
+  // 区切りの規則は SSE_LINE_SEPARATOR が唯一の参照元（フラグ無しなので状態を持たない）
+  return SSE_LINE_SEPARATOR.test(text);
+}
+
+/**
  * 受信バッファを SSE の行へ切り分ける。
  *
  * <p>読み取りは行境界と無関係な位置で区切られて届くため、最後の要素は
@@ -127,12 +142,24 @@ export async function readSseAnswer(
     // ストリームが終わったら抜ける（番兵が来ていなければ未完了として扱われる）
     if (done) break;
 
-    // バイナリデータを文字列にデコードし、持ち越し分と連結する
-    lineBuffer += decoder.decode(value, { stream: true });
+    // バイナリデータを文字列にデコードする
+    const decoded = decoder.decode(value, { stream: true });
+    // 持ち越し分と連結する
+    lineBuffer += decoded;
 
-    // SSE 形式の行に切り分ける。未完の行は次のチャンクへ持ち越す
-    const { lines, remainder } = splitSseLines(lineBuffer);
-    lineBuffer = remainder;
+    // 完結した行（無ければ空）
+    let lines: string[] = [];
+    // 今回届いた分に区切りが無ければ、まだ 1 行も完結していない。
+    // それでも毎回バッファ全体を割り直すと、区切りが来ないまま伸び続ける配信
+    // （応答を 1 本の行にまとめるプロキシ）で走査量と確保量が二乗に膨らみ、
+    // 上限に達するまでのあいだタブが固まる。上限は保持量を抑えるだけで、
+    // そこへ至る仕事量は抑えないので、ここで区切りの有無を先に見る
+    if (hasSseLineSeparator(decoded)) {
+      // SSE 形式の行に切り分ける。未完の行は次のチャンクへ持ち越す
+      const split = splitSseLines(lineBuffer);
+      lines = split.lines;
+      lineBuffer = split.remainder;
+    }
 
     // 行区切りが一度も来ないまま伸び続ける受信への頭打ち。
     // 途中のプロキシが応答を 1 本の終端されない行にまとめてしまうと、

@@ -17,7 +17,7 @@ import {
   afterEach,
 } from "vitest";
 import type { Mock } from "vitest";
-import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import Home from "@/app/page";
 // 送信履歴の上限（画面とサーバーで共有する定数）を参照する
 import { MAX_CONTENT_LENGTH, MAX_MESSAGE_COUNT } from "@/lib/chat-limits";
@@ -443,61 +443,64 @@ describe("チャット画面のストリーミング処理", () => {
     await waitForIdle();
   });
 
-  it("進行中に重なった送信は、黙って捨てず理由を表示すること", async () => {
-    // 応答を保留したままにして「送信中」の状態を作る（1 回目を終わらせない）
+  it("進行中に重なった送信は理由を表示し、応答後にその通知を残さないこと", async () => {
+    // 応答を保留したままにして「送信中」の状態を作る
     const encoder = new TextEncoder();
-    const fetchMock = vi.fn().mockImplementation(
-      () =>
-        new Promise((resolve) => {
-          // 少し遅らせて、2 回目の送信が重なる余地を作る
-          setTimeout(() => {
-            const stream = new ReadableStream<Uint8Array>({
-              start(controller) {
-                controller.enqueue(
-                  encoder.encode('data: {"text":"回答"}\n\ndata: [DONE]\n\n')
-                );
-                controller.close();
-              },
-            });
-            resolve(new Response(stream, { status: 200 }));
-          }, 20);
-        })
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(async () => {
+        await gate;
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(
+              encoder.encode('data: {"text":"回答"}\n\ndata: [DONE]\n\n')
+            );
+            controller.close();
+          },
+        });
+        return new Response(stream, { status: 200 });
+      })
     );
-    vi.stubGlobal("fetch", fetchMock);
 
-    // チャット画面を描画する
+    // チャット画面を描画して 1 回目の送信を始める（応答は保留中）
     render(<Home />);
+    sendMessage("1 つ目の質問");
 
-    // 入力欄とフォームを取得する
-    const input = screen.getByLabelText("メッセージを入力");
-    const form = input.closest("form");
-    // フォームが取得できることを確かめる（取得できなければ以降の検証が意味を失う）
-    expect(form).not.toBeNull();
-
-    // 本文を入力する
-    fireEvent.change(input, { target: { value: "重なる質問" } });
-
-    // 同じ act の中で 2 回続けて送信する。ボタンの無効化（isLoading）は再描画を
-    // 待つため、この時点ではまだ効かない＝ハンドラー側の進行中ガードへ到達できる。
-    // 入力欄経由では通常止まる経路なので、ここだけが「黙って捨てない」ことを
-    // 確かめられる唯一の入口になる
-    act(() => {
-      fireEvent.submit(form as HTMLFormElement);
-      fireEvent.submit(form as HTMLFormElement);
-    });
-
-    // 2 回目は受け付けられず、理由が画面に出ることを確認する。
-    // 表示しないと、入力は残るのに何も起きない画面になり、
-    // 何が起きたのか（あるいは何も起きていないのか）が分からない
+    // 送信中であることを確認する（前提の確認）
     await waitFor(() => {
-      expect(screen.getByRole("alert")).toHaveTextContent(
-        "送信中です。応答を待ってからもう一度お試しください。"
-      );
+      expect(screen.getByRole("button", { name: "送信中..." })).toBeDisabled();
     });
 
-    // 実際に送信されたのは 1 回だけであることも確かめる
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    // 入力欄を経由しない送信経路を模して、フォームの submit を直接起こす。
+    // 実ブラウザでは送信ボタンが無効なのでここへは来ないが、そうした経路が
+    // 増えたときに「入力は残るのに何も起きない」画面へ戻らないよう固定する
+    const input = screen.getByLabelText("メッセージを入力");
+    fireEvent.change(input, { target: { value: "重なった質問" } });
+    fireEvent.submit(input.closest("form")!);
 
+    // 黙って捨てず、理由が表示されることを確認する
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent("送信中です");
+    });
+
+    // 1 回目の応答を返す
+    release?.();
+
+    // 応答が届いたことを確認する
+    await waitFor(() => {
+      expect(screen.getByText("回答")).toBeInTheDocument();
+    });
+
+    // 「送信中です」は進行中という一時的な状態を説明する文言なので、
+    // 状態が終わったあとも残ると、完了した会話の上に成り立たない案内が
+    // 貼り付いたままになる
+    await waitFor(() => {
+      expect(screen.queryByText(/送信中です/)).not.toBeInTheDocument();
+    });
     // 積み残しの再描画をテスト外へ持ち越さないよう、処理完了まで待ってから終える
     await waitForIdle();
   });
