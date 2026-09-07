@@ -69,6 +69,32 @@ updates:
       - dependency-name: "eslint"
         update-types: ["version-update:semver-major"]
 
+      # @types/node の major 更新を保留する。
+      #
+      # なぜ止めるのか: `@types/node` の major は DefinitelyTyped の慣習として
+      #   **Node 本体のリリース系列に対応する**。`@types/node@28` は「Node 28 の API 一覧」
+      #   であって、Node 26 で動くコードの型チェックに使うものではない。
+      #   そしてここがずれても **lint も型チェックも通ってしまう** — むしろ型が
+      #   API の存在を主張するぶん、実行する Node に無い API を書いても
+      #   `tsc --noEmit` が緑のまま通り、壊れるのは本番の実行時
+      #   (`TypeError: x is not a function`) になる。**CI の緑が判断材料にならない
+      #   fail-open** なので、バージョンの主導権を Dependabot ではなく
+      #   「ランタイムを上げる判断」の側に置く。
+      #
+      # 外し方: これは「永久に major を上げない」という意味ではない。
+      #   動かす Node を次の major へ上げるときは、ピン留め 4 か所
+      #   (`.nvmrc` / このリポジトリの CI の `NODE_VERSION` / `Dockerfile` の
+      #   `FROM node:<major>` / `package.json` の `engines.node`) をまとめて上げ、
+      #   **同じ PR で `@types/node` も新しい major へ上げる**。ignore は残したままでよい。
+      #
+      # 効き方: `version-update:semver-major` だけを対象にするので、26 系の
+      #   minor / patch 更新は従来どおり npm-minor-and-patch グループで届く。
+      #
+      # 整合性は tests/node-runtime-alignment.test.ts が機械的に見張る
+      # (ピンの食い違い・型と実行時のずれ・この保留の消失/効きすぎ/置き場所間違い)。
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
+
   # Dockerfile のベースイメージ (node 等)
   - package-ecosystem: "docker"
     directory: "/"

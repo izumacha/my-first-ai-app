@@ -8,21 +8,26 @@ on:
     branches: [main, docs/initial-project-setup]
   pull_request:
 
+# このアプリを実際に動かす Node の major。Dockerfile の `FROM node:<major>` /
+# `.nvmrc` / `package.json` の engines.node と**同じ major** を指していなければならない。
+# 以前はここだけ matrix [20, 22] で、出荷する Node (Dockerfile の 26) を一度も検証して
+# いなかった。緑になるのは「その Node で動くから」ではなく「npm が engines を強制しない
+# から」でしかなく、CI の緑が判断材料にならない fail-open だった
+# (詳細は tests/node-runtime-alignment.test.ts の冒頭コメント)。
+env:
+  NODE_VERSION: '26'
+
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
 
-    strategy:
-      matrix:
-        node-version: [20, 22]
-
     steps:
       - uses: actions/checkout@v7
 
-      - name: Setup Node.js ${{ matrix.node-version }}
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
         uses: actions/setup-node@v7
         with:
-          node-version: ${{ matrix.node-version }}
+          node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
 
       - name: Install dependencies
