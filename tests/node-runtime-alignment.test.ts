@@ -1,9 +1,10 @@
 // このアプリが**実際に動く Node.js の major** を、宣言している場所すべてで揃えるテスト。
 //
 // なぜテストで縛るのか:
-//   「どの Node で動かすか」はこのリポジトリの中で 5 か所に分かれて書かれている
-//   (`.nvmrc` / CI の `NODE_VERSION` / `Dockerfile` の `FROM node:<major>` /
-//    `package.json` の `engines.node` / README の必要環境)。ここがずれても
+//   「どの Node で動かすか」はこのリポジトリの中で 4 か所に分かれて書かれている
+//   (`.nvmrc`(正本) / `Dockerfile` の `FROM node:<major>` /
+//    `package.json` の `engines.node` / README の必要環境。CI は `.nvmrc` を
+//    参照するので版を持たない)。ここがずれても
 //   **lint も型チェックもテストも通ってしまう**。npm は `engines` を既定で強制しない
 //   ので、依存がサポートしていない Node の上でも `npm ci` は成功し、テストも
 //   「たまたま動いている間は」緑になる。つまり **CI の緑が「その Node で動く」ことの
@@ -18,8 +19,11 @@
 //   `tsc --noEmit` が緑のまま通る状態だった。
 //
 // 何を防ぐか:
-//   (a) ピン留めの食い違い … `.nvmrc` / CI / Dockerfile が別々の major を指す状態。
-//       どれか 1 つを上げ忘れると「どの Node に合わせるべきか」が決まらなくなる。
+//   (a) ピン留めの食い違い … `.nvmrc` と Dockerfile が別々の major を指す状態。
+//       どちらかを上げ忘れると「どの Node に合わせるべきか」が決まらなくなる。
+//   (a') CI が版を書き写す形へ戻ること … `node-version: '26'` のように直書きすると、
+//       `.nvmrc` とずれても CI は緑のまま通り、この PR 以前の状態に戻る。
+//       値の一致ではなく**配線そのもの**を固定する。
 //   (b) 読み取り不能 … 書式が変わってピンを読めない状態。判定の土台が崩れるので
 //       「たぶん合っている」ではなく落とす (fail-closed)。
 //   (c) 宣言のずれ … `engines.node` がピン留めした Node を許していない、
@@ -34,7 +38,7 @@
 //       (d) が緑のまま入ってしまう。ignore の形まで含めて固定する。
 //
 // Node を上げるときの手順 (この検査が要求する形):
-//   ピン留め 3 か所と `engines.node` / README / `@types/node` を**同じ PR で**
+//   ピン留め 2 か所と `engines.node` / README / `@types/node` を**同じ PR で**
 //   新しい major へ揃える。ignore は残したままでよい (major を上げる主導権を
 //   Dependabot ではなく「ランタイムを上げる判断」の側に置くのが目的)。
 
@@ -45,16 +49,16 @@ import { readFileSync } from "node:fs";
 // 検査対象のパスを組み立てるため
 import { resolve } from "node:path";
 // ワークフローを構造として読むため (正規表現で近似すると、解説コメント中の
-// `NODE_VERSION:` を設定値と取り違える)
+// `node-version-file:` を設定値と取り違える)
 import { parse as parseYaml } from "yaml";
-// `engines.node` は下限つきの**範囲**なので、等値ではなく範囲の重なりで判定する
-// (§9 自前実装しない。`>=22.12.0` のような下限を「22 系は不可」と読み違えないため)
-import { intersects } from "semver";
+// `engines.node` は範囲で書かれるので、判定は専用ライブラリに任せる (§9 自前実装しない)
+import { satisfies } from "semver";
 // 設定ファイルの読み方・パス・Dependabot の語彙は ESLint 保留のガードと共有する (§6 DRY)
 import {
   ALLOWED_IGNORE_KEYS,
   asRecord,
   collectIgnoreEntries,
+  countUnreadableElements,
   DEPENDABOT_PATH,
   MAJOR_UPDATE_TYPE,
   NPM_DIRECTORY,
@@ -143,21 +147,34 @@ function readNvmrcMajor(): number | null {
 }
 
 /**
- * CI ワークフローの `env.NODE_VERSION` を読み取る。
+ * CI の Node 準備ステップが「どう版を決めているか」を集める。
  *
- * 正規表現ではなく YAML パーサで読むのは、解説コメントや別の場所に書かれた
- * `NODE_VERSION:` を設定値と取り違えないため (ESLint 側のガードと同じ理由)。
+ * **版そのものではなく配線を見るのが要点。** ワークフローに版を書き写す形
+ * (`node-version: '26'` や `env.NODE_VERSION`) だと、その値が `.nvmrc` とずれても
+ * 「両方を突き合わせる」検査でしか気付けず、しかも `setup-node` の `with` を
+ * 書き換えれば宣言だけ残して実際には別の Node を入れられる (env を読むだけの検査は
+ * それを緑のまま通す。実測)。`node-version-file: '.nvmrc'` にしておけば、
+ * **CI が入れる Node はピンそのもの**になり、ずれが原理的に起きない。
+ *
+ * 返すのは各 `actions/setup-node` ステップの `with` で、判定は呼び出し側が行う。
  */
-function readCiNodeMajor(): number | null {
-  // ワークフローを読む (読めなければ null)
+function collectSetupNodeInputs(): Record<string, unknown>[] {
+  // ワークフローを読む (読めなければ空 = 呼び出し側の「1 つも無い」検査で落ちる)
   const text = readTextOrNull(CI_WORKFLOW_PATH);
-  if (text === null) return null;
-  // YAML として解釈し、トップレベルの env.NODE_VERSION を引く
-  const value = asRecord(asRecord(parseYaml(text)).env).NODE_VERSION;
-  // 文字列でも数値でも書けるので、いったん文字列にしてから major を取り出す
-  const matched = String(value ?? "").match(/^(\d+)/);
-  // 形が合わなければ読めなかった扱い
-  return matched ? Number(matched[1]) : null;
+  if (text === null) return [];
+  // YAML として解釈し、jobs 直下のジョブを 1 つずつ見る
+  const jobs = asRecord(asRecord(parseYaml(text)).jobs);
+  // 各ジョブの steps から `actions/setup-node` を使うものだけを集める
+  return Object.values(jobs).flatMap((job) => {
+    // steps は配列 (そうでなければこのジョブには準備ステップが無い扱い)
+    const steps = asRecord(job).steps;
+    if (!Array.isArray(steps)) return [];
+    // uses が actions/setup-node のステップに絞り、その with を返す
+    return steps
+      .map((step) => asRecord(step))
+      .filter((step) => String(step.uses ?? "").startsWith("actions/setup-node"))
+      .map((step) => asRecord(step.with));
+  });
 }
 
 /**
@@ -184,7 +201,7 @@ function readDockerfileNodeMajor(): number | null {
 }
 
 /**
- * README の「Node.js <major> 以上」に書かれた major を読み取る。
+ * README の「Node.js <major> 系」に書かれた major を読み取る。
  *
  * 人向けの必要環境で、ここだけ古い major が残ると読み手を誤らせる
  * (「20 でいい」と思って動かない環境を作らせる)。書式は 1 行だけなので素直に拾う。
@@ -193,23 +210,29 @@ function readReadmeNodeMajor(): number | null {
   // README を読む (読めなければ null)
   const text = readTextOrNull(README_PATH);
   if (text === null) return null;
-  // 「Node.js 26 以上」の形から major を取り出す
-  const matched = text.match(/Node\.js\s+(\d+)\s*以上/);
+  // 「Node.js 26 系」の形から major を取り出す。
+  // **「26 以上」と書かない** — 実際に検証しているのはピン留めした系列だけで、
+  // 「以上」は検査より緩い約束になる (読み手が 28 を入れると、`@types/node@^26` の
+  // 型で 28 のランタイムを型チェックするという、この規約が防ぎたい形が裏返しで起きる)
+  const matched = text.match(/Node\.js\s+(\d+)\s*系/);
   // 形が合わなければ読めなかった扱い
   return matched ? Number(matched[1]) : null;
 }
 
 /**
- * 「実際に動く Node の major」をピン留めしている 3 か所を読み取って並べる。
+ * 「実際に動く Node の major」をピン留めしている 2 か所を読み取って並べる。
  *
  * 1 か所だけを正としないのは、上げ忘れたときに**残りと食い違う**ことこそが
- * 検出したい状態だから。3 つすべてを返し、呼び出し側で「読めたか」「揃っているか」を見る。
+ * 検出したい状態だから。両方を返し、呼び出し側で「読めたか」「揃っているか」を見る。
+ *
+ * **CI はここに含めない。** 版を書き写す形をやめて `.nvmrc` を参照する配線にしたので、
+ * CI が入れる Node はピンそのものになった (突き合わせる相手が存在しない)。
+ * 代わりに「その配線が保たれているか」を専用のテストで見る。
  */
 function collectPinnedSources(): PinnedSource[] {
-  // 3 つの出どころをラベル付きで並べて返す
+  // 2 つの出どころをラベル付きで並べて返す
   return [
     { label: ".nvmrc", major: readNvmrcMajor() },
-    { label: ".github/workflows/ci.yml (NODE_VERSION)", major: readCiNodeMajor() },
     { label: "Dockerfile (FROM node:<major>)", major: readDockerfileNodeMajor() },
   ];
 }
@@ -231,10 +254,25 @@ function directDependencyNames(json: unknown): string[] {
 }
 
 /**
+ * 直接依存のうち、ロックファイルで解決済みメタデータを引けなかったものを返す。
+ *
+ * **「読めた分だけ検査する」にしない。** 引けなかった依存は engines を宣言していても
+ * 黙って対象から外れるので、「違反ゼロ＝緑」と見分けが付かない。全体が読めないときだけ
+ * 落とす形にすると、15 件中 14 件が消えても緑のままになる (この検査の存在意義が薄れる)。
+ */
+function unresolvedDependencies(lock: unknown, names: readonly string[]): string[] {
+  // ロックファイルの packages 枝を共有ヘルパーで取り出す
+  const table = readLockPackages(lock);
+  // 巻き上げ位置にメタデータが無い名前を集める
+  return names.filter((name) => Object.keys(asRecord(table[`node_modules/${name}`])).length === 0);
+}
+
+/**
  * 直接依存のうち、`engines.node` を宣言しているものの範囲を集める。
  *
  * 宣言が無い依存は「どの Node でもよい」とみなして対象外にする
  * (npm 自体がそう扱うので、こちらで勝手に縛ると実在しない食い違いを報告する)。
+ * 解決できなかった依存は unresolvedDependencies が別途落とすので、ここでは黙って外す。
  */
 function collectDependencyEngines(lock: unknown, names: readonly string[]): DependencyEngine[] {
   // ロックファイルの packages 枝を共有ヘルパーで取り出す
@@ -250,21 +288,36 @@ function collectDependencyEngines(lock: unknown, names: readonly string[]): Depe
   });
 }
 
+// 「その major 系列の最新版」を表す代役のバージョン。
+// setup-node と `.nvmrc` は major だけを指定するので、実際に入るのはその系列の**最新**。
+// 具体的な最新版はネットワークを見ないと分からないため、系列の上限に十分近い値で代用する
+// (この 1 か所を読み替えれば判定の意味が変わるので、裸の数値を散らさない)
+const LATEST_OF_MAJOR_PLACEHOLDER = { minor: 9999, patch: 9999 };
+
 /**
- * 範囲が「その major 系列のどれかの版」を許しているかを判定する。
+ * 範囲が「その major 系列で実際に入る版」を許しているかを判定する。
  *
- * 代表値 1 点 (`26.0.0` など) で試すと、`^22.12.0` のように下限へ minor/patch を
- * 持つ宣言を「22 系は不可」と誤判定する。CI の `node-version: '26'` は
- * setup-node がその系列の**最新**を入れるので、問われているのは
- * 「その系列のどれかが許されるか」＝範囲の重なりのほう。
+ * **`intersects(range, "26.x")` では緩すぎる。** 実測すると
+ * `intersects("<26.1.0", "26.x")` も `intersects("^26.0.0 <26.2.0", "26.x")` も true で、
+ * 「系列の一部しか許していない範囲」を通してしまう。CI に入るのはその系列の**最新**
+ * なので、上限で切られた範囲は実際には満たされない。
+ *
+ * そこで「系列の十分新しい版」を 1 点作って `satisfies` で判定する。
+ * `^22.12.0` のように下限へ minor/patch を持つ宣言を「22 系は不可」と誤判定する
+ * (代表値を `22.0.0` にしたときの問題) こともない。
+ *
+ * **残る限界**: `>=26.9.0` のように「まだ出ていない版から」を要求する宣言は、
+ * 現に入る最新版が 26.4.x でもここでは通る (最新版が何かはネットワークを見ないと
+ * 分からないため)。実行時に `npm ci` が EBADENGINE で警告するので、そこで気付く。
  *
  * 範囲として解釈できない値は false を返し、呼び出し側で違反として報告させる
  * (読めない範囲を「たぶん大丈夫」と扱うと、検出網が静かに緩む)。
  */
 function allowsMajor(range: string, major: number): boolean {
   try {
-    // その major 系列 (`26.x`) と範囲が重なるかを見る
-    return intersects(range, `${major}.x`);
+    // その系列の十分新しい版を satisfies に掛ける
+    const latestOfMajor = `${major}.${LATEST_OF_MAJOR_PLACEHOLDER.minor}.${LATEST_OF_MAJOR_PLACEHOLDER.patch}`;
+    return satisfies(latestOfMajor, range);
   } catch {
     // semver が解釈できない書き方は「許していない」側に倒す (fail-closed)
     return false;
@@ -304,7 +357,28 @@ describe("実行する Node の major を宣言しているすべての場所の
     expect(unreadable, `設定ファイルを読めない: ${unreadable.join(" / ")}`).toEqual([]);
   });
 
-  it("実行する Node の major がピン留め 3 か所すべてから読み取れ、値も揃っている", () => {
+  it("CI が Node の版を書き写さず、.nvmrc を参照して用意している", () => {
+    // ワークフローの Node 準備ステップを集める
+    const setupInputs = collectSetupNodeInputs();
+    // 1 つも無ければ、CI が Node を用意していない (= 検証していない) ので落とす
+    expect(
+      setupInputs.length,
+      "ci.yml に actions/setup-node のステップが見つからない。CI が Node を用意していないか、読み取り側が書式の変更に追随できていない。",
+    ).toBeGreaterThan(0);
+    // すべてのステップが `.nvmrc` を参照していることを確かめる。
+    // **`node-version` を書いた形は、値が合っていても許さない** — 合っているかどうかは
+    // その瞬間の話で、片方だけ書き換えれば静かにずれる (版を書き写せる構造そのものを断つ)
+    const misconfigured = setupInputs
+      .filter((input) => input["node-version-file"] !== ".nvmrc" || "node-version" in input)
+      .map((input) => JSON.stringify(input));
+    expect(
+      misconfigured,
+      `actions/setup-node には node-version-file: '.nvmrc' だけを渡すこと。実際の指定: ${misconfigured.join(" / ")}。` +
+        "版を直書きすると .nvmrc とずれても CI は緑のまま通り、出荷する Node を検証していない状態に戻る。",
+    ).toEqual([]);
+  });
+
+  it("実行する Node の major がピン留め 2 か所すべてから読み取れ、値も揃っている", () => {
     // 1 つでも読めなければ前提崩れ (fail-closed)。どこが読めなかったかを名指しする
     const unreadable = pinnedSources
       .filter((source) => source.major === null)
@@ -312,14 +386,14 @@ describe("実行する Node の major を宣言しているすべての場所の
     expect(
       unreadable,
       `実行する Node の major を読み取れない出どころがある: ${unreadable.join(", ")}。` +
-        "このテストは 3 か所の一致を前提にしているので、書式を変えた (多段ビルドで別 major を足した等) なら読み取りも合わせて直すこと。",
+        "このテストは 2 か所の一致を前提にしているので、書式を変えた (多段ビルドで別 major を足した等) なら読み取りも合わせて直すこと。",
     ).toEqual([]);
     // 読み取れた major が全て同じであることを確かめる
     expect(
       [...new Set(pinnedSources.map((source) => source.major))],
       `実行する Node の major が食い違っている: ${pinnedSources
         .map((source) => `${source.label}=${source.major}`)
-        .join(", ")}。Node を上げるときは 3 か所すべてを同じ major に揃えること。`,
+        .join(", ")}。Node を上げるときは 2 か所すべてを同じ major に揃えること。`,
     ).toHaveLength(1);
   });
 
@@ -327,7 +401,7 @@ describe("実行する Node の major を宣言しているすべての場所の
     // 基準が決まっていなければ、その事実を明示して落とす
     expect(
       runtimeMajor,
-      "ピン留め 3 か所が揃っていないため、engines の判定基準が決まらない",
+      "ピン留め 2 か所が揃っていないため、engines の判定基準が決まらない",
     ).not.toBeNull();
     // engines.node は下限つきの範囲なので、パース済みの package.json から素直に引く
     const enginesNode = asRecord(asRecord(packageJsonRead.value).engines).node;
@@ -399,14 +473,21 @@ describe("実行する Node の major を宣言しているすべての場所の
     // 基準が決まっていなければ、その事実を明示して落とす
     expect(
       runtimeMajor,
-      "ピン留め 3 か所が揃っていないため、依存の engines を照合する基準が決まらない",
+      "ピン留め 2 か所が揃っていないため、依存の engines を照合する基準が決まらない",
     ).not.toBeNull();
-    // 直接依存の名前を package.json から取り出し、ロックファイルで engines を引く
-    const engines = collectDependencyEngines(
-      packageLockRead.value,
-      directDependencyNames(packageJsonRead.value),
-    );
-    // 1 つも読めない場合は「違反ゼロ＝緑」になってしまうので、前提崩れとして落とす。
+    // 直接依存の名前を package.json から取り出す
+    const names = directDependencyNames(packageJsonRead.value);
+    // **まず「全部引けたか」を見る。** 引けなかった依存は engines を宣言していても
+    // 黙って対象から外れ、「違反ゼロ＝緑」と見分けが付かなくなる
+    const unresolved = unresolvedDependencies(packageLockRead.value, names);
+    expect(
+      unresolved,
+      `ロックファイルで解決済みメタデータを引けない直接依存がある: ${unresolved.join(", ")}。` +
+        "引けない依存は engines の照合から黙って外れるので、検査した気になったまま穴が空く (ロックファイルの形が変わったなら読み取りも直すこと)。",
+    ).toEqual([]);
+    // ロックファイルから engines.node を引く
+    const engines = collectDependencyEngines(packageLockRead.value, names);
+    // 1 つも読めない場合も「違反ゼロ＝緑」になってしまうので、前提崩れとして落とす。
     // (このリポジトリには engines を宣言する直接依存が現に複数ある)
     expect(
       engines.length,
@@ -423,6 +504,27 @@ describe("実行する Node の major を宣言しているすべての場所の
         "npm は engines を既定で強制しないので、この状態でもインストールもテストも通ってしまう (緑は「動く」ことの証明にならない)。" +
         "ランタイムを上げるか、その依存の版を見直すこと。",
     ).toEqual([]);
+  });
+
+  it("dependabot.yml の読む場所に、読み飛ばされる要素が無い", () => {
+    // 読み手 (collectIgnoreEntries) が黙って捨てる要素の数を数える。
+    // **この検査をこのファイルにも置くのは、同じ数え手を持つ
+    // tests/dependabot-eslint-guard.test.ts が「上流が ESLint 10 に対応したら
+    // ファイルごと削除する」運用だから** — 消えた瞬間に npm ブロックの読み飛ばし検査が
+    // 道連れになり、`@types/node` のエントリの隣に空要素 `-` が増えても
+    // 件数が変わらないまま全検査が緑になる (実際にそうなる形を eslint 側のコメントが
+    // fail-closed として扱っている)
+    const unreadableElementCount = countUnreadableElements(
+      (dependabotRead.value ?? {}) as DependabotConfig,
+      NPM_ECOSYSTEM,
+      NPM_DIRECTORY,
+    );
+    // 1 つでもあれば、意図して書いた形ではないので落とす (fail-closed)
+    expect(
+      unreadableElementCount,
+      "dependabot.yml に、この検査が黙って読み飛ばす形の要素がある (空のリスト要素 `-`、リストでない ignore / directories、文字列でない dependency-name など)。" +
+        "件数が変わらないまま設定だけが壊れるので、書いた形のまま読めるように直すこと。",
+    ).toBe(0);
   });
 
   it("@types/node の major 更新を止める ignore が、npm の対象ディレクトリに 1 件だけある", () => {

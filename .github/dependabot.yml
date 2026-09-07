@@ -82,10 +82,12 @@ updates:
       #   「ランタイムを上げる判断」の側に置く。
       #
       # 外し方: これは「永久に major を上げない」という意味ではない。
-      #   動かす Node を次の major へ上げるときは、ピン留め 4 か所
-      #   (`.nvmrc` / このリポジトリの CI の `NODE_VERSION` / `Dockerfile` の
-      #   `FROM node:<major>` / `package.json` の `engines.node`) をまとめて上げ、
+      #   動かす Node を次の major へ上げるときは、**CLAUDE.md §3「実際に動かす Node の
+      #   major は 5 か所で揃える」に挙げた場所すべて**をまとめて上げ、
       #   **同じ PR で `@types/node` も新しい major へ上げる**。ignore は残したままでよい。
+      #   （場所の一覧をここへ書き写さないのは、写しの片方が古くなる形そのものを
+      #     この保留が防ごうとしているため。一覧は CLAUDE.md と
+      #     tests/node-runtime-alignment.test.ts が持つ）
       #
       # 効き方: `version-update:semver-major` だけを対象にするので、26 系の
       #   minor / patch 更新は従来どおり npm-minor-and-patch グループで届く。
@@ -103,6 +105,25 @@ updates:
     commit-message:
       # コミット規約 type(scope) に合わせる
       prefix: "chore(docker)"
+    ignore:
+      # node ベースイメージの major 更新を保留する（@types/node と同じ理由）。
+      #
+      # なぜ止めるのか: docker エコシステムが触るのは `Dockerfile` の
+      #   `FROM node:<major>` だけで、`.nvmrc` も `package.json` の `engines.node` も
+      #   README も動かない。つまりベースイメージだけの major 更新は「Node 26 で
+      #   検証した成果物を、別 major の Node で動かす」差分になる。
+      #   **バージョンの主導権は「ランタイムを上げる判断」の側に置く**
+      #   （この保留が無いと、毎週立つ PR が
+      #     tests/node-runtime-alignment.test.ts を赤にし続け、
+      #     「赤いのが常態」になった検査はいずれ緩められる）。
+      #
+      # 効き方: major だけを止めるので、`node:26-alpine` のセキュリティ修正を含む
+      #   イメージ更新（同じタグの再ビルド）や minor / patch の追従は従来どおり届く。
+      #
+      # 外し方: CLAUDE.md §3 の手順で Node を上げる PR の中で、この Dockerfile も
+      #   一緒に上げる（ignore は残したままでよい）。
+      - dependency-name: "node"
+        update-types: ["version-update:semver-major"]
 
   # .github/workflows/ で使う GitHub Actions
   - package-ecosystem: "github-actions"

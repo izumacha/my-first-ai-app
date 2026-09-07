@@ -61,19 +61,16 @@ import { satisfies } from "semver";
 // 片方だけが古い読み方のまま残り、そちらの検出網が静かに緩む
 import {
   ALLOWED_IGNORE_KEYS,
-  asArray,
   asRecord,
   collectIgnoreEntries,
+  countUnreadableElements,
   DEPENDABOT_PATH,
   describeReadError,
   displayPath,
-  ecosystemBlocksOf,
   findLockEntry,
-  guardedBlocksOf,
   MAJOR_UPDATE_TYPE,
   NPM_DIRECTORY,
   NPM_ECOSYSTEM,
-  objectElementsOf,
   PACKAGE_JSON_PATH,
   PACKAGE_LOCK_PATH,
   parseAllowedMajor,
@@ -157,170 +154,6 @@ const REQUIRED_UPSTREAM_PLUGINS = [
 // 「一覧から外す」= 検出網に穴を開けることしか無くなる。
 // 現在は該当なし — eslint.config.mjs は eslint-config-next の 2 つの入口だけを読む
 const LOCALLY_ADDED_LINT_PLUGINS: string[] = [];
-
-/**
- * 「書かなくてよいが、書くならリストであるべきキー」がリストでないなら 1 を返す。
- *
- * 呼び出し元は countUnreadableElements の `ignore` と `directories` の 2 か所。
- * どちらも省略できるので「無い」は壊れではないが、`ignore: {}` や
- * `directories: "/"` のようにリスト以外へ書き換えると asArray が空配列へ均すため、
- * **要素を数える方式では 0 のまま素通りする**。この 1 を足すことで
- * 「書いたのに読まれていない」を捉える。
- *
- * `updates` がここを通らないのは、省略できないので「無い」も壊れであり、
- * countUnreadableElements 側で `Array.isArray(...)` 1 つに畳んであるため
- * (キーの有無で場合分けする必要がない)。
- *
- * なお `directories` については、これとは別に「使える値が 1 つでもあるか」も見る
- * (`directories: []` はリストなのでここでは 0 だが、値が無いので担当から外れる)。
- */
-function countNonListKey(container: Record<string, unknown>, key: string): number {
-  // キーが無いのは「書いていない」だけなので壊れではない
-  if (!(key in container)) return 0;
-  // キーがあるのに配列でなければ、asArray が空へ均して読み飛ばす形なので 1 つ数える
-  return Array.isArray(container[key]) ? 0 : 1;
-}
-
-/**
- * 設定の中に「読めない形のリスト要素」がいくつあるかを数える。
- *
- * 読み飛ばしを握り潰さないための検査。**数える範囲は「この検査が実際に読む場所」に
- * 揃える** — 読まない場所の壊れを数えても、この保留の正しさとは関係が無いのに
- * eslint の保留を守る検査が無関係なエコシステムの設定まで咎めることになる。
- * 該当するのは次の 7 通りで、どれも読み手が黙って要素・値を捨てる。
- *
- * **範囲は「読み手が読みうる場所」を覆う向きに合わせる (厳密な一致ではなく過剰側)。**
- * 読み手には短絡があるため、ある実行で実際に触れる要素だけを厳密に写すことはできない
- * — 例えば coversDirectory は単数形の `directory` が一致した時点で true を返し、
- * `directories` を読まずに終わる。それでも `directories` は数える: 過剰に数えると
- * 「壊れていないのに落ちる」だけ (fail-closed) だが、取りこぼすと「壊れているのに緑」
- * になり、この検査の存在理由そのものが失われるため。
- * 一方で**エコシステムが違うブロックのように、どう転んでも読まない場所は数えない** —
- * eslint の保留を守る検査が無関係な設定を咎めても直し方の案内にならないので、
- * そこは絞る:
- *
- *   0. `updates` そのもの … 無い / 配列でない場合。asArray が空へ均すので
- *      「ブロックが 1 つも無い設定」として黙って読み進んでしまう。
- *   1. `updates` 直下 … objectElementsOf がオブジェクト以外を捨てる。
- *      全ブロックが担当判定の対象なので、全要素が読む対象。
- *   1'. 全ブロックの `package-ecosystem` … 文字列でない場合。ecosystemBlocksOf は
- *      `=== ecosystem` で比べるだけなので、値が消えるとそのブロックが静かに脱落する。
- *      この値は全ブロックについて読むので、エコシステムで絞らず全ブロックを見る。
- *   2. **エコシステムが一致するブロックの** `directories` 直下 …
- *      coversDirectory が文字列以外を捨てる。guardedBlocksOf の絞り込みは
- *      ecosystemBlocksOf の戻り値にだけ coversDirectory を掛けるため
- *      **coversDirectory が呼ばれるのはエコシステムが一致したブロックだけ**。
- *      全ブロックを数えると、読みもしない docker ブロックの空要素を
- *      eslint の保留を守る検査が咎めることになる。
- *      **判定は単数形・複数形をまとめて「空でない文字列を 1 つでも持つか」で行う。**
- *      `directory:` と値を消す・`directory: ""`・`directories: []` はどれも
- *      「どこも指していない」ブロックになり、coversDirectory が黙って不一致にする。
- *      すると担当ブロックが 0 件になり、(3)(4) が何も数えられなくなるうえ
- *      **保留の期限判定ごと skip され、検出網が静かに止まる**（このとき唯一赤くなる
- *      ignore 件数の検査は「別のブロックへ移された」と案内するので、原因からも遠ざかる）。
- *      逆に**どこかを指してさえいれば単数形の形は問わない** — `directory:` を消しても
- *      `directories: ["/"]` があれば読めるので、それは壊れではない。
- *   2'. **指す先はあるが `directories` だけがリストでない形** (`directories: "/"`)。
- *      `directory` が担当ディレクトリと違えば (`directory: "/app"`) そのブロックの
- *      ignore は丸ごと読まれず、`dependency-name: "*"` が潜んでいても緑で通る。
- *      2 と排他にして、同じキーの壊れを二重に数えないようにしている。
- *   3. **担当ブロックの** `ignore` 直下 … objectElementsOf がオブジェクト以外を捨てる。
- *      ignore を読むのは担当ブロック (エコシステム＋ディレクトリが一致) だけなので、
- *      ここは担当分に絞る。
- *   4. **担当ブロックの** `ignore` のうち `dependency-name` が文字列でないもの …
- *      ignoreNameMatches が文字列以外を「当たらない」として捨てる。
- *      `dependency-name: ["eslint"]` のように書き崩れたエントリが、
- *      正しいエントリの隣にあると件数が変わらず素通りする。
- *
- * 各読み手の受け入れ条件をこちら側から組み立て直す形なので、**読み手を増やしたら
- * ここにも足す**必要がある (読み手自身に「何を捨てたか」を報告させる設計なら
- * 足し忘れは起きないが、既存の 4 つの読み手すべての戻り値を変える改修になるため、
- * ここでは列挙を保ち、対応関係を上のとおり明記しておく)。
- *
- * これを検査しないと、空要素 `-` が正しいエントリの隣に増えたときに件数が変わらず、
- * 壊れた設定のまま緑になる。**Dependabot がこの形の設定をどう扱うかは
- * docs.github.com へ到達できず裏取りできていない**ので、「無害だから通してよい」とは
- * 判断せず、意図して書いた形でない時点で落とす (fail-closed)。
- */
-function countUnreadableElements(
-  config: DependabotConfig,
-  ecosystem: string,
-  directory: string,
-): number {
-  // (0) リストであるべきキーがリストでない形も数える。
-  //     `updates: {...}` や `directories: "/"` のように**キーごと別の形へ**書き換えると、
-  //     asArray が空配列に均すので「要素の数え上げ」では 0 のまま素通りしてしまう。
-  //     結果は directory を消したときと同じで、担当ブロックが 0 件になって
-  //     期限判定ごと skip され、検出網が静かに止まる
-  // `updates` は「無い」も「リストでない」も同じ結末 (空として読み飛ばす) なので、
-  // キーの有無で場合分けせず「配列であること」だけを求める
-  let unreadable = Array.isArray(config.updates) ? 0 : 1;
-  // (1) updates 直下: 元の要素数から、オブジェクトとして読めた数を引く
-  const blocks = objectElementsOf(config.updates);
-  unreadable += asArray(config.updates).length - blocks.length;
-  // (1') package-ecosystem が文字列でないブロックを数える。ecosystemBlocksOf は
-  //      値を `=== ecosystem` で比べるだけなので、値を消すと**全ブロックが静かに脱落**し、
-  //      担当ブロックが 0 件 → 期限判定ごと skip という同じ結末になる。
-  //      この値は全ブロックについて読むので、絞らず全ブロックを見る
-  unreadable += blocks.filter(
-    (block) => typeof block["package-ecosystem"] !== "string",
-  ).length;
-  // (2) directory / directories: coversDirectory が呼ばれるのはエコシステムが一致した
-  //     ブロックだけ (guardedBlocksOf が ecosystemBlocksOf の戻り値にだけ
-  //     coversDirectory を掛けるため)。読む範囲に合わせて同じ絞り込みを使う。
-  //     **同じ blocks 配列を渡す**ので、読み手と数え手が同じ要素集合を見ることが
-  //     引数の受け渡しで保証される (走査し直すと同一性を目視で確かめる羽目になる)
-  const ecosystemBlocks = ecosystemBlocksOf(blocks, ecosystem);
-  for (const block of ecosystemBlocks) {
-    // **「キーがあるか」ではなく「使える値が 1 つでもあるか」で見る。**
-    // キーの有無や形だけを個別に数えると、`directories: []`(空リスト) や
-    // `directory: ""` のように**キーはあるが値が無い**形を取りこぼす。どれも
-    // coversDirectory が黙って不一致にするので、担当ブロックが 0 件になり
-    // **期限判定ごと skip されて検出網が静かに止まる**という同じ結末になる
-    // (しかも唯一赤くなる ignore 件数の検査は「別のブロックへ移された」と案内し、
-    //  原因から遠ざかる)。単数形・複数形をまとめて 1 つの条件で見る
-    const declaredDirectories = [block["directory"], ...asArray(block["directories"])];
-    // 空でない文字列が 1 つでもあれば、このブロックはどこかを指している
-    const pointsSomewhere = declaredDirectories.some(
-      (value) => typeof value === "string" && value !== "",
-    );
-    if (!pointsSomewhere) {
-      // どこも指していない = 壊れているので 1 つ数える
-      unreadable += 1;
-    } else {
-      // 指す先はあるが、`directories` だけがリストでない形 (`directories: "/"` 等) の場合。
-      // **「使える directory があるなら害は無い」は成り立たない** — `directory` が
-      // 空でない文字列でも、それが担当ディレクトリと違えば (`directory: "/app"`)
-      // coversDirectory は false になり、そのブロックの ignore は**丸ごと読まれない**。
-      // そこに `dependency-name: "*"` (update-types 無し = 全バージョン無視) が
-      // 書かれていても全検査が緑のまま通ってしまう。
-      // 上の分岐と else で分けるのは、`directories: "/"` や `directories: [-]` 単独の
-      // ときに「どこも指していない」と重ねて数え、件数が実際の 2 倍になるのを避けるため
-      unreadable += countNonListKey(block, "directories");
-      // 指す先はあるが、リストに紛れた文字列以外の要素も読み手が黙って捨てるので数える
-      // (`directories: ["/", null]` のような形。これも else 側に置いて二重計上を避ける)
-      unreadable += asArray(block["directories"]).filter(
-        (value) => typeof value !== "string",
-      ).length;
-    }
-  }
-  // (3)(4) ignore 直下: 実際に読むのは担当ブロックだけなので、同じ絞り込みを通してから数える
-  for (const block of guardedBlocksOf(ecosystemBlocks, directory)) {
-    // ignore もキーごとリストでない形を先に数える
-    unreadable += countNonListKey(block, "ignore");
-    // ignore のうちオブジェクトとして読めたエントリ
-    const entries = objectElementsOf(block["ignore"]);
-    // (3) オブジェクトですらない要素 (空要素 `-` など) は元の要素数との差で数える
-    unreadable += asArray(block["ignore"]).length - entries.length;
-    // (4) オブジェクトではあるが dependency-name が文字列でないものも読み飛ばされる
-    //     (ignoreNameMatches が文字列以外を「当たらない」として捨てるため)
-    unreadable += entries.filter(
-      (entry) => typeof entry["dependency-name"] !== "string",
-    ).length;
-  }
-  // 合計を返す (0 なら「読む場所」に読めない要素は無い)
-  return unreadable;
-}
 
 // 上流パッケージ 1 つ分の「eslint に対する peer 範囲」
 interface UpstreamPeer {

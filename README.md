@@ -52,7 +52,7 @@
 
 ### 前提条件
 
-- Node.js 26 以上（`.nvmrc` / `Dockerfile` / CI と同じ major。`package.json` の `engines.node` が正本）
+- Node.js 26 系（正本は `.nvmrc`。CI もこのファイルを読み、`Dockerfile` / `package.json` の `engines.node` も同じ major に揃えている）
 - npm
 - Anthropic API キー（[console.anthropic.com](https://console.anthropic.com/) で取得）
 
