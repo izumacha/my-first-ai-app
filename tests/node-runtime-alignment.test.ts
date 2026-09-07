@@ -44,8 +44,9 @@
 
 // Vitest の DSL
 import { describe, expect, it } from "vitest";
-// ピン留めを書いた素のテキスト (.nvmrc / Dockerfile / README) を読むため
-import { readFileSync } from "node:fs";
+// ピン留めを書いた素のテキスト (.nvmrc / Dockerfile / README) と、
+// ワークフローの一覧 (ファイル名を書き並べず、ディレクトリから列挙する) を読むため
+import { readdirSync, readFileSync } from "node:fs";
 // 検査対象のパスを組み立てるため
 import { resolve } from "node:path";
 // ワークフローを構造として読むため (正規表現で近似すると、解説コメント中の
@@ -76,13 +77,25 @@ import {
 
 // ピン留めの出どころ (package.json の engines は「下限」なので別扱い。冒頭コメント参照)
 const NVMRC_PATH = resolve(REPO_ROOT, ".nvmrc");
-const CI_WORKFLOW_PATH = resolve(REPO_ROOT, ".github/workflows/ci.yml");
+// ワークフローは**ファイル名を書き並べず、置き場ごと**見る。
+// 特定の 1 本 (ci.yml) だけを対象にすると、Node を用意する別のワークフローを足した瞬間に
+// その 1 本だけが黙って検査から外れる (痕跡はテスト件数すら変わらない)
+const WORKFLOWS_DIR = resolve(REPO_ROOT, ".github/workflows");
 const DOCKERFILE_PATH = resolve(REPO_ROOT, "Dockerfile");
 // 必要環境を人向けに書いている場所 (コードと同じ major を指していないと読み手を誤らせる)
 const README_PATH = resolve(REPO_ROOT, "README.md");
 
 // major 保留の対象パッケージ名 (dependabot.yml の dependency-name と完全一致させる)
 const GUARDED_DEPENDENCY = "@types/node";
+// Dockerfile のベースイメージ側も同じ理由で major を保留している。
+// **こちらにも保留のガードを置く。** 片方だけ見ていると、docker の ignore を消しても
+// この検査はすべて緑のまま通り、気付けるのは「Dockerfile だけを別 major へ上げる PR が
+// 毎週立って赤くなる」ときになる (赤いのが常態になった検査はいずれ緩められる)
+const DOCKER_ECOSYSTEM = "docker";
+// Dockerfile の置き場 (dependabot.yml の directory と一致させる)
+const DOCKER_DIRECTORY = "/";
+// 保留の対象イメージ名 (dependabot.yml の dependency-name と完全一致させる)
+const GUARDED_BASE_IMAGE = "node";
 
 /** 「実際に動く Node の major」をピン留めしている出どころ 1 つ分。 */
 interface PinnedSource {
@@ -147,6 +160,31 @@ function readNvmrcMajor(): number | null {
 }
 
 /**
+ * `.github/workflows/` に置かれたワークフローのファイル名を並べる。
+ *
+ * ディレクトリを読むのは、**対象を名前で書き並べると増えた分が黙って外れる**から
+ * (`ci.yml` だけを見る形だと、Node を用意する 2 本目を足しても検査は緑のまま通り、
+ *  痕跡はテスト件数にも出ない)。読めなければ空を返し、呼び出し側で落とす。
+ */
+function listWorkflowFiles(): string[] {
+  try {
+    // 拡張子が .yml / .yaml のものだけを対象にする (README などを YAML として解釈しない)
+    return readdirSync(WORKFLOWS_DIR).filter((name) => /\.ya?ml$/i.test(name));
+  } catch {
+    // ディレクトリごと読めない場合は空 = 呼び出し側の「1 つも無い」検査で落ちる
+    return [];
+  }
+}
+
+/** ワークフロー 1 本の中の `actions/setup-node` ステップ 1 つ分。 */
+interface SetupNodeStep {
+  // 失敗メッセージに出す、どのワークフローのステップかを示す名前
+  file: string;
+  // そのステップの `with`（判定の対象）
+  inputs: Record<string, unknown>;
+}
+
+/**
  * CI の Node 準備ステップが「どう版を決めているか」を集める。
  *
  * **版そのものではなく配線を見るのが要点。** ワークフローに版を書き写す形
@@ -158,22 +196,25 @@ function readNvmrcMajor(): number | null {
  *
  * 返すのは各 `actions/setup-node` ステップの `with` で、判定は呼び出し側が行う。
  */
-function collectSetupNodeInputs(): Record<string, unknown>[] {
-  // ワークフローを読む (読めなければ空 = 呼び出し側の「1 つも無い」検査で落ちる)
-  const text = readTextOrNull(CI_WORKFLOW_PATH);
-  if (text === null) return [];
-  // YAML として解釈し、jobs 直下のジョブを 1 つずつ見る
-  const jobs = asRecord(asRecord(parseYaml(text)).jobs);
-  // 各ジョブの steps から `actions/setup-node` を使うものだけを集める
-  return Object.values(jobs).flatMap((job) => {
-    // steps は配列 (そうでなければこのジョブには準備ステップが無い扱い)
-    const steps = asRecord(job).steps;
-    if (!Array.isArray(steps)) return [];
-    // uses が actions/setup-node のステップに絞り、その with を返す
-    return steps
-      .map((step) => asRecord(step))
-      .filter((step) => String(step.uses ?? "").startsWith("actions/setup-node"))
-      .map((step) => asRecord(step.with));
+function collectSetupNodeSteps(): SetupNodeStep[] {
+  // 置き場にあるワークフローを 1 本ずつ見る
+  return listWorkflowFiles().flatMap((file) => {
+    // ワークフローを読む (読めなければこの 1 本には準備ステップが無い扱い)
+    const text = readTextOrNull(resolve(WORKFLOWS_DIR, file));
+    if (text === null) return [];
+    // YAML として解釈し、jobs 直下のジョブを 1 つずつ見る
+    const jobs = asRecord(asRecord(parseYaml(text)).jobs);
+    // 各ジョブの steps から `actions/setup-node` を使うものだけを集める
+    return Object.values(jobs).flatMap((job) => {
+      // steps は配列 (そうでなければこのジョブには準備ステップが無い扱い)
+      const steps = asRecord(job).steps;
+      if (!Array.isArray(steps)) return [];
+      // uses が actions/setup-node のステップに絞り、その with をファイル名付きで返す
+      return steps
+        .map((step) => asRecord(step))
+        .filter((step) => String(step.uses ?? "").startsWith("actions/setup-node"))
+        .map((step) => ({ file, inputs: asRecord(step.with) }));
+    });
   });
 }
 
@@ -342,6 +383,13 @@ const ignoreEntries = collectIgnoreEntries(
   NPM_DIRECTORY,
   GUARDED_DEPENDENCY,
 );
+// Dockerfile のベースイメージ側の ignore エントリ (同上)
+const baseImageIgnoreEntries = collectIgnoreEntries(
+  (dependabotRead.value ?? {}) as DependabotConfig,
+  DOCKER_ECOSYSTEM,
+  DOCKER_DIRECTORY,
+  GUARDED_BASE_IMAGE,
+);
 
 describe("実行する Node の major を宣言しているすべての場所の整合", () => {
   it("検査に使う設定ファイルが読めて、構造として解釈できる", () => {
@@ -358,19 +406,21 @@ describe("実行する Node の major を宣言しているすべての場所の
   });
 
   it("CI が Node の版を書き写さず、.nvmrc を参照して用意している", () => {
-    // ワークフローの Node 準備ステップを集める
-    const setupInputs = collectSetupNodeInputs();
+    // 置き場のワークフローすべてから Node 準備ステップを集める
+    const setupSteps = collectSetupNodeSteps();
     // 1 つも無ければ、CI が Node を用意していない (= 検証していない) ので落とす
     expect(
-      setupInputs.length,
-      "ci.yml に actions/setup-node のステップが見つからない。CI が Node を用意していないか、読み取り側が書式の変更に追随できていない。",
+      setupSteps.length,
+      ".github/workflows/ に actions/setup-node のステップが見つからない。CI が Node を用意していないか、読み取り側が書式の変更に追随できていない。",
     ).toBeGreaterThan(0);
     // すべてのステップが `.nvmrc` を参照していることを確かめる。
     // **`node-version` を書いた形は、値が合っていても許さない** — 合っているかどうかは
     // その瞬間の話で、片方だけ書き換えれば静かにずれる (版を書き写せる構造そのものを断つ)
-    const misconfigured = setupInputs
-      .filter((input) => input["node-version-file"] !== ".nvmrc" || "node-version" in input)
-      .map((input) => JSON.stringify(input));
+    const misconfigured = setupSteps
+      .filter(
+        (step) => step.inputs["node-version-file"] !== ".nvmrc" || "node-version" in step.inputs,
+      )
+      .map((step) => `${step.file}: ${JSON.stringify(step.inputs)}`);
     expect(
       misconfigured,
       `actions/setup-node には node-version-file: '.nvmrc' だけを渡すこと。実際の指定: ${misconfigured.join(" / ")}。` +
@@ -410,8 +460,8 @@ describe("実行する Node の major を宣言しているすべての場所の
       typeof enginesNode,
       `package.json の engines.node を文字列で書くこと。実際の値: ${String(enginesNode)}`,
     ).toBe("string");
-    // 等値ではなく「その major 系列と範囲が重なるか」で見る (下限に minor/patch を
-    // 持つ宣言を「許していない」と誤判定しないため)
+    // 等値ではなく「その系列で実際に入る版を許しているか」で見る (下限に minor/patch を
+    // 持つ宣言を「許していない」と誤判定しないため。判定の中身は allowsMajor のコメント参照)
     expect(
       allowsMajor(String(enginesNode), runtimeMajor as number),
       `engines.node (${String(enginesNode)}) がピン留めした Node ${runtimeMajor} の実行を許していない。` +
@@ -420,17 +470,20 @@ describe("実行する Node の major を宣言しているすべての場所の
   });
 
   it("README の必要環境が、ピン留めした major と同じ Node を案内している", () => {
-    // README から「Node.js <major> 以上」を読み取る
+    // README から「Node.js <major> 系」を読み取る
     const readmeMajor = readReadmeNodeMajor();
-    // 書式ごと変わって読めない場合は、案内が消えたのと同じなので落とす
+    // 書式ごと変わって読めない場合は、案内が消えたのと同じなので落とす。
+    // **「Node.js 26 以上」と書き換えても落ちる**（読み取りが要求するのは「系」の形）。
+    // 検証しているのはピン留めした系列だけなので、「以上」は検査より緩い約束になる
+    // (readReadmeNodeMajor のコメント参照)
     expect(
       readmeMajor,
-      "README から「Node.js <major> 以上」を読み取れない。必要環境の案内を消さず、書式を変えたならこの読み取りも直すこと。",
+      "README から「Node.js <major> 系」を読み取れない。必要環境の案内を消さず、書式を変えたならこの読み取りも直すこと（「以上」ではなく「系」で書く）。",
     ).not.toBeNull();
     // ピンと同じ major を案内していることを確かめる
     expect(
       readmeMajor,
-      `README の必要環境 (Node.js ${readmeMajor} 以上) がピン留めした Node ${runtimeMajor} と違う。` +
+      `README の必要環境 (Node.js ${readmeMajor} 系) がピン留めした Node ${runtimeMajor} と違う。` +
         "古い major を案内したままにすると、読み手が動かない環境を用意してしまう。",
     ).toBe(runtimeMajor);
   });
@@ -514,11 +567,18 @@ describe("実行する Node の major を宣言しているすべての場所の
     // 道連れになり、`@types/node` のエントリの隣に空要素 `-` が増えても
     // 件数が変わらないまま全検査が緑になる (実際にそうなる形を eslint 側のコメントが
     // fail-closed として扱っている)
-    const unreadableElementCount = countUnreadableElements(
-      (dependabotRead.value ?? {}) as DependabotConfig,
-      NPM_ECOSYSTEM,
-      NPM_DIRECTORY,
-    );
+    // npm ブロックと docker ブロックの両方を数える (保留を置いているのはこの 2 つ)
+    const unreadableElementCount =
+      countUnreadableElements(
+        (dependabotRead.value ?? {}) as DependabotConfig,
+        NPM_ECOSYSTEM,
+        NPM_DIRECTORY,
+      ) +
+      countUnreadableElements(
+        (dependabotRead.value ?? {}) as DependabotConfig,
+        DOCKER_ECOSYSTEM,
+        DOCKER_DIRECTORY,
+      );
     // 1 つでもあれば、意図して書いた形ではないので落とす (fail-closed)
     expect(
       unreadableElementCount,
@@ -556,6 +616,40 @@ describe("実行する Node の major を宣言しているすべての場所の
     // update-types が「major だけ」であることを確かめる
     expect(
       ignoreEntries[0]?.["update-types"],
+      "update-types が major 限定でなくなっている。空にすると全バージョンが無視される。",
+    ).toEqual([MAJOR_UPDATE_TYPE]);
+  });
+
+  it("Dockerfile のベースイメージ node の major 更新を止める ignore が、docker の対象ディレクトリに 1 件だけある", () => {
+    // 1 件だけであることを確かめる (0 件 = 保留の消失 / 2 件以上 = 効きすぎ)。
+    // 消えると Dockerfile だけが別 major へ進む PR が立ち、「26 で検証した成果物を
+    // 別の Node で動かす」差分になる (ピンの食い違いとして毎週赤くなる)
+    expect(
+      baseImageIgnoreEntries,
+      `${GUARDED_BASE_IMAGE} の ignore は ${DOCKER_ECOSYSTEM} / ${DOCKER_DIRECTORY} のブロックに 1 件だけ置くこと。` +
+        "Dependabot は同じパッケージの複数エントリをすべて適用するため、2 件目が足されると効き方が変わる。",
+    ).toHaveLength(1);
+  });
+
+  it("その ignore が node だけを名指ししている (ワイルドカードで他のベースイメージを巻き込まない)", () => {
+    // `*` などに書き換えられると、将来足す別のベースイメージまで major 追従が止まる。
+    // しかも件数・update-types・キー集合は想定どおりのまま素通りするので、名前を完全一致で見る
+    expect(
+      baseImageIgnoreEntries[0]?.["dependency-name"],
+      `ignore の dependency-name は ${GUARDED_BASE_IMAGE} と完全一致で書くこと。`,
+    ).toBe(GUARDED_BASE_IMAGE);
+  });
+
+  it("その ignore が major 更新だけを止めている (同タグの再ビルド・minor/patch は届く)", () => {
+    // 想定外のキー (versions など) が増えていないことを確かめる。
+    // ここを塞いでおかないと、node:26 のセキュリティ修正を含む更新まで止まりうる
+    expect(
+      sortedKeysOf(baseImageIgnoreEntries[0] ?? {}),
+      "ignore エントリに想定外のキーがある。versions などを足すと現行系列の更新まで止まる。",
+    ).toEqual([...ALLOWED_IGNORE_KEYS].sort());
+    // update-types が「major だけ」であることを確かめる
+    expect(
+      baseImageIgnoreEntries[0]?.["update-types"],
       "update-types が major 限定でなくなっている。空にすると全バージョンが無視される。",
     ).toEqual([MAJOR_UPDATE_TYPE]);
   });
