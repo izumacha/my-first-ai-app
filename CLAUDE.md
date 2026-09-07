@@ -20,6 +20,9 @@ npm run build        # 本番ビルド
 npm run lint         # ESLint
 npm run typecheck    # tsc --noEmit
 npm run test         # Vitest
+npm run test:e2e     # Playwright（chromium のみ。webServer が next build → standalone 起動まで行う）
+                     # ブラウザをダウンロードできない環境では PLAYWRIGHT_CHROMIUM_PATH に
+                     # 既存 Chromium の実行ファイルを指定する（scripts/lib/chromium-launch-options.mjs）
 node scripts/capture-demo.mjs  # デモ GIF を再生成（上流 Claude API はスタブ。要 ffmpeg。docs/screenshots/chat-demo.gif を出力）
 node scripts/capture-screenshots.mjs  # 静止画スクショ 4 枚を再生成（上流 Claude API はスタブ。ffmpeg 不要。docs/screenshots/*.png を出力）
 ```
