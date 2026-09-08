@@ -407,6 +407,55 @@ type UpstreamStream = AsyncIterable<Anthropic.RawMessageStreamEvent> & {
   controller: { abort: () => void };
 };
 
+/** 沈黙が続いたことを知らせる見張り。`arm()` を呼ぶたびに計測が 0 からやり直される。 */
+interface IdleWatchdog {
+  /** 見張りを張り直す（イベントを受け取るたびに呼ぶ） */
+  arm: () => void;
+  /** 見張りを解除する（何度呼んでも安全） */
+  disarm: () => void;
+}
+
+/**
+ * 「一定時間なにも起きなかったら知らせる」だけの見張りを作る。
+ *
+ * タイマーの張り直し・解除という**仕組み**をここに閉じ込め、呼び出し側には
+ * 「沈黙が続いたら何をするか」という**方針**だけを残す（§6 単一責務）。
+ * 解除は何度呼んでも安全にしてあり、正常終了・例外・切断のどの経路からでも
+ * ためらわずに呼べる（§8 タイマーは使い終わったら必ず解除する）。
+ *
+ * @param timeoutMs - 沈黙をどれだけ許すか（ミリ秒）
+ * @param onIdle - その長さの沈黙が続いたときに 1 度だけ呼ばれる処理
+ * @returns 張り直し・解除の 2 操作を持つ見張り
+ */
+function createIdleWatchdog(
+  timeoutMs: number,
+  onIdle: () => void
+): IdleWatchdog {
+  // 待機中のタイマー（張っていなければ null）
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  // 解除の手順（張り直しの前と、後片付けの両方から使う）
+  const disarm = (): void => {
+    // 待機中のタイマーがあれば取り消す
+    if (timer !== null) {
+      clearTimeout(timer);
+    }
+    // 取り消し済みであることを記録する（二重解除・解除後の発火を防ぐ）
+    timer = null;
+  };
+  // 張り直し・解除の 2 操作を返す
+  return {
+    // 前の見張りを取り消してから新しく張る（タイマーが積み上がるのを防ぐ）
+    arm: () => {
+      // 古いタイマーを片付ける
+      disarm();
+      // 指定の長さだけ沈黙が続いたら通知する
+      timer = setTimeout(onIdle, timeoutMs);
+    },
+    // 解除はそのまま公開する
+    disarm,
+  };
+}
+
 /**
  * 上流の Claude ストリームを、ブラウザへ返す SSE 形式の ReadableStream に変換する。
  * POST ハンドラーから切り出して「SSE への変換」という単一の責務に閉じ込める（§6 単一責務）。
@@ -437,30 +486,16 @@ function createSseStream(
       // 「クライアントが離れた」「上流が最後まで流し切った」のどちらとも違うので、
       // 反復が終わったあとに見分けられるよう記録しておく
       let idleTimedOut = false;
-      // 待機中の見張りタイマー（張っていなければ null）
-      let idleTimer: ReturnType<typeof setTimeout> | null = null;
-      // 見張りを解除する（張っていなければ何もしない。何度呼んでも安全）
-      const disarmIdleWatchdog = (): void => {
-        // 待機中のタイマーがあれば取り消す
-        if (idleTimer !== null) {
-          clearTimeout(idleTimer);
-        }
-        // 取り消し済みであることを記録する（二重解除・解除後の発火を防ぐ）
-        idleTimer = null;
-      };
-      // 見張りを張り直す（イベントを受け取るたびに呼び、沈黙の長さを 0 から数え直す）
-      const armIdleWatchdog = (): void => {
-        // 前の見張りを取り消してから新しく張る（タイマーが積み上がるのを防ぐ）
-        disarmIdleWatchdog();
-        // 上限まで沈黙が続いたら上流の受信を打ち切る
-        idleTimer = setTimeout(() => {
-          // 自分たちの判断で打ち切ったことを記録する（正常終了と見分けるため）
-          idleTimedOut = true;
-          // 上流の受信を中断する（受信側の切断時と同じ経路を使う。
-          // SDK は中断で throw せず反復を終えるので、下の for-await は静かに抜ける）
-          stream.controller.abort();
-        }, UPSTREAM_IDLE_TIMEOUT_MS);
-      };
+      // 沈黙が上限に達したら上流の受信を打ち切る見張り。
+      // 何を待つか（タイマーの張り直し）は createIdleWatchdog が持ち、
+      // ここには「沈黙が続いたらどうするか」という方針だけを書く
+      const idleWatchdog = createIdleWatchdog(UPSTREAM_IDLE_TIMEOUT_MS, () => {
+        // 自分たちの判断で打ち切ったことを記録する（正常終了と見分けるため）
+        idleTimedOut = true;
+        // 上流の受信を中断する（受信側の切断時と同じ経路を使う。
+        // SDK は中断で throw せず反復を終えるので、下の for-await は静かに抜ける）
+        stream.controller.abort();
+      });
       // 上流の沈黙で打ち切ったときの後始末（記録と受信側への通知）。
       // ループが静かに終わった場合と例外で抜けた場合の両方から呼ぶので 1 か所にまとめる
       const failWithIdleTimeout = (): void => {
@@ -477,11 +512,11 @@ function createSseStream(
       };
       try {
         // 1 件目のイベントが届くまでの沈黙も見張る（ヘッダだけ返して黙る上流に備える）
-        armIdleWatchdog();
+        idleWatchdog.arm();
         // テキストデルタイベントを順次読み出す
         for await (const event of stream) {
           // 何かしら届いたので沈黙の計測をやり直す（ping も含めた全イベントが対象）
-          armIdleWatchdog();
+          idleWatchdog.arm();
           // 生成の終了理由を伝えるイベントなら、その理由を控える
           if (event.type === "message_delta" && event.delta.stop_reason) {
             finalStopReason = event.delta.stop_reason;
@@ -505,7 +540,7 @@ function createSseStream(
         // ループを抜けたので見張りは役目を終えた。ここで解除しないと、後片付けの最中に
         // 発火して完了済みのストリームを中断扱いにしてしまう（判定の順序に依存しないよう
         // フラグを見る前に必ず止める）
-        disarmIdleWatchdog();
+        idleWatchdog.disarm();
         // 自分たちの見張りが打ち切ったのなら、それは上流の無応答という障害。
         // 受信側が既に切断していても記録は残す（切断と上流障害は同時に起こりうるので、
         // 切断を先に見て早期 return すると、いちばんログが欲しい場面で記録が消える）
@@ -606,7 +641,7 @@ function createSseStream(
         // どの経路で抜けても見張りタイマーは必ず片付ける。残したままにすると
         // 待機中のタイマーがプロセスに残り、終了済みのストリームを中断しにいく
         // （§8 タイマーは使い終わったら解除する）
-        disarmIdleWatchdog();
+        idleWatchdog.disarm();
       }
     },
     cancel() {
