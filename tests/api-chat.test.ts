@@ -107,6 +107,47 @@ function makeAbortAwareStream(
   };
 }
 
+// 上流の沈黙を作るときに進める時間（ミリ秒）。アイドル上限より確実に長ければよいので、
+// 実装側の定数を書き写さずに「どんな上限でも超える」大きさを 1 つ置く
+// （書き写すと、上限を変えたときにテストだけが古い値を見たまま緑になる）
+const IDLE_FAR_BEYOND_ANY_LIMIT_MS = 60 * 60 * 1000;
+// 「イベントが届き続けている」ストリームの、イベント同士の間隔（ミリ秒）
+const STEADY_EVENT_GAP_MS = 1_000;
+// そのストリームが流すイベントの件数。間隔 × 件数が上流呼び出しのタイムアウト
+// （現状 120 秒）すら超えるので、沈黙ではなく合計時間で打ち切る実装なら必ず落ちる
+const STEADY_EVENT_COUNT = 300;
+
+/**
+ * 一定間隔でイベントを流し続け、最後に話し終えて終わるストリームのモックを生成する。
+ * 「長い生成」と「無応答」を取り違えていないか（見張りがイベントごとに数え直しているか）
+ * を確かめるために使う。
+ * @returns 中断用コントローラ付きの、間隔を空けて流し続けるモックストリーム
+ */
+function makeSteadyStream() {
+  return {
+    // 打ち切られた場合に記録が残るよう、中断用コントローラを持たせる
+    controller: { abort: vi.fn() },
+    // 間隔を空けながらデルタを流し、最後に終了理由を伝える非同期イテレータ
+    async *[Symbol.asyncIterator]() {
+      // 指定件数ぶん、間隔を空けてデルタを流す
+      for (let i = 0; i < STEADY_EVENT_COUNT; i += 1) {
+        // 次のイベントまでの間隔を空ける（上限より十分短い沈黙）
+        await new Promise((resolve) => setTimeout(resolve, STEADY_EVENT_GAP_MS));
+        // テキスト差分を 1 件返す
+        yield {
+          type: "content_block_delta",
+          delta: { type: "text_delta", text: "あ" },
+        };
+      }
+      // 最後まで話し終えたことを伝えて終わる（実ストリームと同じ終わり方）
+      yield {
+        type: "message_delta",
+        delta: { stop_reason: "end_turn", stop_sequence: null },
+      };
+    },
+  };
+}
+
 /**
  * ストリームを最後まで（またはエラーになるまで）読み進める。
  * 反復中のエラーは start() の中で起きるため、ボディを実際に読まないと表面化しない。
@@ -752,6 +793,74 @@ describe("POST /api/chat の上流エラーマッピング", () => {
       expect(errorSpy).not.toHaveBeenCalled();
     } finally {
       // スパイを元に戻して他のテストへ影響させない
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("ヘッダだけ返して黙り込んだ上流を打ち切り、完了として終わらせない", async () => {
+    // 1 件流したあと中断されるまで待ち続けるストリーム（= 無応答の上流）を仕込む。
+    // SDK のタイムアウトはヘッダ受信までしか効かないため、アイドル上限が無いと
+    // ここで for-await が永久に待ち、接続を握ったまま解放されない
+    const stalled = makeAbortAwareStream();
+    createMock.mockImplementationOnce(() => Promise.resolve(stalled));
+    // 上流障害としてサーバログに残ることを検証するためスパイを仕込む
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    // 実時間で待たずに沈黙を再現するため、タイマーを偽物に差し替える
+    vi.useFakeTimers();
+    try {
+      // 正常な形のリクエストを送る
+      const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
+      // 読み取り口を取得して 1 チャンク目（正常デルタ）まで読む
+      const reader = (res.body as ReadableStream<Uint8Array>).getReader();
+      await reader.read();
+      // どんなアイドル上限よりも長い沈黙を作る（上限値をテストへ書き写さないための余裕）
+      await vi.advanceTimersByTimeAsync(IDLE_FAR_BEYOND_ANY_LIMIT_MS);
+      // 上流の受信が中断されていることを確認する（放置せず必ず手放す）
+      expect(stalled.controller.abort).toHaveBeenCalled();
+      // 受信側には「完了していない」ことがエラーとして伝わる。
+      // 黙って閉じると読み手は done で抜け、途中で切れた回答が
+      // 「完全な回答」として確定・保存されてしまう
+      await expect(reader.read()).rejects.toThrow("上流が無応答");
+      // 上流の無応答はサーバ側の障害なので記録が残る（200 を返し終えた後は
+      // POST の catch へ戻らないため、ここで残さないと痕跡がゼロになる）
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("無応答"));
+    } finally {
+      // タイマーとスパイを元に戻して他のテストへ影響させない
+      vi.useRealTimers();
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("イベントが届き続けている限り、生成が長引いても打ち切らない", async () => {
+    // 一定間隔でイベントを流し続けるストリームを仕込む。合計時間はどのアイドル上限より
+    // 長いので、「経過時間の合計」で打ち切る実装だとここで落ちる（見張りは
+    // イベントが届くたびに数え直す＝沈黙の長さだけを見る、という契約の固定）
+    const steady = makeSteadyStream();
+    createMock.mockImplementationOnce(() => Promise.resolve(steady));
+    // 正常な配信で障害ログが出ないことも合わせて確認するためスパイを仕込む
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    // 実時間で待たずに長い生成を再現するため、タイマーを偽物に差し替える
+    vi.useFakeTimers();
+    try {
+      // 正常な形のリクエストを送る
+      const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
+      // 応答本文の読み取りを開始する（読み進めながら時間を進める必要がある）
+      const bodyText = new Response(res.body).text();
+      // 生成が続いている時間ぶんだけ時計を進める（各イベントの間隔は上限より十分短い）
+      await vi.advanceTimersByTimeAsync(
+        STEADY_EVENT_COUNT * STEADY_EVENT_GAP_MS + STEADY_EVENT_GAP_MS
+      );
+      // 読み終えた本文を取り出す
+      const body = await bodyText;
+      // 最後まで流し切ったので完了の番兵が付く（途中で打ち切られていない）
+      expect(body).toContain(SSE_DONE_MARKER);
+      // 上流は中断されない（正常な長い生成を勝手に切らない）
+      expect(steady.controller.abort).not.toHaveBeenCalled();
+      // 正常な配信なので障害ログも出ない
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      // タイマーとスパイを元に戻して他のテストへ影響させない
+      vi.useRealTimers();
       errorSpy.mockRestore();
     }
   });
