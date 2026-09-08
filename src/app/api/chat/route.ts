@@ -75,6 +75,19 @@ const REQUIRED_CONTENT_TYPE = "application/json";
  * 公開エンドポイントとして必ず頭打ちにする（§9 タイムアウトを設ける）。 */
 const UPSTREAM_TIMEOUT_MS = 120_000;
 
+/** 上流イベントが 1 件も届かないまま待てる長さ（ミリ秒）＝アイドル上限。
+ * **`UPSTREAM_TIMEOUT_MS` はヘッダを受け取るまでしか効かない。** SDK（client.js）は
+ * `await fetch(...)` の直後の finally で `clearTimeout` するが、fetch は応答ヘッダが
+ * 届いた時点で解決するので、本文（イベント列）を読んでいる最中は見張りが誰もいない。
+ * その状態でヘッダだけ返して黙り込んだ上流に当たると、`for await` は解決しない
+ * `read()` を待ち続け、**どのタイムアウトにも掛からないまま**接続・メモリ・
+ * ソケットを握り続ける（画面も「生成中」のまま永久に止まる）。
+ * そこでイベントが届くたびに数え直す上限を別に置き、沈黙が続いたら自分から打ち切る
+ * （§9 公開エンドポイントにタイムアウトを設ける／§8 リソースを確実に解放する）。
+ * 上流は生成中も ping イベントを挟むため、正常な生成がこの長さの沈黙に至ることはない
+ * （`UPSTREAM_TIMEOUT_MS` より短くしてあるのは、掛かるべきときに先に効かせるため）。 */
+const UPSTREAM_IDLE_TIMEOUT_MS = 60_000;
+
 /** クライアントへ返すエラー文言の一元管理（§6 定数・ラベルは一元管理／DRY）。
  * 同じ文言を複数箇所に直書きすると片方だけ直して食い違うため、ここを唯一の参照元にする。
  * いずれも内部情報（スタックトレース・上流の英語メッセージ）を含まない安全な文言（§9）。 */
@@ -394,6 +407,55 @@ type UpstreamStream = AsyncIterable<Anthropic.RawMessageStreamEvent> & {
   controller: { abort: () => void };
 };
 
+/** 沈黙が続いたことを知らせる見張り。`arm()` を呼ぶたびに計測が 0 からやり直される。 */
+interface IdleWatchdog {
+  /** 見張りを張り直す（イベントを受け取るたびに呼ぶ） */
+  arm: () => void;
+  /** 見張りを解除する（何度呼んでも安全） */
+  disarm: () => void;
+}
+
+/**
+ * 「一定時間なにも起きなかったら知らせる」だけの見張りを作る。
+ *
+ * タイマーの張り直し・解除という**仕組み**をここに閉じ込め、呼び出し側には
+ * 「沈黙が続いたら何をするか」という**方針**だけを残す（§6 単一責務）。
+ * 解除は何度呼んでも安全にしてあり、正常終了・例外・切断のどの経路からでも
+ * ためらわずに呼べる（§8 タイマーは使い終わったら必ず解除する）。
+ *
+ * @param timeoutMs - 沈黙をどれだけ許すか（ミリ秒）
+ * @param onIdle - その長さの沈黙が続いたときに 1 度だけ呼ばれる処理
+ * @returns 張り直し・解除の 2 操作を持つ見張り
+ */
+function createIdleWatchdog(
+  timeoutMs: number,
+  onIdle: () => void
+): IdleWatchdog {
+  // 待機中のタイマー（張っていなければ null）
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  // 解除の手順（張り直しの前と、後片付けの両方から使う）
+  const disarm = (): void => {
+    // 待機中のタイマーがあれば取り消す
+    if (timer !== null) {
+      clearTimeout(timer);
+    }
+    // 取り消し済みであることを記録する（二重解除・解除後の発火を防ぐ）
+    timer = null;
+  };
+  // 張り直し・解除の 2 操作を返す
+  return {
+    // 前の見張りを取り消してから新しく張る（タイマーが積み上がるのを防ぐ）
+    arm: () => {
+      // 古いタイマーを片付ける
+      disarm();
+      // 指定の長さだけ沈黙が続いたら通知する
+      timer = setTimeout(onIdle, timeoutMs);
+    },
+    // 解除はそのまま公開する
+    disarm,
+  };
+}
+
 /**
  * 上流の Claude ストリームを、ブラウザへ返す SSE 形式の ReadableStream に変換する。
  * POST ハンドラーから切り出して「SSE への変換」という単一の責務に閉じ込める（§6 単一責務）。
@@ -420,9 +482,41 @@ function createSseStream(
       // model_context_window_exceeded や refusal といった途中終了があり、
       // 列挙側で持つと新しい理由が増えるたびに黙って「完全な回答」に化ける
       let finalStopReason: Anthropic.StopReason | null = null;
+      // アイドル上限で自分から打ち切ったかどうか。上流の沈黙による打ち切りは
+      // 「クライアントが離れた」「上流が最後まで流し切った」のどちらとも違うので、
+      // 反復が終わったあとに見分けられるよう記録しておく
+      let idleTimedOut = false;
+      // 沈黙が上限に達したら上流の受信を打ち切る見張り。
+      // 何を待つか（タイマーの張り直し）は createIdleWatchdog が持ち、
+      // ここには「沈黙が続いたらどうするか」という方針だけを書く
+      const idleWatchdog = createIdleWatchdog(UPSTREAM_IDLE_TIMEOUT_MS, () => {
+        // 自分たちの判断で打ち切ったことを記録する（正常終了と見分けるため）
+        idleTimedOut = true;
+        // 上流の受信を中断する（受信側の切断時と同じ経路を使う。
+        // SDK は中断で throw せず反復を終えるので、下の for-await は静かに抜ける）
+        stream.controller.abort();
+      });
+      // 上流の沈黙で打ち切ったときの後始末（記録と受信側への通知）。
+      // ループが静かに終わった場合と例外で抜けた場合の両方から呼ぶので 1 か所にまとめる
+      const failWithIdleTimeout = (): void => {
+        // 上流の無応答はサーバ側の障害なので必ず記録する。200 とヘッダを返し終えた後は
+        // POST の catch（mapErrorToResponse）へ戻らないため、ここで残さないと痕跡がゼロになる
+        console.error(
+          `チャット API のストリーミング中に上流が ${UPSTREAM_IDLE_TIMEOUT_MS}ms 無応答になったため打ち切りました`
+        );
+        // 受信側にも「完了していない」ことを伝える（切断済みなら仕様上その場で戻る）。
+        // 黙って close() すると読み手は done で抜けて「完全な回答」として確定させてしまう
+        controller.error(
+          new Error("上流が無応答のためストリーミングを打ち切りました")
+        );
+      };
       try {
+        // 1 件目のイベントが届くまでの沈黙も見張る（ヘッダだけ返して黙る上流に備える）
+        idleWatchdog.arm();
         // テキストデルタイベントを順次読み出す
         for await (const event of stream) {
+          // 何かしら届いたので沈黙の計測をやり直す（ping も含めた全イベントが対象）
+          idleWatchdog.arm();
           // 生成の終了理由を伝えるイベントなら、その理由を控える
           if (event.type === "message_delta" && event.delta.stop_reason) {
             finalStopReason = event.delta.stop_reason;
@@ -442,6 +536,18 @@ function createSseStream(
             const data = JSON.stringify({ text: event.delta.text });
             controller.enqueue(sseEncoder.encode(formatSseFrame(data)));
           }
+        }
+        // ループを抜けたので見張りは役目を終えた。ここで解除しないと、後片付けの最中に
+        // 発火して完了済みのストリームを中断扱いにしてしまう（判定の順序に依存しないよう
+        // フラグを見る前に必ず止める）
+        idleWatchdog.disarm();
+        // 自分たちの見張りが打ち切ったのなら、それは上流の無応答という障害。
+        // 受信側が既に切断していても記録は残す（切断と上流障害は同時に起こりうるので、
+        // 切断を先に見て早期 return すると、いちばんログが欲しい場面で記録が消える）
+        if (idleTimedOut) {
+          // 記録を残し、受信側にも未完了であることを伝えて終わる
+          failWithIdleTimeout();
+          return;
         }
         // 上流を読み切ったあとも、書く前に受信側が残っているかを確かめる。
         // SDK は反復中の中断を throw せず正常終了する（core/streaming.js の
@@ -505,6 +611,15 @@ function createSseStream(
         // なお、受信側が既に切断していれば error() は仕様上その場で戻る（何も起きない）
         // ので、切断の有無で呼び分ける必要はない。呼び分けが要るのは enqueue() /
         // close() のほうで、あちらは切断後に呼ぶと TypeError になる
+        // 自分たちの見張りによる打ち切りは、SDK の分類次第では中断エラーとして
+        // 飛んでくる。日常的なクライアント離脱と同じ「記録しない」扱いに流すと
+        // 上流の無応答が無記録で消えるので、abort の判定より先にここで拾う
+        if (idleTimedOut) {
+          // 記録を残し、受信側にも未完了であることを伝えて終わる
+          failWithIdleTimeout();
+          return;
+        }
+
         if (isAbortError(error)) {
           controller.error(error);
           return;
@@ -522,6 +637,11 @@ function createSseStream(
 
         // 受信側へ失敗を伝える（切断済みなら上と同じく何も起きない）
         controller.error(error);
+      } finally {
+        // どの経路で抜けても見張りタイマーは必ず片付ける。残したままにすると
+        // 待機中のタイマーがプロセスに残り、終了済みのストリームを中断しにいく
+        // （§8 タイマーは使い終わったら解除する）
+        idleWatchdog.disarm();
       }
     },
     cancel() {
