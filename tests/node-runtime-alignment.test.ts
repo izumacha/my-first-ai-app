@@ -24,6 +24,12 @@
 //   (a') CI が版を書き写す形へ戻ること … `node-version: '26'` のように直書きすると、
 //       `.nvmrc` とずれても CI は緑のまま通り、この PR 以前の状態に戻る。
 //       値の一致ではなく**配線そのもの**を固定する。
+//       **ジョブの `container:` に node イメージを置く形も同じ扱いで落とす。**
+//       `container: node:20` と書くと steps はそのイメージの Node で走るので、
+//       `actions/setup-node` を 1 つも置かずに別 major で検証できてしまう
+//       (setup-node だけを見る検査はこれを緑のまま通す。実測)。
+//       CI が入れる Node は必ず `.nvmrc` 由来にする、が守りたい 1 つの性質で、
+//       版が入り込む口を両方とも塞いでおかないとその性質は保証にならない。
 //   (b) 読み取り不能 … 書式が変わってピンを読めない状態。判定の土台が崩れるので
 //       「たぶん合っている」ではなく落とす (fail-closed)。
 //   (c) 宣言のずれ … `engines.node` がピン留めした Node を許していない、
@@ -36,6 +42,18 @@
 //   (f) `@types/node` の major 保留の消失・効きすぎ・置き場所間違い …
 //       Dependabot がランタイムと無関係に型だけを次の major へ進める PR を毎週立てると、
 //       (d) が緑のまま入ってしまう。ignore の形まで含めて固定する。
+//
+// (a') が保証する範囲を正確に書いておく (この検出網は「証明」ではない):
+//   見るのは**ワークフローの YAML に構造として現れる 2 つの口**だけ —
+//   `actions/setup-node` の `with`、およびジョブの `container:` イメージ。
+//   これは「宣言として書かれた Node」を全部見るという意味で、逆に言えば
+//   **`run:` の中身で Node を入れ替える形は原理的に見えない**
+//   (`volta pin` / `nvm install 20` / `asdf` などを走らせる 1 行を足せば素通りする)。
+//   そこまで追うには run スクリプトの中身を解釈することになり、綴りを 1 つ塞ぐたびに
+//   次の抜け道が出てくる終わりのない作業になる (この repo が CSP の静的解析で
+//   実際に踏んだ形)。**「増やしたことに気付く」ための網であって証明ではない**、
+//   と理解して使うこと。ここを広げたくなったら、まず実際にその形が現れてから、
+//   正当なワークフローを巻き添えにしない判定を決めて足すこと。
 //
 // Node を上げるときの手順 (この検査が要求する形):
 //   ピン留め 2 か所と `engines.node` / README / `@types/node` を**同じ PR で**
@@ -214,6 +232,73 @@ function collectSetupNodeSteps(): SetupNodeStep[] {
         .map((step) => asRecord(step))
         .filter((step) => String(step.uses ?? "").startsWith("actions/setup-node"))
         .map((step) => ({ file, inputs: asRecord(step.with) }));
+    });
+  });
+}
+
+/** ワークフロー 1 本の中で、node イメージを `container:` に据えたジョブ 1 つ分。 */
+interface NodeContainerJob {
+  // 失敗メッセージに出す、どのワークフローのどのジョブかを示す名前
+  file: string;
+  // ジョブ名 (jobs 直下のキー)
+  job: string;
+  // 実際に書かれていたイメージ名 (どう直せばよいか分かるように、そのまま出す)
+  image: string;
+}
+
+/**
+ * イメージ名が Node の公式イメージを指しているかを判定する。
+ *
+ * レジストリ・名前空間の付いた書き方 (`docker.io/library/node:20`) でも拾えるよう、
+ * **最後のパス区切り以降**をリポジトリ名として見る。タグ (`:20-alpine`) と
+ * ダイジェスト (`@sha256:...`) は落としてから比べる。
+ *
+ * 判定を「名前が node と完全一致」に絞るのは、`myorg/node-tools` のような
+ * 別物まで巻き込むと**直しようの無い要求**を出すことになるから
+ * (この repo が繰り返し避けている形。無関係なものを赤くする検出網はいずれ緩められる)。
+ */
+function isNodeImage(image: string): boolean {
+  // ダイジェスト指定 (`@sha256:...`) が付いていれば切り落とす
+  const withoutDigest = image.split("@")[0];
+  // レジストリ・名前空間を落として、最後のパス要素だけを取り出す
+  const lastSegment = withoutDigest.split("/").pop() ?? "";
+  // タグ (`:20-alpine`) を落として、リポジトリ名だけにする
+  const repository = lastSegment.split(":")[0];
+  // 公式の node イメージだけを対象にする (node-tools 等は別物なので拾わない)
+  return repository === "node";
+}
+
+/**
+ * `container:` に node イメージを据えているジョブを集める。
+ *
+ * **`actions/setup-node` を見るだけでは足りない**のがここを足した理由。
+ * ジョブに `container: node:20` と書くと steps はそのイメージの中で走るため、
+ * setup-node を 1 本も置かないまま `.nvmrc` と別の major で `npm ci && npm run test`
+ * を回せてしまう。setup-node だけを見る検査はこれを**全件緑のまま通す** (実測)。
+ * Node の版が CI に入り込む口はこの 2 つなので、両方を塞いで初めて
+ * 「CI が入れる Node はピンそのもの」が保証になる。
+ *
+ * `container:` は文字列 (`container: node:20`) でも
+ * マップ (`container: { image: node:20 }`) でも書けるので、両方の書き方を読む。
+ */
+function collectNodeContainerJobs(): NodeContainerJob[] {
+  // 置き場にあるワークフローを 1 本ずつ見る
+  return listWorkflowFiles().flatMap((file) => {
+    // ワークフローを読む (読めなければこの 1 本には対象ジョブが無い扱い)
+    const text = readTextOrNull(resolve(WORKFLOWS_DIR, file));
+    if (text === null) return [];
+    // YAML として解釈し、jobs 直下のジョブを名前付きで 1 つずつ見る
+    const jobs = asRecord(asRecord(parseYaml(text)).jobs);
+    return Object.entries(jobs).flatMap(([job, definition]) => {
+      // container の値を取り出す (未指定ならこのジョブは対象外)
+      const container = asRecord(definition).container;
+      // 文字列ならそれ自体がイメージ名、マップなら image キーがイメージ名
+      const image =
+        typeof container === "string" ? container : String(asRecord(container).image ?? "");
+      // node イメージでなければ対象外 (ubuntu 等の中で setup-node を使う形は上の検査が見る)
+      if (!isNodeImage(image)) return [];
+      // どのワークフローのどのジョブが、どのイメージを据えているかを返す
+      return [{ file, job, image }];
     });
   });
 }
@@ -425,6 +510,18 @@ describe("実行する Node の major を宣言しているすべての場所の
       misconfigured,
       `actions/setup-node には node-version-file: '.nvmrc' だけを渡すこと。実際の指定: ${misconfigured.join(" / ")}。` +
         "版を直書きすると .nvmrc とずれても CI は緑のまま通り、出荷する Node を検証していない状態に戻る。",
+    ).toEqual([]);
+    // **版が入り込むもう 1 つの口**も塞ぐ。`container: node:20` を据えたジョブは
+    // setup-node を 1 本も置かずにそのイメージの Node で steps を回せるため、
+    // 上の検査だけでは素通りする (実測で全件緑のまま通った)
+    const nodeContainers = collectNodeContainerJobs().map(
+      (job) => `${job.file}: ${job.job} (container: ${job.image})`,
+    );
+    expect(
+      nodeContainers,
+      `ジョブの container: に node イメージを据えないこと。実際の指定: ${nodeContainers.join(" / ")}。` +
+        "そのイメージの Node で steps が走るので、.nvmrc と別の major で検証している状態になる。" +
+        "Node は actions/setup-node に node-version-file: '.nvmrc' を渡して用意すること。",
     ).toEqual([]);
   });
 
