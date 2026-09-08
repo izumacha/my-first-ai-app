@@ -12,17 +12,20 @@ jobs:
   lint-and-test:
     runs-on: ubuntu-latest
 
-    strategy:
-      matrix:
-        node-version: [20, 22]
-
     steps:
       - uses: actions/checkout@v7
 
-      - name: Setup Node.js ${{ matrix.node-version }}
+      # 検証に使う Node は **`.nvmrc` から読む**（ここに版を書き写さない）。
+      # 以前は matrix [20, 22] を直書きしていて、Dockerfile が出荷する Node（26）を
+      # 一度も検証していなかった。緑になるのは「その Node で動くから」ではなく
+      # 「npm が engines を既定で強制しないから」でしかなく、CI の緑が判断材料に
+      # ならない fail-open だった。版をここへ書き写すと同じずれがいつでも再発するので、
+      # 参照にして食い違いようのない形にしてある
+      # （詳細は tests/node-runtime-alignment.test.ts の冒頭コメント）。
+      - name: Setup Node.js (.nvmrc)
         uses: actions/setup-node@v7
         with:
-          node-version: ${{ matrix.node-version }}
+          node-version-file: '.nvmrc'
           cache: 'npm'
 
       - name: Install dependencies

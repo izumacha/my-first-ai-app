@@ -3,7 +3,8 @@
 // なぜテストで縛るのか:
 //   「どの Node で動かすか」はこのリポジトリの中で 4 か所に分かれて書かれている
 //   (`.nvmrc`(正本) / `Dockerfile` の `FROM node:<major>` /
-//    `package.json` の `engines.node` / README の必要環境)。ここがずれても
+//    `package.json` の `engines.node` / README の必要環境。CI は `.nvmrc` を
+//    参照するので版を持たない)。ここがずれても
 //   **lint も型チェックもテストも通ってしまう**。npm は `engines` を既定で強制しない
 //   ので、依存がサポートしていない Node の上でも `npm ci` は成功し、テストも
 //   「たまたま動いている間は」緑になる。つまり **CI の緑が「その Node で動く」ことの
@@ -20,6 +21,9 @@
 // 何を防ぐか:
 //   (a) ピン留めの食い違い … `.nvmrc` と Dockerfile が別々の major を指す状態。
 //       どちらかを上げ忘れると「どの Node に合わせるべきか」が決まらなくなる。
+//   (a') CI が版を書き写す形へ戻ること … `node-version: '26'` のように直書きすると、
+//       `.nvmrc` とずれても CI は緑のまま通り、この PR 以前の状態に戻る。
+//       値の一致ではなく**配線そのもの**を固定する。
 //   (b) 読み取り不能 … 書式が変わってピンを読めない状態。判定の土台が崩れるので
 //       「たぶん合っている」ではなく落とす (fail-closed)。
 //   (c) 宣言のずれ … `engines.node` がピン留めした Node を許していない、
@@ -40,12 +44,13 @@
 
 // Vitest の DSL
 import { describe, expect, it } from "vitest";
-// ピン留めを書いた素のテキスト (.nvmrc / Dockerfile / README) を読むため
-import { readFileSync } from "node:fs";
+// ピン留めを書いた素のテキスト (.nvmrc / Dockerfile / README) と、
+// ワークフローの一覧 (ファイル名を書き並べず、ディレクトリから列挙する) を読むため
+import { readdirSync, readFileSync } from "node:fs";
 // 検査対象のパスを組み立てるため
 import { resolve } from "node:path";
-// dependabot.yml を構造として読むため (正規表現で近似すると、解説コメント中の
-// `dependency-name:` を設定値と取り違える)
+// ワークフローを構造として読むため (正規表現で近似すると、解説コメント中の
+// `node-version-file:` を設定値と取り違える)
 import { parse as parseYaml } from "yaml";
 // `engines.node` は範囲で書かれるので、判定は専用ライブラリに任せる (§9 自前実装しない)
 import { satisfies } from "semver";
@@ -72,6 +77,10 @@ import {
 
 // ピン留めの出どころ (package.json の engines は「下限」なので別扱い。冒頭コメント参照)
 const NVMRC_PATH = resolve(REPO_ROOT, ".nvmrc");
+// ワークフローは**ファイル名を書き並べず、置き場ごと**見る。
+// 特定の 1 本 (ci.yml) だけを対象にすると、Node を用意する別のワークフローを足した瞬間に
+// その 1 本だけが黙って検査から外れる (痕跡はテスト件数すら変わらない)
+const WORKFLOWS_DIR = resolve(REPO_ROOT, ".github/workflows");
 const DOCKERFILE_PATH = resolve(REPO_ROOT, "Dockerfile");
 // 必要環境を人向けに書いている場所 (コードと同じ major を指していないと読み手を誤らせる)
 const README_PATH = resolve(REPO_ROOT, "README.md");
@@ -151,6 +160,65 @@ function readNvmrcMajor(): number | null {
 }
 
 /**
+ * `.github/workflows/` に置かれたワークフローのファイル名を並べる。
+ *
+ * ディレクトリを読むのは、**対象を名前で書き並べると増えた分が黙って外れる**から
+ * (`ci.yml` だけを見る形だと、Node を用意する 2 本目を足しても検査は緑のまま通り、
+ *  痕跡はテスト件数にも出ない)。読めなければ空を返し、呼び出し側で落とす。
+ */
+function listWorkflowFiles(): string[] {
+  try {
+    // 拡張子が .yml / .yaml のものだけを対象にする (README などを YAML として解釈しない)
+    return readdirSync(WORKFLOWS_DIR).filter((name) => /\.ya?ml$/i.test(name));
+  } catch {
+    // ディレクトリごと読めない場合は空 = 呼び出し側の「1 つも無い」検査で落ちる
+    return [];
+  }
+}
+
+/** ワークフロー 1 本の中の `actions/setup-node` ステップ 1 つ分。 */
+interface SetupNodeStep {
+  // 失敗メッセージに出す、どのワークフローのステップかを示す名前
+  file: string;
+  // そのステップの `with`（判定の対象）
+  inputs: Record<string, unknown>;
+}
+
+/**
+ * CI の Node 準備ステップが「どう版を決めているか」を集める。
+ *
+ * **版そのものではなく配線を見るのが要点。** ワークフローに版を書き写す形
+ * (`node-version: '26'` や `env.NODE_VERSION`) だと、その値が `.nvmrc` とずれても
+ * 「両方を突き合わせる」検査でしか気付けず、しかも `setup-node` の `with` を
+ * 書き換えれば宣言だけ残して実際には別の Node を入れられる (env を読むだけの検査は
+ * それを緑のまま通す。実測)。`node-version-file: '.nvmrc'` にしておけば、
+ * **CI が入れる Node はピンそのもの**になり、ずれが原理的に起きない。
+ *
+ * 返すのは各 `actions/setup-node` ステップの `with` で、判定は呼び出し側が行う。
+ */
+function collectSetupNodeSteps(): SetupNodeStep[] {
+  // 置き場にあるワークフローを 1 本ずつ見る
+  return listWorkflowFiles().flatMap((file) => {
+    // ワークフローを読む (読めなければこの 1 本には準備ステップが無い扱い)
+    const text = readTextOrNull(resolve(WORKFLOWS_DIR, file));
+    if (text === null) return [];
+    // YAML として解釈し、jobs 直下のジョブを 1 つずつ見る
+    const jobs = asRecord(asRecord(parseYaml(text)).jobs);
+    // 各ジョブの steps から `actions/setup-node` を使うものだけを集める
+    return Object.values(jobs).flatMap((job) => {
+      // steps は配列 (そうでなければこのジョブには準備ステップが無い扱い)
+      const steps = asRecord(job).steps;
+      if (!Array.isArray(steps)) return [];
+      // uses が actions/setup-node のステップに絞り、その with をファイル名付きで返す
+      return steps
+        .map((step) => asRecord(step))
+        .filter((step) => String(step.uses ?? "").startsWith("actions/setup-node"))
+        .map((step) => ({ file, inputs: asRecord(step.with) }));
+    });
+  });
+}
+
+/**
  * Dockerfile が使う Node のベースイメージ major を読み取る。
  *
  * **最初の 1 件だけを見ない。** 多段ビルドで `FROM node:22-alpine AS tools` のような
@@ -198,12 +266,9 @@ function readReadmeNodeMajor(): number | null {
  * 1 か所だけを正としないのは、上げ忘れたときに**残りと食い違う**ことこそが
  * 検出したい状態だから。両方を返し、呼び出し側で「読めたか」「揃っているか」を見る。
  *
- * **CI はここに含めない。** `.github/workflows/ci.yml` はまだ版を直書きしており
- * (`node-version` の matrix)、この検査の対象外になっている。値を突き合わせるだけの
- * 検査では「片方だけ書き換えれば静かにずれる」形が残るため、CI 側は
- * **`node-version-file: '.nvmrc'` を参照する配線へ変える**のが正しい直し方で、
- * その変更と「配線が保たれているか」を見る検査は PR #53 が持っている
- * (チェック名が変わるため、リポジトリの必須ステータスチェック設定の更新待ち)。
+ * **CI はここに含めない。** 版を書き写す形をやめて `.nvmrc` を参照する配線にしたので、
+ * CI が入れる Node はピンそのものになった (突き合わせる相手が存在しない)。
+ * 代わりに「その配線が保たれているか」を専用のテストで見る。
  */
 function collectPinnedSources(): PinnedSource[] {
   // 2 つの出どころをラベル付きで並べて返す
@@ -338,6 +403,29 @@ describe("実行する Node の major を宣言しているすべての場所の
       .map((input) => `${input.label}: ${String(input.read.error)}`);
     // 1 つでも読めなければ、以降の判定は意味を持たないので前提崩れとして落とす
     expect(unreadable, `設定ファイルを読めない: ${unreadable.join(" / ")}`).toEqual([]);
+  });
+
+  it("CI が Node の版を書き写さず、.nvmrc を参照して用意している", () => {
+    // 置き場のワークフローすべてから Node 準備ステップを集める
+    const setupSteps = collectSetupNodeSteps();
+    // 1 つも無ければ、CI が Node を用意していない (= 検証していない) ので落とす
+    expect(
+      setupSteps.length,
+      ".github/workflows/ に actions/setup-node のステップが見つからない。CI が Node を用意していないか、読み取り側が書式の変更に追随できていない。",
+    ).toBeGreaterThan(0);
+    // すべてのステップが `.nvmrc` を参照していることを確かめる。
+    // **`node-version` を書いた形は、値が合っていても許さない** — 合っているかどうかは
+    // その瞬間の話で、片方だけ書き換えれば静かにずれる (版を書き写せる構造そのものを断つ)
+    const misconfigured = setupSteps
+      .filter(
+        (step) => step.inputs["node-version-file"] !== ".nvmrc" || "node-version" in step.inputs,
+      )
+      .map((step) => `${step.file}: ${JSON.stringify(step.inputs)}`);
+    expect(
+      misconfigured,
+      `actions/setup-node には node-version-file: '.nvmrc' だけを渡すこと。実際の指定: ${misconfigured.join(" / ")}。` +
+        "版を直書きすると .nvmrc とずれても CI は緑のまま通り、出荷する Node を検証していない状態に戻る。",
+    ).toEqual([]);
   });
 
   it("実行する Node の major がピン留め 2 か所すべてから読み取れ、値も揃っている", () => {
