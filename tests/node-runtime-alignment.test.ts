@@ -194,6 +194,43 @@ function listWorkflowFiles(): string[] {
   }
 }
 
+/** ワークフロー 1 本の中の 1 ジョブ (どのファイルの、どの名前で、中身は何か)。 */
+interface WorkflowJob {
+  // 失敗メッセージに出す、どのワークフローかを示すファイル名
+  file: string;
+  // ジョブ名 (jobs 直下のキー)
+  name: string;
+  // そのジョブの定義 (steps / container などを読む)
+  definition: Record<string, unknown>;
+}
+
+/**
+ * 置き場のワークフローすべてから、ジョブを 1 つずつ平らに並べる。
+ *
+ * **走査を 1 か所に集めるのが目的。** Node の版が入り込む口は 2 つ
+ * (`setup-node` の `with` と ジョブの `container:`) あり、どちらの検査も
+ * 「どのワークフローの、どのジョブを見るか」は同じでなければならない。
+ * 走査を各検査に書き写すと、片方だけ対象範囲を直したときに
+ * **もう片方の検出網が黙って狭くなる** (このリポジトリが繰り返し踏んでいる形)。
+ * 読めない / YAML として解釈できない 1 本はジョブ 0 件として扱い、
+ * 「1 つも見つからない」を呼び出し側の fail-closed な検査が落とす。
+ */
+function collectWorkflowJobs(): WorkflowJob[] {
+  // 置き場にあるワークフローを 1 本ずつ見る
+  return listWorkflowFiles().flatMap((file) => {
+    // ワークフローを読む (読めなければこの 1 本にはジョブが無い扱い)
+    const text = readTextOrNull(resolve(WORKFLOWS_DIR, file));
+    if (text === null) return [];
+    // YAML として解釈し、jobs 直下をジョブ名付きで平らに並べる
+    const jobs = asRecord(asRecord(parseYaml(text)).jobs);
+    return Object.entries(jobs).map(([name, definition]) => ({
+      file,
+      name,
+      definition: asRecord(definition),
+    }));
+  });
+}
+
 /** ワークフロー 1 本の中の `actions/setup-node` ステップ 1 つ分。 */
 interface SetupNodeStep {
   // 失敗メッセージに出す、どのワークフローのステップかを示す名前
@@ -215,24 +252,16 @@ interface SetupNodeStep {
  * 返すのは各 `actions/setup-node` ステップの `with` で、判定は呼び出し側が行う。
  */
 function collectSetupNodeSteps(): SetupNodeStep[] {
-  // 置き場にあるワークフローを 1 本ずつ見る
-  return listWorkflowFiles().flatMap((file) => {
-    // ワークフローを読む (読めなければこの 1 本には準備ステップが無い扱い)
-    const text = readTextOrNull(resolve(WORKFLOWS_DIR, file));
-    if (text === null) return [];
-    // YAML として解釈し、jobs 直下のジョブを 1 つずつ見る
-    const jobs = asRecord(asRecord(parseYaml(text)).jobs);
-    // 各ジョブの steps から `actions/setup-node` を使うものだけを集める
-    return Object.values(jobs).flatMap((job) => {
-      // steps は配列 (そうでなければこのジョブには準備ステップが無い扱い)
-      const steps = asRecord(job).steps;
-      if (!Array.isArray(steps)) return [];
-      // uses が actions/setup-node のステップに絞り、その with をファイル名付きで返す
-      return steps
-        .map((step) => asRecord(step))
-        .filter((step) => String(step.uses ?? "").startsWith("actions/setup-node"))
-        .map((step) => ({ file, inputs: asRecord(step.with) }));
-    });
+  // 共有の走査でジョブを平らに並べ、各ジョブの steps を見る
+  return collectWorkflowJobs().flatMap((job) => {
+    // steps は配列 (そうでなければこのジョブには準備ステップが無い扱い)
+    const steps = job.definition.steps;
+    if (!Array.isArray(steps)) return [];
+    // uses が actions/setup-node のステップに絞り、その with をファイル名付きで返す
+    return steps
+      .map((step) => asRecord(step))
+      .filter((step) => String(step.uses ?? "").startsWith("actions/setup-node"))
+      .map((step) => ({ file: job.file, inputs: asRecord(step.with) }));
   });
 }
 
@@ -282,24 +311,17 @@ function isNodeImage(image: string): boolean {
  * マップ (`container: { image: node:20 }`) でも書けるので、両方の書き方を読む。
  */
 function collectNodeContainerJobs(): NodeContainerJob[] {
-  // 置き場にあるワークフローを 1 本ずつ見る
-  return listWorkflowFiles().flatMap((file) => {
-    // ワークフローを読む (読めなければこの 1 本には対象ジョブが無い扱い)
-    const text = readTextOrNull(resolve(WORKFLOWS_DIR, file));
-    if (text === null) return [];
-    // YAML として解釈し、jobs 直下のジョブを名前付きで 1 つずつ見る
-    const jobs = asRecord(asRecord(parseYaml(text)).jobs);
-    return Object.entries(jobs).flatMap(([job, definition]) => {
-      // container の値を取り出す (未指定ならこのジョブは対象外)
-      const container = asRecord(definition).container;
-      // 文字列ならそれ自体がイメージ名、マップなら image キーがイメージ名
-      const image =
-        typeof container === "string" ? container : String(asRecord(container).image ?? "");
-      // node イメージでなければ対象外 (ubuntu 等の中で setup-node を使う形は上の検査が見る)
-      if (!isNodeImage(image)) return [];
-      // どのワークフローのどのジョブが、どのイメージを据えているかを返す
-      return [{ file, job, image }];
-    });
+  // 共有の走査でジョブを平らに並べ、各ジョブの container を見る
+  return collectWorkflowJobs().flatMap((job) => {
+    // container の値を取り出す (未指定ならこのジョブは対象外)
+    const container = job.definition.container;
+    // 文字列ならそれ自体がイメージ名、マップなら image キーがイメージ名
+    const image =
+      typeof container === "string" ? container : String(asRecord(container).image ?? "");
+    // node イメージでなければ対象外 (ubuntu 等の中で setup-node を使う形は上の検査が見る)
+    if (!isNodeImage(image)) return [];
+    // どのワークフローのどのジョブが、どのイメージを据えているかを返す
+    return [{ file: job.file, job: job.name, image }];
   });
 }
 
