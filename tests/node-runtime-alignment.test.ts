@@ -102,6 +102,7 @@ import {
   DEPENDABOT_PATH,
   describeReadError,
   describeShape,
+  displayPath,
   isPlainMapping,
   MAJOR_UPDATE_TYPE,
   NPM_DIRECTORY,
@@ -663,14 +664,21 @@ const baseImageIgnoreEntries = collectIgnoreEntries(
 
 describe("実行する Node の major を宣言しているすべての場所の整合", () => {
   it("検査に使う設定ファイルが読めて、構造として解釈できる", () => {
-    // 3 つの入力のうち読めなかったものを、原因付きで並べる
+    // 3 つの入力のうち読めなかったものを、原因付きで並べる。
+    // **名前も原因も共有の整形を通す。** 名前を文字列で書き写すと、定数を変えたときに
+    // 「読んでいるファイル」と「文言が名指しするファイル」がずれる。原因をそのまま
+    // 文字列化すると ENOENT のメッセージに実行機の絶対パスが載り、CI と手元で
+    // 文言が食い違う (describeReadError はそれを畳むために作られている)
     const unreadable = [
-      { label: ".github/dependabot.yml", read: dependabotRead },
-      { label: "package.json", read: packageJsonRead },
-      { label: "package-lock.json", read: packageLockRead },
+      { path: DEPENDABOT_PATH, read: dependabotRead },
+      { path: PACKAGE_JSON_PATH, read: packageJsonRead },
+      { path: PACKAGE_LOCK_PATH, read: packageLockRead },
     ]
       .filter((input) => input.read.error !== null)
-      .map((input) => `${input.label}: ${String(input.read.error)}`);
+      .map(
+        (input) =>
+          `${displayPath(input.path)}: ${describeReadError(input.read.error, REPO_ROOT)}`,
+      );
     // 1 つでも読めなければ、以降の判定は意味を持たないので前提崩れとして落とす
     expect(unreadable, `設定ファイルを読めない: ${unreadable.join(" / ")}`).toEqual([]);
   });
