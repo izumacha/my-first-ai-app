@@ -30,6 +30,9 @@
 //       (setup-node だけを見る検査はこれを緑のまま通す。実測)。
 //       CI が入れる Node は必ず `.nvmrc` 由来にする、が守りたい 1 つの性質で、
 //       版が入り込む口を両方とも塞いでおかないとその性質は保証にならない。
+//       **読めないワークフローが 1 本でもあれば、その時点で落とす。**
+//       ジョブ 0 件として黙って飛ばすと、他に正しい `ci.yml` があるかぎり検査は
+//       緑のまま通り、その 1 本だけが検査から外れる (実測。fail-open)。
 //   (b) 読み取り不能 … 書式が変わってピンを読めない状態。判定の土台が崩れるので
 //       「たぶん合っている」ではなく落とす (fail-closed)。
 //   (c) 宣言のずれ … `engines.node` がピン留めした Node を許していない、
@@ -52,6 +55,9 @@
 //   同じ理由で、値が式のとき (`container: ${{ matrix.image }}` など) も中身は分からない
 //   — 実行時にしか決まらないものを静的に解決しようとすると、matrix や env の
 //   評価器を自前で持つことになり、やはり終わらない。
+//   **他リポジトリの再利用可能ワークフローを呼ぶジョブ** (`jobs.<id>.uses:
+//   `other-org/repo/.github/workflows/x.yml@ref`) も同様で、steps はこのリポジトリの
+//   外にあるため読めない (置き場の中の 1 本を呼ぶ形なら、その 1 本自体が走査対象に入る)。
 //   そこまで追うには run スクリプトの中身を解釈することになり、綴りを 1 つ塞ぐたびに
 //   次の抜け道が出てくる終わりのない作業になる (この repo が CSP の静的解析で
 //   実際に踏んだ形)。**「増やしたことに気付く」ための網であって証明ではない**、
@@ -207,32 +213,66 @@ interface WorkflowJob {
   definition: Record<string, unknown>;
 }
 
+/** 置き場のワークフローを 1 本ずつ読んだ結果 (読めたジョブと、読めなかったファイル)。 */
+interface WorkflowScan {
+  // 読めたワークフローから取り出した全ジョブ
+  jobs: WorkflowJob[];
+  // 読めなかった / 構造として解釈できなかったワークフロー (ファイル名と原因)
+  unreadable: string[];
+}
+
 /**
- * 置き場のワークフローすべてから、ジョブを 1 つずつ平らに並べる。
+ * 置き場のワークフローすべてを読み、ジョブを平らに並べる。
  *
  * **走査を 1 か所に集めるのが目的。** Node の版が入り込む口は 2 つ
  * (`setup-node` の `with` と ジョブの `container:`) あり、どちらの検査も
  * 「どのワークフローの、どのジョブを見るか」は同じでなければならない。
  * 走査を各検査に書き写すと、片方だけ対象範囲を直したときに
  * **もう片方の検出網が黙って狭くなる** (このリポジトリが繰り返し踏んでいる形)。
- * 読めない / YAML として解釈できない 1 本はジョブ 0 件として扱い、
- * 「1 つも見つからない」を呼び出し側の fail-closed な検査が落とす。
+ *
+ * **読めなかった 1 本は「ジョブ 0 件」で済ませず、名指しで返す。**
+ * 済ませてしまうと 2 通りの壊れ方をする (どちらも実測):
+ *   - 壊れた YAML … `parseYaml` がその場で例外を投げ、丁寧に書いた失敗文言が
+ *     1 つも出ないまま素の `YAMLParseError` とスタックトレースだけが残る。
+ *   - 空 / 全体コメントアウトの `.yml` … 例外は出ず jobs 0 件になるので、
+ *     **他に正しい `ci.yml` が 1 本あれば「1 つも無い」検査を通過し、
+ *     その 1 本だけが黙って検査から外れる** (= 見逃す側へ倒れる fail-open)。
+ * 読み取りと「トップレベルがオブジェクトか」の判定は、同じ理由で作られている
+ * 共有の `readParsed` に任せる (§6 DRY)。判定は呼び出し側の fail-closed な検査が行う。
  */
-function collectWorkflowJobs(): WorkflowJob[] {
+function scanWorkflows(): WorkflowScan {
+  // 読めたジョブを溜める入れ物
+  const jobs: WorkflowJob[] = [];
+  // 読めなかったワークフローを原因付きで溜める入れ物
+  const unreadable: string[] = [];
   // 置き場にあるワークフローを 1 本ずつ見る
-  return listWorkflowFiles().flatMap((file) => {
-    // ワークフローを読む (読めなければこの 1 本にはジョブが無い扱い)
-    const text = readTextOrNull(resolve(WORKFLOWS_DIR, file));
-    if (text === null) return [];
-    // YAML として解釈し、jobs 直下をジョブ名付きで平らに並べる
-    const jobs = asRecord(asRecord(parseYaml(text)).jobs);
-    return Object.entries(jobs).map(([name, definition]) => ({
-      file,
-      name,
-      definition: asRecord(definition),
-    }));
-  });
+  for (const file of listWorkflowFiles()) {
+    // 読んで YAML として解釈する (例外は投げず、原因を戻り値に載せてくれる)
+    const read = readParsed(resolve(WORKFLOWS_DIR, file), parseYaml);
+    // 読めなかった 1 本は名指しで控え、ジョブは取り出さない
+    if (read.error !== null) {
+      unreadable.push(`${file}: ${String(read.error)}`);
+      continue;
+    }
+    // jobs 直下をジョブ名付きで平らに並べる
+    for (const [name, definition] of Object.entries(asRecord(asRecord(read.value).jobs))) {
+      jobs.push({ file, name, definition: asRecord(definition) });
+    }
+  }
+  // ジョブと読めなかったファイルの両方を返す (どちらも呼び出し側が検査する)
+  return { jobs, unreadable };
 }
+
+/**
+ * `uses:` が Node 準備アクションを指しているかを判定する形。
+ *
+ * バージョン指定 (`actions/setup-node@v7` / `@<sha>`) を許しつつ、**名前はそこで終わる**
+ * ことを求める。前方一致だけにすると `actions/setup-node-foo@v1` のような別アクションまで
+ * 拾い、「`node-version-file: '.nvmrc'` を渡せ」という**直しようの無い要求**を出す
+ * (`isNodeImage` が `myorg/node-tools` を巻き込まないのと同じ理由。
+ *  無関係なものを赤くする検出網はいずれ緩められる)。
+ */
+const SETUP_NODE_USES = /^actions\/setup-node(@|$)/;
 
 /** ワークフロー 1 本の中の `actions/setup-node` ステップ 1 つ分。 */
 interface SetupNodeStep {
@@ -254,16 +294,16 @@ interface SetupNodeStep {
  *
  * 返すのは各 `actions/setup-node` ステップの `with` で、判定は呼び出し側が行う。
  */
-function collectSetupNodeSteps(): SetupNodeStep[] {
-  // 共有の走査でジョブを平らに並べ、各ジョブの steps を見る
-  return collectWorkflowJobs().flatMap((job) => {
+function collectSetupNodeSteps(jobs: readonly WorkflowJob[]): SetupNodeStep[] {
+  // 共有の走査で平らに並べたジョブを受け取り、各ジョブの steps を見る
+  return jobs.flatMap((job) => {
     // steps は配列 (そうでなければこのジョブには準備ステップが無い扱い)
     const steps = job.definition.steps;
     if (!Array.isArray(steps)) return [];
     // uses が actions/setup-node のステップに絞り、その with をファイル名付きで返す
     return steps
       .map((step) => asRecord(step))
-      .filter((step) => String(step.uses ?? "").startsWith("actions/setup-node"))
+      .filter((step) => SETUP_NODE_USES.test(String(step.uses ?? "")))
       .map((step) => ({ file: job.file, inputs: asRecord(step.with) }));
   });
 }
@@ -313,9 +353,9 @@ function isNodeImage(image: string): boolean {
  * `container:` は文字列 (`container: node:20`) でも
  * マップ (`container: { image: node:20 }`) でも書けるので、両方の書き方を読む。
  */
-function collectNodeContainerJobs(): NodeContainerJob[] {
-  // 共有の走査でジョブを平らに並べ、各ジョブの container を見る
-  return collectWorkflowJobs().flatMap((job) => {
+function collectNodeContainerJobs(jobs: readonly WorkflowJob[]): NodeContainerJob[] {
+  // 共有の走査で平らに並べたジョブを受け取り、各ジョブの container を見る
+  return jobs.flatMap((job) => {
     // container の値を取り出す (未指定ならこのジョブは対象外)
     const container = job.definition.container;
     // 文字列ならそれ自体がイメージ名、マップなら image キーがイメージ名
@@ -516,8 +556,17 @@ describe("実行する Node の major を宣言しているすべての場所の
   });
 
   it("CI が Node の版を書き写さず、.nvmrc を参照して用意している", () => {
-    // 置き場のワークフローすべてから Node 準備ステップを集める
-    const setupSteps = collectSetupNodeSteps();
+    // 置き場のワークフローを 1 度だけ読み、ジョブと「読めなかった 1 本」を受け取る
+    const workflows = scanWorkflows();
+    // **読めない 1 本を先に落とす。** ジョブ 0 件で済ませると、他に正しい ci.yml が
+    // あるかぎり以降の検査を通過し、その 1 本だけが黙って検査から外れる (fail-open)
+    expect(
+      workflows.unreadable,
+      `.github/workflows/ に読めない・構造として解釈できないワークフローがある: ${workflows.unreadable.join(" / ")}。` +
+        "そのファイルは Node の版を直書きしていても検査をすり抜けるため、前提崩れとして落としている。",
+    ).toEqual([]);
+    // 読めたジョブから Node 準備ステップを集める
+    const setupSteps = collectSetupNodeSteps(workflows.jobs);
     // 1 つも無ければ、CI が Node を用意していない (= 検証していない) ので落とす
     expect(
       setupSteps.length,
@@ -539,7 +588,7 @@ describe("実行する Node の major を宣言しているすべての場所の
     // **版が入り込むもう 1 つの口**も塞ぐ。`container: node:20` を据えたジョブは
     // setup-node を 1 本も置かずにそのイメージの Node で steps を回せるため、
     // 上の検査だけでは素通りする (実測で全件緑のまま通った)
-    const nodeContainers = collectNodeContainerJobs().map(
+    const nodeContainers = collectNodeContainerJobs(workflows.jobs).map(
       (job) => `${job.file}: ${job.job} (container: ${job.image})`,
     );
     expect(
