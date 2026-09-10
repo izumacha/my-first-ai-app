@@ -28,6 +28,11 @@
 //       `container: node:20` と書くと steps はそのイメージの Node で走るので、
 //       `actions/setup-node` を 1 つも置かずに別 major で検証できてしまう
 //       (setup-node だけを見る検査はこれを緑のまま通す。実測)。
+//       **3 つ目の口は「setup-node を書き忘れる」形。** ランナーには Node が
+//       最初から入っているため、`setup-node` の無いジョブで `npm ci && npm run test`
+//       と書くとランナー既定の major でスイートが丸ごと走る。上の 2 つを塞いでも
+//       これは緑のまま通る (実測) ので、Node のツールを起動している `run:` を持つ
+//       ジョブには `setup-node` があることまで求める。
 //       CI が入れる Node は必ず `.nvmrc` 由来にする、が守りたい 1 つの性質で、
 //       版が入り込む口を両方とも塞いでおかないとその性質は保証にならない。
 //       **読めないワークフローが 1 本でもあれば、その時点で落とす。**
@@ -58,6 +63,11 @@
 //   **他リポジトリの再利用可能ワークフローを呼ぶジョブ** (`jobs.<id>.uses:
 //   `other-org/repo/.github/workflows/x.yml@ref`) も同様で、steps はこのリポジトリの
 //   外にあるため読めない (置き場の中の 1 本を呼ぶ形なら、その 1 本自体が走査対象に入る)。
+//   **リポジトリ内の composite action** (`.github/actions/*/action.yml`) の中身も
+//   読んでいない。ただし「そこへ Node の用意を追い出す」逃げ道は 3 つ目の検査が塞ぐ —
+//   ジョブ自身に `setup-node` が無いまま `npm` を叩けば、その時点で落ちる。
+//   `.github/actions/` を走査対象に加えるのは、実際にその形が現れてからでよい
+//   (存在しない事情のために対象範囲を広げない。CLAUDE.md §6)。
 //   そこまで追うには run スクリプトの中身を解釈することになり、綴りを 1 つ塞ぐたびに
 //   次の抜け道が出てくる終わりのない作業になる (この repo が CSP の静的解析で
 //   実際に踏んだ形)。**「増やしたことに気付く」ための網であって証明ではない**、
@@ -88,6 +98,8 @@ import {
   collectIgnoreEntries,
   countUnreadableElements,
   DEPENDABOT_PATH,
+  describeReadError,
+  describeShape,
   MAJOR_UPDATE_TYPE,
   NPM_DIRECTORY,
   NPM_ECOSYSTEM,
@@ -154,6 +166,20 @@ function readTextOrNull(path: string): string | null {
     // 存在しない・読めない場合は null を返し、呼び出し側の存在確認で落とす
     return null;
   }
+}
+
+/**
+ * 値が YAML の「対応表」(キーと値の組) かどうかを判定する。
+ *
+ * `asRecord` では代わりにならない。あちらは**配列も通す** (`typeof [] === "object"`) うえ、
+ * 対応表でない値を黙って `{}` に潰すため、「中身が無い」と「そもそも形が違う」の
+ * 区別が付かない。ワークフローの `jobs` やジョブ定義がこの形でなければ
+ * steps も container も読めない = 検査から黙って外れるので、
+ * ここで見分けて呼び出し側が落とせるようにする。
+ */
+function isPlainMapping(value: unknown): value is Record<string, unknown> {
+  // オブジェクトで、null でも配列でもないものだけを対応表として扱う
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /**
@@ -249,14 +275,31 @@ function scanWorkflows(): WorkflowScan {
   for (const file of listWorkflowFiles()) {
     // 読んで YAML として解釈する (例外は投げず、原因を戻り値に載せてくれる)
     const read = readParsed(resolve(WORKFLOWS_DIR, file), parseYaml);
-    // 読めなかった 1 本は名指しで控え、ジョブは取り出さない
+    // 読めなかった 1 本は名指しで控え、ジョブは取り出さない。
+    // 絶対パスをそのまま出さないよう、共有の整形を通す (CI と手元で文言をそろえる)
     if (read.error !== null) {
-      unreadable.push(`${file}: ${String(read.error)}`);
+      unreadable.push(`${file}: ${describeReadError(read.error, REPO_ROOT)}`);
+      continue;
+    }
+    // **`jobs` が対応表になっていることまで確かめる。**
+    // `readParsed` が見るのはトップレベルだけなので、`jobs: "extra"` のような形は
+    // 例外にならず `asRecord` が `{}` に潰す = そのワークフローが黙って検査から外れる
+    // (トップレベルで塞いだのと同じ fail-open が 1 段下に残っていた。実測)
+    const jobsValue = asRecord(read.value).jobs;
+    if (!isPlainMapping(jobsValue)) {
+      unreadable.push(`${file}: jobs が対応表ではありません (${describeShape(jobsValue)})`);
       continue;
     }
     // jobs 直下をジョブ名付きで平らに並べる
-    for (const [name, definition] of Object.entries(asRecord(asRecord(read.value).jobs))) {
-      jobs.push({ file, name, definition: asRecord(definition) });
+    for (const [name, definition] of Object.entries(jobsValue)) {
+      // ジョブの中身も対応表でなければ、steps も container も読めない = 見逃す側に倒れる
+      if (!isPlainMapping(definition)) {
+        unreadable.push(
+          `${file}: ジョブ ${name} の定義が対応表ではありません (${describeShape(definition)})`,
+        );
+        continue;
+      }
+      jobs.push({ file, name, definition });
     }
   }
   // ジョブと読めなかったファイルの両方を返す (どちらも呼び出し側が検査する)
@@ -271,8 +314,13 @@ function scanWorkflows(): WorkflowScan {
  * 拾い、「`node-version-file: '.nvmrc'` を渡せ」という**直しようの無い要求**を出す
  * (`isNodeImage` が `myorg/node-tools` を巻き込まないのと同じ理由。
  *  無関係なものを赤くする検出網はいずれ緩められる)。
+ *
+ * **大文字小文字は区別しない (`i`)。** GitHub は `uses:` の owner/repo を
+ * 大文字小文字を無視して解決するので、`Actions/Setup-Node@v7` と書いた
+ * ステップは**実際に動く**。区別する判定にすると、そのステップだけが検査から外れ、
+ * `.nvmrc` と別の major で CI が回る (実測で全件緑のまま通った)。
  */
-const SETUP_NODE_USES = /^actions\/setup-node(@|$)/;
+const SETUP_NODE_USES = /^actions\/setup-node(@|$)/i;
 
 /** ワークフロー 1 本の中の `actions/setup-node` ステップ 1 つ分。 */
 interface SetupNodeStep {
@@ -308,6 +356,17 @@ function collectSetupNodeSteps(jobs: readonly WorkflowJob[]): SetupNodeStep[] {
   });
 }
 
+/**
+ * ジョブを 1 つに定めるキー (どのワークフローの、どの名前か) を作る。
+ *
+ * ジョブ名はワークフローごとに独立しているので、ファイル名と組にしないと
+ * 別ファイルの同名ジョブを取り違える。
+ */
+function jobKey(file: string, job: string): string {
+  // 「ファイル名 : ジョブ名」の形で 1 つの文字列にする
+  return `${file}:${job}`;
+}
+
 /** ワークフロー 1 本の中で、node イメージを `container:` に据えたジョブ 1 つ分。 */
 interface NodeContainerJob {
   // 失敗メッセージに出す、どのワークフローのどのジョブかを示す名前
@@ -338,6 +397,69 @@ function isNodeImage(image: string): boolean {
   const repository = lastSegment.split(":")[0];
   // 公式の node イメージだけを対象にする (node-tools 等は別物なので拾わない)
   return repository === "node";
+}
+
+/**
+ * `run:` の 1 行が Node のツールを起動しているかを判定する形。
+ *
+ * 前後に語を作る文字 (`\w` / `.` / `-` / `/`) が付いていないときだけ拾う。
+ * こうしないと `node_modules` や `./node-helper` のような**ただの文字列**まで
+ * 「Node を走らせている」と読み違え、直す先の無い要求を出すことになる。
+ */
+const NODE_TOOLING_COMMAND = /(^|[^\w./-])(nodejs|node|npm|npx|yarn|pnpm)(?![\w.-])/;
+
+/** Node のツールを走らせているのに `setup-node` を置いていないジョブ 1 つ分。 */
+interface UnpinnedNodeJob {
+  // 失敗メッセージに出す、どのワークフローかを示すファイル名
+  file: string;
+  // ジョブ名 (jobs 直下のキー)
+  job: string;
+  // 実際に見つかった `run:` の行 (どこを直せばよいか分かるように、そのまま出す)
+  command: string;
+}
+
+/**
+ * Node のツールを走らせているのに `setup-node` を置いていないジョブを集める。
+ *
+ * **版が入り込む 3 つ目の口で、しかも「書き忘れ」で到達する。**
+ * GitHub ホストのランナー (`ubuntu-latest`) には Node が最初から入っているため、
+ * `setup-node` を 1 つも置かないジョブで `npm ci && npm run test` と書くと、
+ * **ランナー既定の major** でスイートが丸ごと走る。`.nvmrc` は一切参照されない。
+ * `setup-node` の `with` と `container:` だけを見る検査はこれを**全件緑のまま通す** (実測)。
+ *
+ * 判定を「Node のツールを実際に起動している `run:` があること」に絞るのは、
+ * すべてのジョブに `setup-node` を要求すると、ラベラーのような Node と無関係な
+ * ジョブまで巻き込んで**直しようの無い要求**になるため
+ * (この repo が繰り返し避けている形)。直し方は「`setup-node` を足す」の 1 つだけになる。
+ *
+ * すでに `container:` の検査が名指ししたジョブは除く (同じジョブを 2 通りの文言で
+ * 報告すると、どちらを直せばよいのか読み手に伝わらない)。
+ */
+function collectJobsRunningNodeWithoutSetup(
+  jobs: readonly WorkflowJob[],
+  excludedJobKeys: ReadonlySet<string>,
+): UnpinnedNodeJob[] {
+  // 平らに並べたジョブを 1 つずつ見る
+  return jobs.flatMap((job) => {
+    // container: の検査が既に名指ししたジョブは、そちらの文言に任せる
+    if (excludedJobKeys.has(jobKey(job.file, job.name))) return [];
+    // steps が無いジョブ (再利用可能ワークフローの呼び出しなど) は対象外
+    const steps = job.definition.steps;
+    if (!Array.isArray(steps)) return [];
+    // 各ステップを対応表として扱う
+    const stepRecords = steps.map((step) => asRecord(step));
+    // setup-node を 1 つでも置いていれば、版の決め方は上の検査が見ている
+    if (stepRecords.some((step) => SETUP_NODE_USES.test(String(step.uses ?? "")))) return [];
+    // すべての run: を行に割り、Node のツールを起動している最初の 1 行を探す
+    const command = stepRecords
+      .flatMap((step) => String(step.run ?? "").split("\n"))
+      .map((line) => line.trim())
+      .find((line) => NODE_TOOLING_COMMAND.test(line));
+    // 1 行も無ければ Node と無関係なジョブなので対象外
+    if (command === undefined) return [];
+    // どのワークフローのどのジョブが、どの行で Node を使っているかを返す
+    return [{ file: job.file, job: job.name, command }];
+  });
 }
 
 /**
@@ -582,13 +704,15 @@ describe("実行する Node の major を宣言しているすべての場所の
       .map((step) => `${step.file}: ${JSON.stringify(step.inputs)}`);
     expect(
       misconfigured,
-      `actions/setup-node には node-version-file: '.nvmrc' だけを渡すこと。実際の指定: ${misconfigured.join(" / ")}。` +
+      `actions/setup-node の版は node-version-file: '.nvmrc' で指定し、node-version は書かないこと` +
+        `(cache などの他の入力は付けてよい)。実際の指定: ${misconfigured.join(" / ")}。` +
         "版を直書きすると .nvmrc とずれても CI は緑のまま通り、出荷する Node を検証していない状態に戻る。",
     ).toEqual([]);
-    // **版が入り込むもう 1 つの口**も塞ぐ。`container: node:20` を据えたジョブは
+    // **版が入り込む 2 つ目の口**も塞ぐ。`container: node:20` を据えたジョブは
     // setup-node を 1 本も置かずにそのイメージの Node で steps を回せるため、
     // 上の検査だけでは素通りする (実測で全件緑のまま通った)
-    const nodeContainers = collectNodeContainerJobs(workflows.jobs).map(
+    const nodeContainerJobs = collectNodeContainerJobs(workflows.jobs);
+    const nodeContainers = nodeContainerJobs.map(
       (job) => `${job.file}: ${job.job} (container: ${job.image})`,
     );
     expect(
@@ -596,6 +720,18 @@ describe("実行する Node の major を宣言しているすべての場所の
       `ジョブの container: に node イメージを据えないこと。実際の指定: ${nodeContainers.join(" / ")}。` +
         "そのイメージの Node で steps が走るので、.nvmrc と別の major で検証している状態になる。" +
         "Node は actions/setup-node に node-version-file: '.nvmrc' を渡して用意すること。",
+    ).toEqual([]);
+    // **版が入り込む 3 つ目の口**は「書き忘れ」で到達する。ランナーには Node が
+    // 最初から入っているので、setup-node を置かないジョブで npm を叩くと
+    // ランナー既定の major でスイートが丸ごと走る (上の 2 つは素通りする。実測)
+    const unpinnedJobs = collectJobsRunningNodeWithoutSetup(
+      workflows.jobs,
+      new Set(nodeContainerJobs.map((job) => jobKey(job.file, job.job))),
+    ).map((job) => `${job.file}: ${job.job} (${job.command})`);
+    expect(
+      unpinnedJobs,
+      `Node のツールを走らせるジョブには actions/setup-node を置くこと。置いていないジョブ: ${unpinnedJobs.join(" / ")}。` +
+        "ランナーに最初から入っている Node でそのまま走るため、.nvmrc とは無関係な major で検証している状態になる。",
     ).toEqual([]);
   });
 
