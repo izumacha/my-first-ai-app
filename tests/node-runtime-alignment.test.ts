@@ -100,6 +100,7 @@ import {
   DEPENDABOT_PATH,
   describeReadError,
   describeShape,
+  isPlainMapping,
   MAJOR_UPDATE_TYPE,
   NPM_DIRECTORY,
   NPM_ECOSYSTEM,
@@ -166,20 +167,6 @@ function readTextOrNull(path: string): string | null {
     // 存在しない・読めない場合は null を返し、呼び出し側の存在確認で落とす
     return null;
   }
-}
-
-/**
- * 値が YAML の「対応表」(キーと値の組) かどうかを判定する。
- *
- * `asRecord` では代わりにならない。あちらは**配列も通す** (`typeof [] === "object"`) うえ、
- * 対応表でない値を黙って `{}` に潰すため、「中身が無い」と「そもそも形が違う」の
- * 区別が付かない。ワークフローの `jobs` やジョブ定義がこの形でなければ
- * steps も container も読めない = 検査から黙って外れるので、
- * ここで見分けて呼び出し側が落とせるようにする。
- */
-function isPlainMapping(value: unknown): value is Record<string, unknown> {
-  // オブジェクトで、null でも配列でもないものだけを対応表として扱う
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /**

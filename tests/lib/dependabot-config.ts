@@ -214,6 +214,25 @@ export function describeShape(value: unknown): string {
   return typeof value;
 }
 
+/**
+ * 値が YAML / JSON の「対応表」(キーと値の組) かどうかを判定する。
+ *
+ * `asRecord` では代わりにならない。あちらは**配列も通す** (`typeof [] === "object"`) うえ、
+ * 対応表でない値を黙って `{}` に潰すため、「中身が無い」と「そもそも形が違う」の
+ * 区別が付かない。設定ファイルを構造として読む検査はどれも
+ * 「対応表でなければ、そこから先は読めない = 黙って検査から外れる」という同じ事情を
+ * 抱えているので、判定をここに 1 つだけ置く (§6 DRY)。
+ *
+ * **写しを作らないこと。** この述語は `readParsed` (ファイルのトップレベル) と
+ * ワークフロー走査 (`jobs` とその各ジョブ定義) の両方が使う。書き写すと、
+ * 片方だけ条件を直したときにもう片方の検出網が黙って緩む
+ * (このリポジトリが繰り返し踏んでいる形)。
+ */
+export function isPlainMapping(value: unknown): value is Record<string, unknown> {
+  // オブジェクトで、null でも配列でもないものだけを対応表として扱う
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 // 1 つの入力ファイルを読んだ結果 (解釈できた値と、読めなかったときの原因)
 export interface ReadResult {
   // パースできた値 (読めなければ null)
@@ -252,8 +271,9 @@ export function readParsed(path: string, parse: (text: string) => unknown): Read
   // これを素通りさせると、「構造として解釈できる」と名乗るテストが
   // 中身の無いファイルに対して緑になり、読み手に誤った安心を与える。
   // 3 つの入力はいずれもトップレベルがオブジェクトである前提なので、そうでなければ
-  // 読めなかったものとして扱う (fail-closed)
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+  // 読めなかったものとして扱う (fail-closed)。判定は共有の述語に任せる —
+  // 同じ条件をワークフロー走査側も使うので、書き写すと片方だけ緩む
+  if (!isPlainMapping(value)) {
     // 何が入っていたかを添えて原因を作る。**値そのものは埋め込まない** —
     // JSON.stringify は循環参照 (YAML のアンカーで自己参照配列が書ける。実測) で
     // 例外を投げ、しかもこの行は catch の外なので、収集時エラーになって
