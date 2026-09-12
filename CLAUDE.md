@@ -25,6 +25,7 @@ npm run test:e2e     # Playwright（chromium のみ。webServer が next build �
                      # 既存 Chromium の実行ファイルを指定する（scripts/lib/chromium-launch-options.mjs）
 node scripts/capture-demo.mjs  # デモ GIF を再生成（上流 Claude API はスタブ。要 ffmpeg。docs/screenshots/chat-demo.gif を出力）
 node scripts/capture-screenshots.mjs  # 静止画スクショ 4 枚を再生成（上流 Claude API はスタブ。ffmpeg 不要。docs/screenshots/*.png を出力）
+node scripts/verify-node-major.mjs    # いま動いている Node の major が .nvmrc と同じかを確認（CI も同じステップを実行する）
 ```
 
 ## 3. アーキテクチャ

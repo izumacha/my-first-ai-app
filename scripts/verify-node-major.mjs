@@ -11,9 +11,27 @@
 //   気付く」ための網として残し、**性質そのものの担保はこの 1 ステップが持つ**。
 import { readFileSync } from "node:fs";
 
-// `.nvmrc` を読む (リポジトリのルートから実行される前提。読めなければ下で落とす)
-const declared = readFileSync(new URL("../.nvmrc", import.meta.url), "utf8").trim();
-// `v26` のような書き方も許して、先頭の v を落とす
+// `.nvmrc` の場所 (このスクリプトからの相対で決めるので、実行時の cwd に依存しない)
+const nvmrcUrl = new URL("../.nvmrc", import.meta.url);
+
+// 読み取りの失敗 (削除・改名・権限) を素の例外にしない。
+// **例外のまま落とすと、丁寧に書いたメッセージの代わりにスタックトレースだけが残る**
+// (この repo が readParsed で避けている形)。終了コードは同じく 1 で fail-closed
+let declared;
+try {
+  // ファイルの中身を読み、前後の空白だけを落とす
+  declared = readFileSync(nvmrcUrl, "utf8").trim();
+} catch (error) {
+  // 何が起きたかを 1 行で伝える (パスは相対表記のまま出す)
+  console.error(`.nvmrc を読めない: ${error instanceof Error ? error.message : String(error)}`);
+  // 比較の土台が無いので、検証できないまま通さずに止める
+  process.exit(1);
+}
+// `v26` のような書き方も許して、先頭の v を落とす。
+// **`#` のコメントは許さない** — `.nvmrc` を実際に読む `actions/setup-node` と `nvm` が
+// 中身を trim するだけで `#` 以降を落とさないため、ここだけ寛容にすると
+// 「検査は通るのに CI の Node 準備が壊れる」食い違いになる
+// (テスト側の readNvmrcMajor も同じ規則にそろえてある)
 const wantedMajor = declared.replace(/^v/, "").split(".")[0];
 // いま動いている Node の major (`process.versions.node` は "26.1.0" の形)
 const actualMajor = process.versions.node.split(".")[0];
