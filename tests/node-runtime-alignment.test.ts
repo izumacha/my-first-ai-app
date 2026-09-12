@@ -24,10 +24,13 @@
 //   (a') CI が版を書き写す形へ戻ること … `node-version: '26'` のように直書きすると、
 //       `.nvmrc` とずれても CI は緑のまま通り、この PR 以前の状態に戻る。
 //       値の一致ではなく**配線そのもの**を固定する。
-//       **ジョブの `container:` に node イメージを置く形も同じ扱いで落とす。**
+//       **node イメージを走らせる形も同じ扱いで落とす。**
 //       `container: node:20` と書くと steps はそのイメージの Node で走るので、
 //       `actions/setup-node` を 1 つも置かずに別 major で検証できてしまう
 //       (setup-node だけを見る検査はこれを緑のまま通す。実測)。
+//       **ステップ単位の `uses: docker://node:20` も同じ口**で、こちらは
+//       3 つ目の検査でも拾えない (`uses:` が `./` で始まらないので「リポジトリの
+//       コードを実行するステップ」に数えられず、そのジョブが要求の対象から外れる。実測)。
 //       **3 つ目の口は「setup-node を書き忘れる」形。** ランナーには Node が
 //       最初から入っているため、`setup-node` の無いジョブで `npm ci && npm run test`
 //       と書くとランナー既定の major でスイートが丸ごと走る。上の 2 つを塞いでも
@@ -35,8 +38,9 @@
 //       (`run:` を持つ / ローカルの composite action を呼ぶ) には
 //       **無条件の `setup-node` がそのコードより前にある**ことまで求める。
 //       置いてあるかだけでは足りない — `run: npm ci` の後ろに置いた形と、
-//       `if:` を付けた形はどちらも実測で素通りした (前半 / 全体がランナー既定の
-//       Node で走るのに全件緑)。Node と無関係なジョブは `NODE_UNRELATED_JOBS` へ
+//       `if:` / `continue-on-error:` を付けた形はどれも実測で素通りした
+//       (前半 / 全体がランナー既定の Node で走るのに全件緑。とくに
+//        `continue-on-error: true` は setup-node が失敗してもジョブが成功で終わる)。Node と無関係なジョブは `NODE_UNRELATED_JOBS` へ
 //       理由付きで登録する (判定を `run:` の文言から当てる形は、綴りが変わるだけで
 //       黙って外れた。実測は同定数の docstring に記録した)。
 //       CI が入れる Node は必ず `.nvmrc` 由来にする、が守りたい 1 つの性質で、
@@ -59,8 +63,9 @@
 //
 // (a') が保証する範囲を正確に書いておく (この検出網は「証明」ではない):
 //   見るのは**ワークフローの YAML に構造として現れる 3 つの口**だけ —
-//   `actions/setup-node` の `with`、ジョブの `container:` イメージ、そして
-//   「リポジトリのコードを実行するのに、無条件の `setup-node` がその前に無い」形。
+//   `actions/setup-node` の `with`、node イメージを走らせる形 (ジョブの `container:` と
+//   ステップの `uses: docker://`)、そして「リポジトリのコードを実行するのに、
+//   必ず効く `setup-node` がその前に無い」形。
 //   これは「**その場に値として書かれた** Node」と「その場に**書かれていない**こと」しか
 //   見ないという意味で、逆に言えば
 //   **`run:` の中身で Node を入れ替える形は原理的に見えない**
@@ -236,6 +241,7 @@ function listWorkflowFiles(): WorkflowListing {
   try {
     // 拡張子が .yml / .yaml のものだけを対象にする (README などを YAML として解釈しない)
     const files = readdirSync(WORKFLOWS_DIR).filter((name) => /\.ya?ml$/i.test(name));
+    // 読めたので、原因は無しとして返す
     return { files, error: null };
   } catch (error) {
     // 原因を添えて返す (絶対パスを文言に混ぜないよう共有の整形を通す)
@@ -317,6 +323,7 @@ function scanWorkflows(): WorkflowScan {
         );
         continue;
       }
+      // 読めたジョブを、どのワークフローの何という名前かと一緒に控える
       jobs.push({ file, name, definition });
     }
   }
@@ -354,8 +361,9 @@ const SETUP_NODE_USES = /^actions\/setup-node(@|$)/i;
  * `setup-node` を要求しても置く場所が無い。
  */
 function stepRecordsOf(job: WorkflowJob): Record<string, unknown>[] | null {
-  // steps が配列でなければ「steps を持たないジョブ」として扱う
+  // steps の値を取り出す
   const steps = job.definition.steps;
+  // 配列でなければ「steps を持たないジョブ」として null を返す
   if (!Array.isArray(steps)) return null;
   // 各ステップを対応表として読める形にそろえる
   return steps.map((step) => asRecord(step));
@@ -365,6 +373,28 @@ function stepRecordsOf(job: WorkflowJob): Record<string, unknown>[] | null {
 function isSetupNodeStep(step: Record<string, unknown>): boolean {
   // uses を文字列として照合する (未指定なら空文字列 = 一致しない)
   return SETUP_NODE_USES.test(String(step.uses ?? ""));
+}
+
+/**
+ * その `setup-node` ステップが **必ず効く** 置き方かを判定する。
+ *
+ * 「置いてあること」だけでは足りない。**効かなくても後続が走る**書き方が 2 つあり、
+ * どちらも結果は同じ（ランナー既定の Node でスイートが走るのに CI は緑）:
+ *   - `if:` … 条件が偽なら実行されない。条件の中身は静的に決まらないので、
+ *     「無条件でない」ことをもって落とす。
+ *   - `continue-on-error:` … ステップが失敗しても**ジョブは成功で終わる**。
+ *     `.nvmrc` の版が setup-node のマニフェストにまだ無い等で失敗したとき、
+ *     以降の `npm ci` / `npm run test` はランナー既定の Node で走り、しかも緑になる
+ *     (実測: これを付けた形は検査を全件緑のまま通っていた)。
+ *     明示的な `false` だけは、効かない書き方ではないので通す。
+ */
+function isUnconditionalSetupNode(step: Record<string, unknown>): boolean {
+  // setup-node のステップでなければ対象外
+  if (!isSetupNodeStep(step)) return false;
+  // if: が付いていれば、実行されない可能性がある
+  if ("if" in step) return false;
+  // continue-on-error は「明示的に false」以外を、効かなくても進む書き方として扱う
+  return !("continue-on-error" in step) || step["continue-on-error"] === false;
 }
 
 /** ワークフロー 1 本の中の `actions/setup-node` ステップ 1 つ分。 */
@@ -414,15 +444,21 @@ function jobKey(file: string, job: string): string {
   return `${file}:${job}`;
 }
 
-/** ワークフロー 1 本の中で、node イメージを `container:` に据えたジョブ 1 つ分。 */
-interface NodeContainerJob {
+/** ワークフロー 1 本の中で、node イメージを据えている箇所 1 つ分。 */
+interface NodeImageUse {
   // 失敗メッセージに出す、どのワークフローのどのジョブかを示す名前
   file: string;
   // ジョブ名 (jobs 直下のキー)
   job: string;
   // 実際に書かれていたイメージ名 (どう直せばよいか分かるように、そのまま出す)
   image: string;
+  // どこに書かれていたか (`container:` かステップの `uses: docker://`)。
+  // 直す場所が 2 通りあるので、文言で区別できないと読み手が探し回ることになる
+  where: string;
 }
+
+/** ステップで直接コンテナイメージを走らせる書き方の接頭辞 (`uses: docker://node:20`)。 */
+const DOCKER_USES_PREFIX = "docker://";
 
 /**
  * イメージ名が Node の公式イメージを指しているかを判定する。
@@ -490,6 +526,7 @@ function runsRepositoryCode(step: Record<string, unknown>): boolean {
 function describeStep(step: Record<string, unknown>): string {
   // run: なら最初の 1 行だけを出す (複数行をそのまま出すと文言が読めなくなる)
   const run = typeof step.run === "string" ? step.run.trim().split("\n")[0] : "";
+  // run: に中身があれば、その 1 行を説明として使う
   if (run !== "") return `run: ${run}`;
   // run: が無ければローカル action の呼び出し
   return `uses: ${String(step.uses ?? "")}`;
@@ -547,13 +584,13 @@ function collectJobsMissingSetupNode(
     const firstRepoCode = steps.findIndex(runsRepositoryCode);
     // 1 つも無ければ、第三者アクションだけのジョブなので対象外
     if (firstRepoCode === -1) return [];
-    // 無条件の setup-node の位置 (if: 付きは走らない可能性があるので数えない)
-    const setupIndex = steps.findIndex((step) => isSetupNodeStep(step) && !("if" in step));
+    // 必ず効く setup-node の位置 (if: / continue-on-error 付きは数えない)
+    const setupIndex = steps.findIndex(isUnconditionalSetupNode);
     // 無条件の setup-node が 1 つも無い場合は、条件付きの有無で文言を分ける
     if (setupIndex === -1) {
-      // if: 付きの setup-node があるなら、書き忘れではなく条件が問題だと伝える
+      // setup-node 自体はあるなら、書き忘れではなく「効かない置き方」だと伝える
       const reason = steps.some(isSetupNodeStep)
-        ? "setup-node に if: が付いている (実行されなければランナー既定の Node で走る)"
+        ? "setup-node に if: / continue-on-error が付いている (効かなくても後続が走る)"
         : "setup-node が無い";
       return [{ file: job.file, job: job.name, reason }];
     }
@@ -573,30 +610,61 @@ function collectJobsMissingSetupNode(
 }
 
 /**
- * `container:` に node イメージを据えているジョブを集める。
+ * node イメージを据えている箇所を集める (ジョブの `container:` と、ステップの
+ * `uses: docker://<image>`)。
  *
  * **`actions/setup-node` を見るだけでは足りない**のがここを足した理由。
  * ジョブに `container: node:20` と書くと steps はそのイメージの中で走るため、
  * setup-node を 1 本も置かないまま `.nvmrc` と別の major で `npm ci && npm run test`
  * を回せてしまう。setup-node だけを見る検査はこれを**全件緑のまま通す** (実測)。
- * これは版が入り込む 2 つ目の口で、3 つ目 (`setup-node` の書き忘れ) と合わせて
+ * これは版が入り込む 2 つ目の口で、3 つ目 (`setup-node` の置き方) と合わせて
  * すべて塞いで初めて「CI が入れる Node はピンそのもの」が保証になる。
+ *
+ * **ステップ単位の `uses: docker://node:20` も同じ口。** そのステップだけがイメージの
+ * Node で走るので、ジョブに `container:` が無くても `.nvmrc` とは別の major で
+ * リポジトリのコードを回せる。しかも `setup-node` の置き方を見る検査では拾えない
+ * (`uses:` が `./` で始まらないため「リポジトリのコードを実行するステップ」に数えられず、
+ *  そのジョブは要求の対象から外れる)。実測でこの形は全件緑のまま通っていた。
+ * `container:` と同じく**宣言として YAML に現れる値**なので、塞げる口はここで塞ぐ。
  *
  * `container:` は文字列 (`container: node:20`) でも
  * マップ (`container: { image: node:20 }`) でも書けるので、両方の書き方を読む。
+ * node 以外のイメージは対象外 — Node の版が入り込まないので、要求する内容が無い。
  */
-function collectNodeContainerJobs(jobs: readonly WorkflowJob[]): NodeContainerJob[] {
-  // 共有の走査で平らに並べたジョブを受け取り、各ジョブの container を見る
+function collectNodeImageUses(jobs: readonly WorkflowJob[]): NodeImageUse[] {
+  // 共有の走査で平らに並べたジョブを受け取り、2 つの書き方を順に見る
   return jobs.flatMap((job) => {
-    // container の値を取り出す (未指定ならこのジョブは対象外)
+    // 見つけた箇所を溜める入れ物 (1 ジョブに container: とステップの両方がありうる)
+    const found: NodeImageUse[] = [];
+    // container の値を取り出す (未指定ならこのジョブに container は無い)
     const container = job.definition.container;
     // 文字列ならそれ自体がイメージ名、マップなら image キーがイメージ名
-    const image =
+    const containerImage =
       typeof container === "string" ? container : String(asRecord(container).image ?? "");
-    // node イメージでなければ対象外 (ubuntu 等の中で setup-node を使う形は上の検査が見る)
-    if (!isNodeImage(image)) return [];
-    // どのワークフローのどのジョブが、どのイメージを据えているかを返す
-    return [{ file: job.file, job: job.name, image }];
+    // node イメージなら控える (ubuntu 等の中で setup-node を使う形は上の検査が見る)
+    if (isNodeImage(containerImage)) {
+      found.push({ file: job.file, job: job.name, image: containerImage, where: "container:" });
+    }
+    // 各ステップの uses: docker:// も同じ扱いで見る (steps が無いジョブは空で回す)
+    for (const step of stepRecordsOf(job) ?? []) {
+      // uses を文字列として取り出す
+      const uses = String(step.uses ?? "");
+      // docker:// で始まらないステップはイメージを直接走らせていない
+      if (!uses.startsWith(DOCKER_USES_PREFIX)) continue;
+      // 接頭辞を落としてイメージ名だけにする
+      const image = uses.slice(DOCKER_USES_PREFIX.length);
+      // node イメージなら、どのステップで据えているかを控える
+      if (isNodeImage(image)) {
+        found.push({
+          file: job.file,
+          job: job.name,
+          image,
+          where: `uses: ${DOCKER_USES_PREFIX}`,
+        });
+      }
+    }
+    // このジョブで見つかった箇所をすべて返す
+    return found;
   });
 }
 
@@ -747,7 +815,10 @@ function allowsMajor(range: string, major: number): boolean {
   }
 }
 
-// 検査対象の設定ファイルは 1 度だけ読む (テストごとに読み直す必要はない)
+// 検査対象の設定ファイルは 1 度だけ読む (テストごとに読み直す必要はない)。
+// ワークフローの走査も同じ扱い — 2 つの検査が使うので、テストごとに呼ぶと
+// 置き場の YAML を全部読み直すことになる (この節の方針と食い違う)
+const workflowScan = scanWorkflows();
 const dependabotRead = readParsed(DEPENDABOT_PATH, (text) => parseYaml(text));
 const packageJsonRead = readParsed(PACKAGE_JSON_PATH, (text) => JSON.parse(text));
 const packageLockRead = readParsed(PACKAGE_LOCK_PATH, (text) => JSON.parse(text));
@@ -795,8 +866,8 @@ describe("実行する Node の major を宣言しているすべての場所の
   });
 
   it("CI が Node の版を書き写さず、.nvmrc を参照して用意している", () => {
-    // 置き場のワークフローを 1 度だけ読み、ジョブと「読めなかった 1 本」を受け取る
-    const workflows = scanWorkflows();
+    // 置き場のワークフローの走査結果 (module スコープで 1 度だけ読んだもの)
+    const workflows = workflowScan;
     // **置き場ごと読めなかった場合は、その事実を原因付きで落とす。**
     // 下の「setup-node が 1 つも無い」で落とすと、置き場の改名・削除・権限という
     // 入力側の事故が「ワークフローの書き方の問題」として報告される (§6 握り潰さない)
@@ -839,25 +910,28 @@ describe("実行する Node の major を宣言しているすべての場所の
     ).toEqual([]);
     // **版が入り込む 2 つ目の口**も塞ぐ。`container: node:20` を据えたジョブは
     // setup-node を 1 本も置かずにそのイメージの Node で steps を回せるため、
-    // 上の検査だけでは素通りする (実測で全件緑のまま通った)
-    const nodeContainerJobs = collectNodeContainerJobs(workflows.jobs);
-    const nodeContainers = nodeContainerJobs.map(
-      (job) => `${job.file}: ${job.job} (container: ${job.image})`,
+    // 上の検査だけでは素通りする (実測で全件緑のまま通った)。
+    // ステップ単位の `uses: docker://node:20` も同じ口なので一緒に見る
+    // (こちらは setup-node の置き方を見る検査でも拾えない。実測)
+    const nodeImageUses = collectNodeImageUses(workflows.jobs);
+    const nodeImages = nodeImageUses.map(
+      (use) => `${use.file}: ${use.job} (${use.where} ${use.image})`,
     );
     expect(
-      nodeContainers,
-      `ジョブの container: に node イメージを据えないこと。実際の指定: ${nodeContainers.join(" / ")}。` +
-        "そのイメージの Node で steps が走るので、.nvmrc と別の major で検証している状態になる。" +
+      nodeImages,
+      `node イメージを CI で走らせないこと (ジョブの container: / ステップの uses: docker://)。` +
+        `実際の指定: ${nodeImages.join(" / ")}。` +
+        "そのイメージの Node でステップが走るので、.nvmrc と別の major で検証している状態になる。" +
         "Node は actions/setup-node に node-version-file: '.nvmrc' を渡して用意すること。",
     ).toEqual([]);
     // **版が入り込む 3 つ目の口**は「書き忘れ」で到達する。ランナーには Node が
     // 最初から入っているので、setup-node を置かないジョブで npm を叩くと
     // ランナー既定の major でスイートが丸ごと走る (上の 2 つは素通りする。実測)。
-    // 置いてあっても「リポジトリのコードより後ろ」「if: 付き」は同じ結果になるので、
-    // 位置と条件まで見る
+    // 置いてあっても「リポジトリのコードより後ろ」「if: / continue-on-error 付き」は
+    // 同じ結果になるので、位置と効き方まで見る
     const missingSetup = collectJobsMissingSetupNode(
       workflows.jobs,
-      new Set(nodeContainerJobs.map((job) => jobKey(job.file, job.job))),
+      new Set(nodeImageUses.map((use) => jobKey(use.file, use.job))),
     ).map((job) => `${job.file}: ${job.job} (${job.reason})`);
     expect(
       missingSetup,
@@ -871,12 +945,19 @@ describe("実行する Node の major を宣言しているすべての場所の
   it("Node と無関係なジョブの除外表が、実在するジョブだけを理由付きで挙げている", () => {
     // 除外表は「検査を fail-closed にするためのエスケープハッチ」なので、
     // 表そのものが腐ると検査が黙って緩む。2 つの腐り方を落とす
-    const workflows = scanWorkflows();
+    const workflows = workflowScan;
+    // **入力側が壊れているときは「実在するか」を判定しない。**
+    // 読めなかったワークフローのジョブは `existing` に入らないので、正しい除外まで
+    // 「実在しない」と報告してしまう — その指示に従って消すと、上の検査が
+    // 本当に Node と無関係なジョブで落ち続ける。原因は姉妹の検査が名指しする
+    const inputsBroken = workflows.listError !== null || workflows.unreadable.length > 0;
     // いま実在するジョブのキー一覧
     const existing = new Set(workflows.jobs.map((job) => jobKey(job.file, job.name)));
     // **実在しないジョブの登録**を落とす。ジョブ名を変えた・消したあとも残っていると、
     // 将来その名前のジョブを足した人に黙って除外が効く (差分にも現れない)
-    const stale = Object.keys(NODE_UNRELATED_JOBS).filter((key) => !existing.has(key));
+    const stale = inputsBroken
+      ? []
+      : Object.keys(NODE_UNRELATED_JOBS).filter((key) => !existing.has(key));
     expect(
       stale,
       `NODE_UNRELATED_JOBS に実在しないジョブが登録されている: ${stale.join(" / ")}。` +
