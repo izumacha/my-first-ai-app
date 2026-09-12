@@ -291,8 +291,12 @@ function readNvmrcMajor(): number | null {
  * `actions/setup-node` / `nvm` が trim しかしないので、コメントも小数点も許さない)。
  */
 function parseNvmrcMajor(text: string): number | null {
-  // 前後の空白だけを落として、先頭の `v` 付きの数字だけを受け取る
-  const matched = text.trim().match(/^v?(\d+)$/);
+  // 前後の空白だけを落として、先頭の `v` 付きの数字だけを受け取る。
+  // **0 埋め (`026`) は受け取らない** — 実際に `.nvmrc` を読む `actions/setup-node`
+  // は `026` を解決できず「Unable to find Node version」で落ちるので、
+  // ここで通すと「2 つの読み手は一致しているのに、本物の読み手だけが落ちる」
+  // という食い違いになる (この関数がそろえようとしているのは本物の読み手の規則)
+  const matched = text.trim().match(/^v?(0|[1-9]\d*)$/);
   // 形が合わなければ読めなかった扱い (呼び出し側が fail-closed で落とす)
   return matched ? Number(matched[1]) : null;
 }
@@ -607,17 +611,6 @@ function collectSetupNodeSteps(jobs: readonly WorkflowJob[]): SetupNodeStep[] {
   });
 }
 
-/**
- * ジョブを 1 つに定めるキー (どのワークフローの、どの名前か) を作る。
- *
- * ジョブ名はワークフローごとに独立しているので、ファイル名と組にしないと
- * 別ファイルの同名ジョブを取り違える。
- */
-function jobKey(file: string, job: string): string {
-  // 「ファイル名 : ジョブ名」の形で 1 つの文字列にする
-  return `${file}:${job}`;
-}
-
 /** ワークフロー 1 本の中で、node イメージを据えている箇所 1 つ分。 */
 interface NodeImageUse {
   // 失敗メッセージに出す、どのワークフローのどのジョブかを示す名前
@@ -843,19 +836,32 @@ interface MissingSetupNodeJob {
  * 拾えなかった)。構造で見て、当てはまるジョブはすべて対象にする (fail-closed。
  * 例外の逃げ道を持たない理由は `runsRepositoryCode` の手前の注記)。
  *
- * すでにイメージ側の検査 (`uses: docker://`) が名指ししたジョブは除く
- * (同じジョブを 2 通りの文言で報告すると、どちらを直せばよいのか読み手に伝わらない)。
+ * **イメージ側の検査と重複しても、それぞれの理由で名指しする。** 以前は
+ * `uses: docker://` で名指しされたジョブを丸ごと除いていたが、その抑止が
+ * **効くのは抑止して困る場合だけ**だった: イメージだけのジョブ (`run:` も
+ * ローカル action も無い) は `firstRepoCode === -1` でどのみちここを素通りするので
+ * 抑止は要らず、逆に `docker://hadolint` と `run: npm ci` を両方持つジョブでは、
+ * hadolint の 1 行が**同じジョブの setup-node / 実行時検証 / 差し替えの指摘を
+ * まとめて伏せて**いた (CI は赤のままだが、docker の行を消すまで本当の問題が
+ * 表に出ず、巡が 1 つ増える)。これは除外表を外した理由と同じ形
+ * 「1 つの事情が、それでは正当化できない検査まで免除する」。
  */
-function collectJobsMissingSetupNode(
-  jobs: readonly WorkflowJob[],
-  excludedJobKeys: ReadonlySet<string>,
-): MissingSetupNodeJob[] {
+function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetupNodeJob[] {
+  // **ワークフローごとのジョブ索引は 1 度だけ作る。** `needs:` をたどるのに要るが、
+  // 中身はジョブごとに変わらない (ループ不変) ので、各ジョブで作り直すと
+  // ジョブ数の 2 乗の走査になる
+  const byFile = new Map<string, Map<string, Record<string, unknown>>>();
+  // 全ジョブを 1 度なめて、ファイルごとの「名前 → 定義」を組み立てる
+  for (const job of jobs) {
+    // そのファイルの索引を用意する (無ければ作る)
+    const index = byFile.get(job.file) ?? new Map<string, Record<string, unknown>>();
+    // ジョブ名で引けるようにする
+    index.set(job.name, job.definition);
+    // 作ったばかりなら入れておく
+    byFile.set(job.file, index);
+  }
   // 平らに並べたジョブを 1 つずつ見る
   return jobs.flatMap((job) => {
-    // このジョブを一意に指すキー
-    const key = jobKey(job.file, job.name);
-    // イメージ側の検査が既に名指ししたジョブは、そちらの文言に任せる
-    if (excludedJobKeys.has(key)) return [];
     // steps が無いジョブ (再利用可能ワークフローの呼び出し) は要求しても置く場所が無い
     const steps = stepRecordsOf(job);
     if (steps === null) return [];
@@ -878,9 +884,7 @@ function collectJobsMissingSetupNode(
     // **`needs:` の先から伝播してくるスキップも同じ結末を招く。**
     // 判定は skipPropagatingNeed が持つ (理由はその docstring)。
     // 同じワークフローのジョブだけを引く — ジョブ名はワークフローごとに独立している
-    const siblings = new Map(
-      jobs.filter((other) => other.file === job.file).map((other) => [other.name, other.definition]),
-    );
+    const siblings = byFile.get(job.file) ?? new Map<string, Record<string, unknown>>();
     // 伝播してくるジョブがあれば、そのジョブ名を添えて名指しする
     const skippedNeed = skipPropagatingNeed(job.definition, siblings);
     if (skippedNeed !== null) {
@@ -1341,10 +1345,9 @@ describe("実行する Node の major を宣言しているすべての場所の
     // ランナー既定の major でスイートが丸ごと走る (上の 2 つは素通りする。実測)。
     // 置いてあっても「リポジトリのコードより後ろ」「if: / continue-on-error 付き」は
     // 同じ結果になるので、位置と効き方まで見る
-    const missingSetup = collectJobsMissingSetupNode(
-      workflows.jobs,
-      new Set(imageOnlySteps.map((use) => jobKey(use.file, use.job))),
-    ).map((job) => `${job.file}: ${job.job} (${job.reason})`);
+    const missingSetup = collectJobsMissingSetupNode(workflows.jobs).map(
+      (job) => `${job.file}: ${job.job} (${job.reason})`,
+    );
     expect.soft(
       missingSetup,
       `このリポジトリのコードを実行するジョブ (run: / ローカル action の呼び出し) には、` +
@@ -1688,13 +1691,13 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
   it("collectJobsMissingSetupNode が、置き方の誤りだけを名指しする", () => {
     // 期待どおりの置き方は名指ししない
     const compliant = jobOf({ steps: compliantSteps });
-    expect(collectJobsMissingSetupNode([compliant], new Set())).toEqual([]);
+    expect(collectJobsMissingSetupNode([compliant])).toEqual([]);
     // setup-node がリポジトリのコードより後ろにある形は名指しする。
     // **件数だけでなく理由まで固定する** — 件数だけだと、どの判定が拾ったのかが
     // 分からず、「その形を名指しする」と読める一方で実際には別の理由 (この例なら
     // 実行時検証が無いこと) で落ちている、という食い違いに気付けない
     const tooLate = jobOf({ steps: [{ run: "npm ci" }, { uses: "actions/setup-node@v7" }] });
-    expect(collectJobsMissingSetupNode([tooLate], new Set())).toEqual([
+    expect(collectJobsMissingSetupNode([tooLate])).toEqual([
       { file: "synthetic.yml", job: "job", reason: `${RUNTIME_VERIFIER} を実行していない` },
     ]);
     // setup-node を前に出しても、実行時検証がリポジトリのコードより後ろなら名指しする
@@ -1705,7 +1708,7 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
         { run: "node scripts/verify-node-major.mjs" },
       ],
     });
-    expect(collectJobsMissingSetupNode([setupBeforeButVerifierLate], new Set())).toEqual([
+    expect(collectJobsMissingSetupNode([setupBeforeButVerifierLate])).toEqual([
       {
         file: "synthetic.yml",
         job: "job",
@@ -1714,22 +1717,22 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
     ]);
     // setup-node が無い形も名指しする
     const missing = jobOf({ steps: [{ run: "npm ci" }] });
-    expect(collectJobsMissingSetupNode([missing], new Set())).toHaveLength(1);
+    expect(collectJobsMissingSetupNode([missing])).toHaveLength(1);
     // 第三者アクションだけのジョブは対象外 (誤検知を出さない)
     const actionsOnly = jobOf({ steps: [{ uses: "actions/labeler@v5" }] });
-    expect(collectJobsMissingSetupNode([actionsOnly], new Set())).toEqual([]);
+    expect(collectJobsMissingSetupNode([actionsOnly])).toEqual([]);
     // steps を持たないジョブ (再利用可能ワークフローの呼び出し) も対象外
     const reusable = jobOf({ uses: "other-org/repo/.github/workflows/x.yml@v1" });
-    expect(collectJobsMissingSetupNode([reusable], new Set())).toEqual([]);
+    expect(collectJobsMissingSetupNode([reusable])).toEqual([]);
     // ジョブ単位の continue-on-error は、失敗しても CI が緑になるので名指しする
     const jobContinues = jobOf({ "continue-on-error": true, steps: compliantSteps });
-    expect(collectJobsMissingSetupNode([jobContinues], new Set())).toHaveLength(1);
+    expect(collectJobsMissingSetupNode([jobContinues])).toHaveLength(1);
     // 明示的な false は「効かなくても進む書き方」ではないので通す
     const jobStops = jobOf({ "continue-on-error": false, steps: compliantSteps });
-    expect(collectJobsMissingSetupNode([jobStops], new Set())).toEqual([]);
+    expect(collectJobsMissingSetupNode([jobStops])).toEqual([]);
     // **ジョブ単位の if: も同じ結末**（スキップされてもワークフローは成功で報告される）
     const jobConditional = jobOf({ if: "github.event_name == 'push'", steps: compliantSteps });
-    expect(collectJobsMissingSetupNode([jobConditional], new Set())).toHaveLength(1);
+    expect(collectJobsMissingSetupNode([jobConditional])).toHaveLength(1);
     // 実行時検証を置いていないジョブも名指しする (宣言として見えない形を何も検証していない)
     const noVerifier = jobOf({
       steps: [
@@ -1737,7 +1740,7 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
         { run: "npm ci" },
       ],
     });
-    expect(collectJobsMissingSetupNode([noVerifier], new Set())).toHaveLength(1);
+    expect(collectJobsMissingSetupNode([noVerifier])).toHaveLength(1);
     // **実行時検証より後ろで Node を差し替えうる uses: は名指しする。**
     // 検証はもう終わっているので実行時には見えず、ここで落とさないと
     // lint / test / e2e が別の Node で走ったまま CI が緑になる (実測)
@@ -1749,7 +1752,7 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
         { run: "npm ci && npm run test" },
       ],
     });
-    expect(collectJobsMissingSetupNode([swappedAfterVerifier], new Set())).toEqual([
+    expect(collectJobsMissingSetupNode([swappedAfterVerifier])).toEqual([
       {
         file: "synthetic.yml",
         job: "job",
@@ -1765,7 +1768,7 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
     const uploadAfterSuite = jobOf({
       steps: [...compliantSteps, { uses: "actions/upload-artifact@v4" }],
     });
-    expect(collectJobsMissingSetupNode([uploadAfterSuite], new Set())).toEqual([]);
+    expect(collectJobsMissingSetupNode([uploadAfterSuite])).toEqual([]);
     // **検証より前に `run:` を置いた形**は「リポジトリのコードより後ろ」として名指しする。
     // 逃げ道 (除外表) は持たないので、この形が要るジョブが現れたらこの検査自体を
     // 直す差分になる — 除外表を置いていた頃は、その鍵が別の検査まで一緒に外していた
@@ -1777,7 +1780,7 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
         { run: "npm ci" },
       ],
     });
-    expect(collectJobsMissingSetupNode([setupBeforeVerifier], new Set())).toEqual([
+    expect(collectJobsMissingSetupNode([setupBeforeVerifier])).toEqual([
       {
         file: "synthetic.yml",
         job: "job",
@@ -1795,7 +1798,7 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
         { uses: "./.github/actions/run-suite" },
       ],
     });
-    expect(collectJobsMissingSetupNode([localActionRunsSuite], new Set())).toEqual([
+    expect(collectJobsMissingSetupNode([localActionRunsSuite])).toEqual([
       {
         file: "synthetic.yml",
         job: "job",
@@ -1816,7 +1819,7 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
       name: "suite",
       definition: { needs: "gate", steps: compliantSteps },
     };
-    expect(collectJobsMissingSetupNode([gate, gated], new Set())).toEqual([
+    expect(collectJobsMissingSetupNode([gate, gated])).toEqual([
       {
         file: "synthetic.yml",
         job: "suite",
@@ -1831,7 +1834,7 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
       name: "suite",
       definition: { needs: ["mid"], steps: compliantSteps },
     };
-    expect(collectJobsMissingSetupNode([gate, mid, chained], new Set())).toHaveLength(1);
+    expect(collectJobsMissingSetupNode([gate, mid, chained])).toHaveLength(1);
     // 条件の無いジョブへの needs: は伝播しないので通す (誤検知を出さない)
     const plain = { file: "synthetic.yml", name: "build", definition: { steps: compliantSteps } };
     const dependsOnPlain = {
@@ -1839,10 +1842,10 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
       name: "suite",
       definition: { needs: "build", steps: compliantSteps },
     };
-    expect(collectJobsMissingSetupNode([plain, dependsOnPlain], new Set())).toEqual([]);
+    expect(collectJobsMissingSetupNode([plain, dependsOnPlain])).toEqual([]);
     // 別のワークフローに同名のジョブがあっても取り違えない
     const otherFileGate = { file: "other.yml", name: "gate", definition: { if: "${{ false }}" } };
-    expect(collectJobsMissingSetupNode([otherFileGate, dependsOnPlain, plain], new Set())).toEqual(
+    expect(collectJobsMissingSetupNode([otherFileGate, dependsOnPlain, plain])).toEqual(
       [],
     );
     // **ステップの `env: PATH:` も差し替えとして名指しする。** `uses:` と同じく
@@ -1856,7 +1859,7 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
         { run: "npm ci && npm run test", env: { PATH: "/opt/node20/bin:/usr/bin:/bin" } },
       ],
     });
-    expect(collectJobsMissingSetupNode([pathEnvAfterVerifier], new Set())).toEqual([
+    expect(collectJobsMissingSetupNode([pathEnvAfterVerifier])).toEqual([
       {
         file: "synthetic.yml",
         job: "job",
@@ -1875,7 +1878,7 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
         { run: "npm ci", env: { CI: "true" } },
       ],
     });
-    expect(collectJobsMissingSetupNode([otherEnv], new Set())).toEqual([]);
+    expect(collectJobsMissingSetupNode([otherEnv])).toEqual([]);
     // 実行時検証が setup-node より前だと、ランナー既定の Node を見る空振りになる
     const verifierTooEarly = jobOf({
       steps: [
@@ -1884,7 +1887,7 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
         { run: "npm ci" },
       ],
     });
-    expect(collectJobsMissingSetupNode([verifierTooEarly], new Set())).toHaveLength(1);
+    expect(collectJobsMissingSetupNode([verifierTooEarly])).toHaveLength(1);
     // パスに触れているだけの run: は「実行している」と認めない
     const mentionsOnly = jobOf({
       steps: [
@@ -1893,10 +1896,7 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
         { run: "npm ci" },
       ],
     });
-    expect(collectJobsMissingSetupNode([mentionsOnly], new Set())).toHaveLength(1);
-    // イメージ側の検査が名指ししたジョブは、そちらの文言に任せる (重複させない)
-    const excluded = new Set([jobKey("synthetic.yml", "job")]);
-    expect(collectJobsMissingSetupNode([missing], excluded)).toEqual([]);
+    expect(collectJobsMissingSetupNode([mentionsOnly])).toHaveLength(1);
   });
 
   it("collectImageOnlySteps が、docker:// のステップだけをイメージ名を問わず拾う", () => {
@@ -1940,14 +1940,15 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
       { file: "synthetic.yml", job: "job", location: "docker://hadolint/hadolint:latest" },
     ]);
     // setup-node 側も、重複除けを渡さなければ同じジョブを名指しする
-    expect(collectJobsMissingSetupNode([mixed], new Set())).toEqual([
+    expect(collectJobsMissingSetupNode([mixed])).toEqual([
       { file: "synthetic.yml", job: "job", reason: "setup-node が無い" },
     ]);
-    // **イメージ側が名指ししたジョブは、重複除けを渡せば setup-node 側が譲る。**
-    // 同じジョブを 2 通りの文言で報告すると、どちらを直せばよいか読み手に伝わらない
-    expect(collectJobsMissingSetupNode([mixed], new Set([jobKey("synthetic.yml", "job")]))).toEqual(
-      [],
-    );
+    // **イメージだけのジョブは、setup-node 側が二重に名指しすることはない。**
+    // `run:` もローカル action も無いので `firstRepoCode === -1` で素通りする —
+    // 重複除けを持たなくても二重報告にならないのはこのため
+    const imageOnly = jobOf({ steps: [{ uses: "docker://node:20" }] });
+    expect(collectImageOnlySteps([imageOnly])).toHaveLength(1);
+    expect(collectJobsMissingSetupNode([imageOnly])).toEqual([]);
   });
 
   it("describeInputs が、循環参照を含む with: でも例外を投げない", () => {
@@ -2112,7 +2113,9 @@ describe("実行時検証スクリプトそのものの挙動", () => {
       "lts/iron",
       "v",
       `${runningMajor}abc`,
-      // **0 埋め**。両方とも「読める」と答えるのに、値の解釈が割れていた形 (実測)
+      // **0 埋め**。以前は両方とも「読める」と答えるのに値の解釈が割れていた (実測)。
+      // いまは両方とも受け取らない — 本物の読み手 (`actions/setup-node`) が
+      // `026` を解決できないため、そこにそろえてある
       `0${runningMajor}`,
     ];
     // 1 つずつ、両方の読み手に同じ文字列を食わせる
