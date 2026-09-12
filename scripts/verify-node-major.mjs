@@ -55,6 +55,8 @@ function fail(message) {
   let written = 0;
   // 書き出すバイト列 (同上)
   let payload = Buffer.alloc(0);
+  // 書き込みが投げた例外 (退避の文言へ errno を添えるために控える)
+  let writeError;
   try {
     // **書けた分を数えて、全部書けるまで繰り返す。** stderr がノンブロッキングな
     // パイプ (CI のログ収集がこの形) でバッファに空きが足りないと、write(2) は
@@ -74,8 +76,13 @@ function fail(message) {
       // 書けた分だけ位置を進める
       written += wrote;
     }
-  } catch {
-    // 例外で抜けた場合も、下の共通の退避で残りを出す (握り潰さない)
+  } catch (error) {
+    // **原因を捨てない (§6 エラーを握り潰さない)。** EAGAIN (バッファ満杯) と
+    // EPIPE (stderr が閉じられている) では読み手の打つ手がまったく違うのに、
+    // 空の catch にすると**なぜ診断が欠けたのかを示す唯一の手掛かりが消える** —
+    // この関数が避けようとしている「終了コード 1 だが理由が分からない」状態そのもの。
+    // 退避の文言へ errno を添えるため、ここでは控えるだけにする
+    writeError = error;
   }
   // **ループを抜ける経路は 2 つあり、どちらも残りを取りこぼしうる** — 例外 (EAGAIN) と、
   // 0 バイトしか書けずに諦めた場合。後者だけ退避が無いと、**文言が丸ごと出ないまま
@@ -91,7 +98,9 @@ function fail(message) {
     // この関数がまさに避けようとしている「読めない診断」を自分で作ることになる。
     // console.error は非同期なので届かないことはありうるが、握り潰すよりは
     // 残る見込みがある (§6 エラーを握り潰さない)
-    console.error(payload.subarray(written).toString("utf8").trimEnd());
+    // 原因が分かっていれば errno を添える (EAGAIN と EPIPE で打つ手が違うため)
+    const cause = writeError?.code !== undefined ? ` [stderr: ${writeError.code}]` : "";
+    console.error(payload.subarray(written).toString("utf8").trimEnd() + cause);
   }
   // 比較の土台が無い / 食い違っている状態で通さない
   process.exit(1);

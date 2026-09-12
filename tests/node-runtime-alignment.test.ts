@@ -858,6 +858,38 @@ function skipPropagatingNeed(
   return null;
 }
 
+/**
+ * そのジョブが**そもそも走らない / 失敗しても緑になる**形かを調べ、理由を返す (無ければ null)。
+ *
+ * 3 つの形が同じ結末を招く。どれも lint / typecheck / test / e2e が 1 つも動かない、
+ * あるいは失敗しても CI が緑になる (いずれも実測で素通りした):
+ *   - ジョブの `if:` … 条件が偽ならスキップされ、ワークフローは成功を報告する。
+ *   - ジョブの `continue-on-error` … 失敗しても成功として扱われる。
+ *   - `needs:` の先が `if:` … スキップは依存先へ**連鎖**する (skipPropagatingNeed)。
+ *
+ * 条件の中身は静的に決まらないので、ステップ側と同じく「無条件でないこと」で落とす。
+ */
+function jobNeverRunsReason(
+  definition: Record<string, unknown>,
+  siblings: ReadonlyMap<string, Record<string, unknown>>,
+): string | null {
+  // ジョブ自身に条件が付いているか
+  if (!isUnconditionalStep(definition)) {
+    // どちらが付いているかを文言で分ける (直す先が違うため)
+    return "if" in definition
+      ? "ジョブに if: が付いている (スキップされても CI は緑になる)"
+      : "ジョブに continue-on-error が付いている (失敗しても CI は緑になる)";
+  }
+  // needs: の先から伝播してくるスキップを探す
+  const skippedNeed = skipPropagatingNeed(definition, siblings);
+  // 見つかればそのジョブ名を添えて理由にする
+  if (skippedNeed !== null) {
+    return `needs: の先に if: 付きのジョブ (${skippedNeed}) がある (そのジョブがスキップされると、このジョブも走らないまま CI は緑になる)`;
+  }
+  // どれにも当てはまらない
+  return null;
+}
+
 /** `setup-node` の置き方が足りていないジョブ 1 つ分。 */
 interface MissingSetupNodeJob {
   // 失敗メッセージに出す、どのワークフローかを示すファイル名
@@ -915,40 +947,30 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
   }
   // 平らに並べたジョブを 1 つずつ見る
   return jobs.flatMap((job) => {
-    // steps が無いジョブ (再利用可能ワークフローの呼び出し) は要求しても置く場所が無い
+    // 同じワークフローのジョブだけを引く — ジョブ名はワークフローごとに独立している
+    const siblings = byFile.get(job.file) ?? new Map<string, Record<string, unknown>>();
+    // 「そもそも走らない」形の理由 (無ければ null)
+    const neverRuns = jobNeverRunsReason(job.definition, siblings);
+    // steps を持つか (持たないのは再利用可能ワークフローの呼び出し)
     const steps = stepRecordsOf(job);
-    if (steps === null) return [];
+    // **steps を持たないジョブでも、ローカルの再利用可能ワークフローを呼ぶなら
+    // 「そもそも走らない」形は見る。** 呼ばれる側のジョブはこの走査に含まれるので
+    // 置き方は別に検査されるが、**呼び出し側が gate されるとその全部が走らないまま
+    // CI は緑**になる (`needs:` で塞いだのとまったく同じ結末に、別のキーで届く)。
+    // 第三者の再利用可能ワークフロー (`other-org/...`) は走査対象外なので、
+    // 条件を付けるなと求める筋が無く、対象にしない
+    if (steps === null) {
+      // ローカルの呼び出しでなければ対象外
+      if (!usesOf(job.definition).startsWith("./")) return [];
+      // gate されていればそれを名指しし、そうでなければ置き方は呼ばれる側で見る
+      return neverRuns === null ? [] : [{ file: job.file, job: job.name, reason: neverRuns }];
+    }
     // このリポジトリのコードを最初に実行するステップの位置
     const firstRepoCode = steps.findIndex(runsRepositoryCode);
     // 1 つも無ければ、第三者アクションだけのジョブなので対象外
     if (firstRepoCode === -1) return [];
-    // **ジョブ単位の `if:` / `continue-on-error` も同じ結末を招く。** どちらも
-    // 「ジョブが走らない・失敗してもワークフローは成功」になるため、lint / typecheck /
-    // test / e2e が 1 つも動かないまま CI が緑になる (どちらも実測で素通りした)。
-    // 条件の中身は静的に決まらないので、ステップ側と同じく「無条件でないこと」で落とす。
-    if (!isUnconditionalStep(job.definition)) {
-      // どちらが付いているかを文言で分ける (直す先が違うため)
-      const reason =
-        "if" in job.definition
-          ? "ジョブに if: が付いている (スキップされても CI は緑になる)"
-          : "ジョブに continue-on-error が付いている (失敗しても CI は緑になる)";
-      return [{ file: job.file, job: job.name, reason }];
-    }
-    // **`needs:` の先から伝播してくるスキップも同じ結末を招く。**
-    // 判定は skipPropagatingNeed が持つ (理由はその docstring)。
-    // 同じワークフローのジョブだけを引く — ジョブ名はワークフローごとに独立している
-    const siblings = byFile.get(job.file) ?? new Map<string, Record<string, unknown>>();
-    // 伝播してくるジョブがあれば、そのジョブ名を添えて名指しする
-    const skippedNeed = skipPropagatingNeed(job.definition, siblings);
-    if (skippedNeed !== null) {
-      return [
-        {
-          file: job.file,
-          job: job.name,
-          reason: `needs: の先に if: 付きのジョブ (${skippedNeed}) がある (そのジョブがスキップされると、このジョブも走らないまま CI は緑になる)`,
-        },
-      ];
-    }
+    // 走らない形なら、置き方を見る前にそれを名指しする
+    if (neverRuns !== null) return [{ file: job.file, job: job.name, reason: neverRuns }];
     // **ジョブ / ワークフロー単位の `env: PATH:` は、そのジョブの全ステップに効く。**
     // ステップ単位のものと同じく**宣言として YAML に現れる**のに読まないと、
     // ジョブ単位で `/opt/node20/bin` を先頭に置き、実行時検証のステップだけ
@@ -1142,6 +1164,18 @@ function readDockerfileNodeMajor(): number | null {
   // Dockerfile を読む (読めなければ null)
   const text = readTextOrNull(DOCKERFILE_PATH);
   if (text === null) return null;
+  // 中身の解釈は純粋関数へ (合成した Dockerfile で挙動を固定できるようにするため。
+  // ファイル入出力と混ぜたままだと、読めない段の扱いを変える変異が拾えない)
+  return nodeMajorOfDockerfileText(text);
+}
+
+/**
+ * Dockerfile の**中身**から node イメージの major を読み取る (ファイル入出力を伴わない)。
+ *
+ * 揃っていない / 読めない段があれば null を返し、呼び出し側が fail-closed で落とす。
+ * 規則そのものの根拠は `readDockerfileNodeMajor` の docstring を参照。
+ */
+function nodeMajorOfDockerfileText(text: string): number | null {
   // コメントを落としたうえで、すべての `FROM node:<major>` を集める
   const majors = new Set<number>();
   for (const line of stripComments(text)) {
@@ -1156,6 +1190,13 @@ function readDockerfileNodeMajor(): number | null {
       .find((word) => !word.startsWith("--"));
     // イメージ名が無い行 (壊れた FROM) は対象外
     if (image === undefined) continue;
+    // **変数で書いた段は「読めない段」として落とす。** `ARG BASE=node:20-alpine` +
+    // `FROM $BASE AS tools` は、名前が `node` と一致しないので「別イメージの段」に
+    // 見えて黙って飛ばされていた — 残りの段だけで「揃っている」ことになり、
+    // **まさに検出したい多段ビルドのドリフトが素通りする** (下の `node:lts-alpine` /
+    // ダイジェスト指定を fail-closed にしているのと同じ事情。同じ class の
+    // 「読めなさ」を、綴りが `node` で始まるかどうかで 2 通りに扱わない)
+    if (image.includes("$")) return null;
     // 公式の node イメージでなければ対象外 (ビルドに使う別イメージの段は見ない)
     if (!isNodeImage(image)) continue;
     // タグから major を取り出す。**最後のパス要素だけを見る** —
@@ -1803,9 +1844,28 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
     // 第三者アクションだけのジョブは対象外 (誤検知を出さない)
     const actionsOnly = jobOf({ steps: [{ uses: "actions/labeler@v5" }] });
     expect(collectJobsMissingSetupNode([actionsOnly])).toEqual([]);
-    // steps を持たないジョブ (再利用可能ワークフローの呼び出し) も対象外
+    // steps を持たないジョブ (第三者の再利用可能ワークフローの呼び出し) も対象外 —
+    // 呼ばれる側はこの走査に含まれないので、条件を付けるなと求める筋が無い
     const reusable = jobOf({ uses: "other-org/repo/.github/workflows/x.yml@v1" });
     expect(collectJobsMissingSetupNode([reusable])).toEqual([]);
+    // **ローカルの再利用可能ワークフローを gate 付きで呼ぶ形は名指しする。**
+    // 呼ばれる側のジョブは別に検査されるが、呼び出し側がスキップされると
+    // その全部が走らないまま CI は緑になる (`needs:` で塞いだのと同じ結末)
+    const gatedLocalCall = jobOf({
+      if: "${{ false }}",
+      uses: "./.github/workflows/suite.yml",
+    });
+    expect(collectJobsMissingSetupNode([gatedLocalCall])).toEqual([
+      {
+        file: "synthetic.yml",
+        job: "job",
+        reason: "ジョブに if: が付いている (スキップされても CI は緑になる)",
+      },
+    ]);
+    // 条件の無いローカル呼び出しは通す (置き方は呼ばれる側で見る)
+    expect(
+      collectJobsMissingSetupNode([jobOf({ uses: "./.github/workflows/suite.yml" })]),
+    ).toEqual([]);
     // ジョブ単位の continue-on-error は、失敗しても CI が緑になるので名指しする
     const jobContinues = jobOf({ "continue-on-error": true, steps: compliantSteps });
     expect(collectJobsMissingSetupNode([jobContinues])).toHaveLength(1);
@@ -2084,6 +2144,20 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
       steps: [{ uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } }],
     });
     expect(collectSetupNodeSteps([plain])[0]?.inputs).toEqual({ "node-version-file": ".nvmrc" });
+  });
+
+  it("readDockerfileNodeMajor が、変数で書いた FROM を読めない段として落とす", () => {
+    // 実在の Dockerfile は読める (誤検知を出さない)
+    expect(readDockerfileNodeMajor()).not.toBeNull();
+    // **変数の段は「別イメージ」ではなく「読めない段」**。黙って飛ばすと、
+    // 残りの段だけで揃っていることになり多段ビルドのドリフトを見逃す
+    expect(nodeMajorOfDockerfileText("FROM node:26-alpine\nFROM $BASE AS tools\n")).toBeNull();
+    // 変数を使わない多段ビルドは、揃っていれば読める
+    expect(nodeMajorOfDockerfileText("FROM node:26-alpine\nFROM node:26 AS tools\n")).toBe(26);
+    // 段ごとに major が違えば読めない扱い (揃っていないことを呼び出し側が落とす)
+    expect(nodeMajorOfDockerfileText("FROM node:26-alpine\nFROM node:20 AS tools\n")).toBeNull();
+    // Node と無関係な段は飛ばす (誤検知を出さない)
+    expect(nodeMajorOfDockerfileText("FROM golang:1.22 AS build\nFROM node:26-alpine\n")).toBe(26);
   });
 
   it("jobsOfWorkflow が、ワークフロー全体の env: をジョブへ運ぶ", () => {
