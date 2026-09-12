@@ -91,7 +91,12 @@
 //   そこまで追うには run スクリプトの中身を解釈することになり、綴りを 1 つ塞ぐたびに
 //   次の抜け道が出てくる終わりのない作業になる (この repo が CSP の静的解析で
 //   実際に踏んだ形)。**「増やしたことに気付く」ための網であって証明ではない**、
-//   と理解して使うこと。ここを広げたくなったら、まず実際にその形が現れてから、
+//   と理解して使うこと。
+//   **判定そのものの挙動は、このファイル末尾のテーブル駆動テストが固定する。**
+//   実際の `ci.yml` が準拠しているだけでは、判定を潰しても (`isUnconditionalSetupNode`
+//   を `return true` にする等) 全件緑のまま通ってしまい、「塞いだ」証拠が
+//   コミットメッセージにしか残らない (実測)。落とす側と通す側の両方を合成した
+//   ジョブ・ステップで固定してある。ここを広げたくなったら、まず実際にその形が現れてから、
 //   正当なワークフローを巻き添えにしない判定を決めて足すこと。
 //
 // Node を上げるときの手順 (この検査が要求する形):
@@ -486,13 +491,11 @@ function collectSetupNodeSteps(jobs: readonly WorkflowJob[]): SetupNodeStep[] {
     const steps = stepRecordsOf(job);
     if (steps === null) return [];
     // setup-node のステップに絞り、その with をファイル名・ジョブ名付きで返す
-    return steps
-      .filter(isSetupNodeStep)
-      .map((step) => ({
-        file: job.file,
-        job: job.name,
-        inputs: asRecord(step.with),
-      }));
+    return steps.filter(isSetupNodeStep).map((step) => ({
+      file: job.file,
+      job: job.name,
+      inputs: asRecord(step.with),
+    }));
   });
 }
 
@@ -1002,11 +1005,18 @@ describe("実行する Node の major を宣言しているすべての場所の
     ).toEqual([]);
     // 読めたジョブから Node 準備ステップを集める
     const setupSteps = collectSetupNodeSteps(workflows.jobs);
-    // 1 つも無ければ、CI が Node を用意していない (= 検証していない) ので落とす
-    expect(
-      setupSteps.length,
-      ".github/workflows/ に actions/setup-node のステップが見つからない。CI が Node を用意していないか、読み取り側が書式の変更に追随できていない。",
-    ).toBeGreaterThan(0);
+    // 1 つも無ければ、CI が Node を用意していない (= 検証していない) ので落とす。
+    // **soft にする。** hard だとここで中断するので、`container: node:20` に置き換えて
+    // setup-node を消した形 (まさに 2 つ目の口が名指ししたい形) で、読み手には
+    // 「検出網が書式変更に追随できていない」という別の疑いだけが表示される (実測)。
+    // CI が本当に Node を使わなくなった場合は、この検査ごと見直す対象になる
+    // (除外表で黙らせる類のものではない)
+    expect
+      .soft(
+        setupSteps.length,
+        ".github/workflows/ に actions/setup-node のステップが見つからない。CI が Node を用意していないか、読み取り側が書式の変更に追随できていない。",
+      )
+      .toBeGreaterThan(0);
     // すべてのステップが `.nvmrc` を参照していることを確かめる。
     // **`node-version` を書いた形は、値が合っていても許さない** — 合っているかどうかは
     // その瞬間の話で、片方だけ書き換えれば静かにずれる (版を書き写せる構造そのものを断つ)。
@@ -1017,7 +1027,7 @@ describe("実行する Node の major を宣言しているすべての場所の
     const misconfigured = setupSteps
       .filter(
         (step) =>
-          step.inputs["node-version-file"] !== ".nvmrc" ||
+          step.inputs["node-version-file"] !== displayPath(NVMRC_PATH) ||
           "node-version" in step.inputs,
       )
       .map(
@@ -1030,9 +1040,10 @@ describe("実行する Node の major を宣言しているすべての場所の
     expect
       .soft(
         misconfigured,
-        `actions/setup-node の版は node-version-file: '.nvmrc' で指定し、node-version は書かないこと` +
+        `actions/setup-node の版は node-version-file: '${displayPath(NVMRC_PATH)}' で指定し、` +
+          `node-version は書かないこと` +
           `(cache などの他の入力は付けてよい)。実際の指定: ${misconfigured.join(" / ")}。` +
-          "版を直書きすると .nvmrc とずれても CI は緑のまま通り、出荷する Node を検証していない状態に戻る。",
+          `版を直書きすると ${displayPath(NVMRC_PATH)} とずれても CI は緑のまま通り、出荷する Node を検証していない状態に戻る。`,
       )
       .toEqual([]);
     // **版が入り込む 2 つ目の口**も塞ぐ。`container: node:20` を据えたジョブは
@@ -1050,7 +1061,7 @@ describe("実行する Node の major を宣言しているすべての場所の
         `node イメージを CI で走らせないこと (ジョブの container: / ステップの uses: docker://)。` +
           `実際の指定: ${nodeImages.join(" / ")}。` +
           "そのイメージの Node でステップが走るので、.nvmrc と別の major で検証している状態になる。" +
-          "Node は actions/setup-node に node-version-file: '.nvmrc' を渡して用意すること。",
+          `Node は actions/setup-node に node-version-file: '${displayPath(NVMRC_PATH)}' を渡して用意すること。`,
       )
       .toEqual([]);
     // **版が入り込む 3 つ目の口**は「書き忘れ」で到達する。ランナーには Node が
@@ -1340,5 +1351,209 @@ describe("実行する Node の major を宣言しているすべての場所の
       baseImageIgnoreEntries[0]?.["update-types"],
       "update-types が major 限定でなくなっている。空にすると全バージョンが無視される。",
     ).toEqual([MAJOR_UPDATE_TYPE]);
+  });
+});
+
+// この検出網は「実際の ci.yml が準拠している」ことしか確かめておらず、**判定そのものは
+// どのテストも通っていなかった**。実測では `isUnconditionalSetupNode` の中身を
+// `return true` に潰しても全件緑で、`isNodeImage` / `runsRepositoryCode` /
+// `describeStepsProblem` / `SETUP_NODE_USES` の `i` も同じ。つまり「塞いだ」実測の証拠が
+// コミットメッセージにしか無く、後の整理で口が静かに開いても CI は何も言わない
+// (helpdesk-hub の Stripe ガードが「実行時チェックそのものの挙動」を固定している理由と
+//  同じ形)。そこで合成したジョブ・ステップを直接渡し、**落とす側と通す側の両方**を固定する。
+describe("CI の配線を見る検出網そのものの挙動", () => {
+  // 合成したステップから、判定に渡せるジョブを組み立てる小さなヘルパー
+  const jobOf = (definition: Record<string, unknown>): WorkflowJob => ({
+    // 失敗文言に出るファイル名 (実在しなくてよい。判定は値だけを見る)
+    file: "synthetic.yml",
+    // ジョブ名
+    name: "job",
+    // 判定対象の中身
+    definition,
+  });
+
+  it.each([
+    // 素の setup-node は「必ず効く」
+    {
+      step: { uses: "actions/setup-node@v7" },
+      expected: true,
+      label: "素の setup-node",
+    },
+    // GitHub は uses: の大文字小文字を無視して解決するので、この形も実際に動く
+    {
+      step: { uses: "Actions/Setup-Node@v7" },
+      expected: true,
+      label: "大文字違い",
+    },
+    // if: が付くと実行されない可能性がある
+    {
+      step: { uses: "actions/setup-node@v7", if: "${{ false }}" },
+      expected: false,
+      label: "if: 付き",
+    },
+    // continue-on-error は失敗しても後続が走る = 効かなくても緑になる
+    {
+      step: { uses: "actions/setup-node@v7", "continue-on-error": true },
+      expected: false,
+      label: "continue-on-error: true",
+    },
+    // 明示的な false は「効かない書き方」ではないので通す
+    {
+      step: { uses: "actions/setup-node@v7", "continue-on-error": false },
+      expected: true,
+      label: "continue-on-error: false",
+    },
+    // 名前が前方一致するだけの別アクションは対象外 (直しようの無い要求を出さない)
+    {
+      step: { uses: "actions/setup-node-foo@v1" },
+      expected: false,
+      label: "別アクション",
+    },
+    // run: だけのステップは setup-node ではない
+    { step: { run: "npm ci" }, expected: false, label: "run: だけ" },
+  ])("isUnconditionalSetupNode: $label → $expected", ({ step, expected }) => {
+    // 合成したステップを判定へ渡し、期待どおりの真偽を返すことを固定する
+    expect(isUnconditionalSetupNode(step)).toBe(expected);
+  });
+
+  it.each([
+    // タグ付きの公式イメージ
+    { image: "node:20", expected: true, label: "node:20" },
+    // レジストリ・名前空間を付けた書き方
+    {
+      image: "docker.io/library/node:20",
+      expected: true,
+      label: "レジストリ付き",
+    },
+    // ダイジェスト指定
+    { image: "node@sha256:abc", expected: true, label: "ダイジェスト" },
+    // 名前が node で始まるだけの別物は巻き込まない
+    { image: "myorg/node-tools:1", expected: false, label: "別イメージ" },
+    // Node と無関係なイメージ (この中で setup-node を使う形は別の検査が見る)
+    { image: "ubuntu:24.04", expected: false, label: "ubuntu" },
+  ])("isNodeImage: $label → $expected", ({ image, expected }) => {
+    // イメージ名の判定が、公式の node イメージだけを拾うことを固定する
+    expect(isNodeImage(image)).toBe(expected);
+  });
+
+  it.each([
+    // run: はリポジトリのコードを走らせる口
+    { step: { run: "npm ci" }, expected: true, label: "run:" },
+    // 空白だけの run: は何も実行しない
+    { step: { run: "   " }, expected: false, label: "空白だけの run:" },
+    // ローカルの composite action も中身はこのリポジトリのコード
+    {
+      step: { uses: "./.github/actions/test" },
+      expected: true,
+      label: "ローカル action",
+    },
+    // 第三者アクションはランナー自身の Node で動くので数えない
+    {
+      step: { uses: "actions/checkout@v7" },
+      expected: false,
+      label: "第三者アクション",
+    },
+  ])("runsRepositoryCode: $label → $expected", ({ step, expected }) => {
+    // 「リポジトリのコードを実行するステップか」の判定を固定する
+    expect(runsRepositoryCode(step)).toBe(expected);
+  });
+
+  it.each([
+    // steps を持たないジョブ (再利用可能ワークフローの呼び出し) は正当
+    { steps: undefined, readable: true, label: "steps なし" },
+    // 空の steps も構造としては読める
+    { steps: [], readable: true, label: "空の steps" },
+    // 対応表の要素だけなら読める
+    { steps: [{ run: "npm ci" }], readable: true, label: "正しい steps" },
+    // 配列でない steps はステップを 1 つも読めない
+    {
+      steps: "npm ci && npm run test",
+      readable: false,
+      label: "文字列の steps",
+    },
+    // 要素が対応表でないと run: も uses: も読めない
+    { steps: ["npm ci"], readable: false, label: "要素が文字列" },
+  ])(
+    "describeStepsProblem: $label → 読める=$readable",
+    ({ steps, readable }) => {
+      // 読めない形だけが理由付きの文字列を返すことを固定する
+      expect(describeStepsProblem(steps) === null).toBe(readable);
+    },
+  );
+
+  it("collectJobsMissingSetupNode が、置き方の 3 つの誤りだけを名指しする", () => {
+    // 期待どおりの置き方 (checkout → setup-node → npm) は名指ししない
+    const compliant = jobOf({
+      steps: [
+        { uses: "actions/checkout@v7" },
+        {
+          uses: "actions/setup-node@v7",
+          with: { "node-version-file": ".nvmrc" },
+        },
+        { run: "npm ci" },
+      ],
+    });
+    expect(collectJobsMissingSetupNode([compliant], new Set())).toEqual([]);
+    // setup-node がリポジトリのコードより後ろにある形は名指しする
+    const tooLate = jobOf({
+      steps: [{ run: "npm ci" }, { uses: "actions/setup-node@v7" }],
+    });
+    expect(collectJobsMissingSetupNode([tooLate], new Set())).toHaveLength(1);
+    // setup-node が無い形も名指しする
+    const missing = jobOf({ steps: [{ run: "npm ci" }] });
+    expect(collectJobsMissingSetupNode([missing], new Set())).toHaveLength(1);
+    // 第三者アクションだけのジョブは対象外 (誤検知を出さない)
+    const actionsOnly = jobOf({ steps: [{ uses: "actions/labeler@v5" }] });
+    expect(collectJobsMissingSetupNode([actionsOnly], new Set())).toEqual([]);
+    // steps を持たないジョブ (再利用可能ワークフローの呼び出し) も対象外
+    const reusable = jobOf({
+      uses: "other-org/repo/.github/workflows/x.yml@v1",
+    });
+    expect(collectJobsMissingSetupNode([reusable], new Set())).toEqual([]);
+    // container: の検査が名指ししたジョブは、そちらの文言に任せる (重複させない)
+    expect(
+      collectJobsMissingSetupNode(
+        [missing],
+        new Set([jobKey("synthetic.yml", "job")]),
+      ),
+    ).toEqual([]);
+  });
+
+  it("collectNodeImageUses が、container: とステップの docker:// を両方拾う", () => {
+    // 文字列の container:
+    expect(
+      collectNodeImageUses([jobOf({ container: "node:20" })]),
+    ).toHaveLength(1);
+    // マップの container:
+    expect(
+      collectNodeImageUses([jobOf({ container: { image: "node:20-alpine" } })]),
+    ).toHaveLength(1);
+    // ステップの uses: docker://node:20 (setup-node の置き方を見る検査では拾えない口)
+    expect(
+      collectNodeImageUses([jobOf({ steps: [{ uses: "docker://node:20" }] })]),
+    ).toHaveLength(1);
+    // node 以外のイメージは Node の版を持ち込まないので対象外
+    expect(
+      collectNodeImageUses([jobOf({ container: "ubuntu:24.04" })]),
+    ).toEqual([]);
+    expect(
+      collectNodeImageUses([jobOf({ steps: [{ uses: "docker://alpine:3" }] })]),
+    ).toEqual([]);
+    // container: とステップの両方にあるジョブは、2 箇所として報告する
+    expect(
+      collectNodeImageUses([
+        jobOf({ container: "node:20", steps: [{ uses: "docker://node:22" }] }),
+      ]),
+    ).toHaveLength(2);
+  });
+
+  it("describeInputs が、循環参照を含む with: でも例外を投げない", () => {
+    // YAML のアンカーで自己参照する with: を再現する
+    const circular: Record<string, unknown> = { "node-version": "20" };
+    circular.self = circular;
+    // 例外ではなく、キー=値の形の説明が返ることを固定する (値は「形」だけ)
+    expect(describeInputs(circular)).toBe("node-version=20, self=object");
+    // 指定が無い場合も読み手に伝わる文言にする
+    expect(describeInputs({})).toBe("with: の指定なし");
   });
 });
