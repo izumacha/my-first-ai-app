@@ -758,16 +758,6 @@ function invokesRuntimeVerifier(step: Record<string, unknown>): boolean {
     .some((line) => RUNTIME_VERIFIER_LINE.test(line));
 }
 
-/** 失敗文言に出す、ステップ 1 つの短い説明。 */
-function describeStep(step: Record<string, unknown>): string {
-  // run: なら最初の 1 行だけを出す (複数行をそのまま出すと文言が読めなくなる)
-  const run = typeof step.run === "string" ? step.run.trim().split("\n")[0] : "";
-  // run: に中身があれば、その 1 行を説明として使う
-  if (run !== "") return `run: ${run}`;
-  // run: が無ければローカル action の呼び出し
-  return `uses: ${usesOf(step)}`;
-}
-
 /** `setup-node` の置き方が足りていないジョブ 1 つ分。 */
 interface MissingSetupNodeJob {
   // 失敗メッセージに出す、どのワークフローかを示すファイル名
@@ -885,17 +875,15 @@ function collectJobsMissingSetupNode(
         },
       ];
     }
-    // 置いてあっても、リポジトリのコードより後ろなら前半はランナー既定の Node で走る
-    if (setupIndex > firstRepoCode) {
-      return [
-        {
-          file: job.file,
-          job: job.name,
-          reason: `setup-node が「${describeStep(steps[firstRepoCode])}」より後ろにある`,
-        },
-      ];
-    }
-    // 無条件の setup-node が、リポジトリのコードより前に置かれている = 期待どおり
+    // **「setup-node がリポジトリのコードより後ろ」を別途見る必要は無い。**
+    // ここまでの 2 つの判定で `setupIndex <= verifierIndex <= firstRepoCode` が
+    // 確定しており、実行時検証自身も `run:` (= リポジトリのコード) なので、
+    // setup-node は必ず最初のリポジトリのコードより前にある。
+    // 以前はここに `setupIndex > firstRepoCode` の分岐があったが、**構造上ぜったいに
+    // 成立しない条件**で、その文言は一度も出ない死んだコードだった (§6)。
+    // 実際の誤り (`run: npm ci` の後ろに setup-node) は、上の 2 つが
+    // 「実行時検証を実行していない」「実行時検証がリポジトリのコードより後ろにある」
+    // として必ず名指しする — 下のテーブル駆動テストがその文言まで固定している。
     return [];
   });
 }
@@ -1620,9 +1608,29 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
     // 期待どおりの置き方は名指ししない
     const compliant = jobOf({ steps: compliantSteps });
     expect(collectJobsMissingSetupNode([compliant], new Set())).toEqual([]);
-    // setup-node がリポジトリのコードより後ろにある形は名指しする
+    // setup-node がリポジトリのコードより後ろにある形は名指しする。
+    // **件数だけでなく理由まで固定する** — 件数だけだと、どの判定が拾ったのかが
+    // 分からず、「その形を名指しする」と読める一方で実際には別の理由 (この例なら
+    // 実行時検証が無いこと) で落ちている、という食い違いに気付けない
     const tooLate = jobOf({ steps: [{ run: "npm ci" }, { uses: "actions/setup-node@v7" }] });
-    expect(collectJobsMissingSetupNode([tooLate], new Set())).toHaveLength(1);
+    expect(collectJobsMissingSetupNode([tooLate], new Set())).toEqual([
+      { file: "synthetic.yml", job: "job", reason: `${RUNTIME_VERIFIER} を実行していない` },
+    ]);
+    // setup-node を前に出しても、実行時検証がリポジトリのコードより後ろなら名指しする
+    const setupBeforeButVerifierLate = jobOf({
+      steps: [
+        { uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } },
+        { run: "npm ci" },
+        { run: "node scripts/verify-node-major.mjs" },
+      ],
+    });
+    expect(collectJobsMissingSetupNode([setupBeforeButVerifierLate], new Set())).toEqual([
+      {
+        file: "synthetic.yml",
+        job: "job",
+        reason: `${RUNTIME_VERIFIER} がリポジトリのコードより後ろにある (先に走った検証の Node が分からない)`,
+      },
+    ]);
     // setup-node が無い形も名指しする
     const missing = jobOf({ steps: [{ run: "npm ci" }] });
     expect(collectJobsMissingSetupNode([missing], new Set())).toHaveLength(1);
@@ -1798,7 +1806,11 @@ describe("実行時検証スクリプトそのものの挙動", () => {
    */
   function runVerifier(nvmrcContent: string | null): VerifierRun {
     // OS の一時領域に、この検査専用の作業場を作る (名前が衝突しないよう mkdtemp)
-    const sandbox = mkdtempSync(join(tmpdir(), "verify-node-major-"));
+    // **名前にわざと空白を入れる。** スクリプトは失敗文言から自分の絶対パスを削るが、
+    // 目印の作り方を `URL.pathname` に戻すと百分率エンコード (`my%20app`) になって
+    // 一致しなくなり、**出さないと書いた絶対パスがそのまま漏れる** (実測)。
+    // 空白を含む作業場で走らせておけば、その退行を下の検査が捕まえる
+    const sandbox = mkdtempSync(join(tmpdir(), "verify node major "));
     try {
       // 実物と同じ `scripts/` の下に置く (スクリプトは `../.nvmrc` を見るため)
       mkdirSync(join(sandbox, "scripts"));
@@ -1812,6 +1824,13 @@ describe("実行時検証スクリプトそのものの挙動", () => {
         // 出力を文字列として受け取る
         encoding: "utf8",
       });
+      // **起動そのものに失敗した場合を握り潰さない (§6)。** spawnSync は EAGAIN /
+      // ENOMEM / EACCES のとき `{status: null, error, stdout: null}` を返すので、
+      // そのまま返すと「出力が空のまま落ちた」= スクリプトの不具合という
+      // 別の顔で報告され、本当の原因 (errno) が消える
+      if (result.error !== undefined) {
+        return { status: result.status, output: `スクリプトを起動できない: ${result.error.message}` };
+      }
       // 成否の理由は stdout / stderr のどちらにも出うるので、まとめて 1 つの文字列で見る
       return { status: result.status, output: `${result.stdout ?? ""}${result.stderr ?? ""}` };
     } finally {
@@ -1843,9 +1862,12 @@ describe("実行時検証スクリプトそのものの挙動", () => {
     const run = runVerifier(otherMajor);
     // **ここが担保の本体**: 食い違いは終了コード 1 で CI を止める
     expect(run.status, `major が違うのに通った: ${run.output}`).toBe(1);
-    // 直す先が分かるよう、実際の Node と `.nvmrc` の値の両方を出す
+    // 直す先が分かるよう、実際の Node と `.nvmrc` の値の両方を出す。
+    // **`.nvmrc` 側は素の数字で照合しない** — 例えば Node 22.23.0 で走ると
+    // otherMajor は "23" で、これは版の文字列 "22.23.0" の**部分文字列**なので、
+    // `.nvmrc` の値を文言から落とす退行が起きても両方の検査が通ってしまう
     expect(run.output).toContain(process.versions.node);
-    expect(run.output).toContain(otherMajor);
+    expect(run.output).toContain(`.nvmrc (${otherMajor})`);
   });
 
   it("`.nvmrc` の形が読めなければ、検証せずに落ちる (fail-closed)", () => {
