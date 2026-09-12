@@ -24,29 +24,32 @@
 //   (a') CI が版を書き写す形へ戻ること … `node-version: '26'` のように直書きすると、
 //       `.nvmrc` とずれても CI は緑のまま通り、この PR 以前の状態に戻る。
 //       値の一致ではなく**配線そのもの**を固定する。
-//       **node イメージを走らせる形も同じ扱いで落とす。**
-//       `container: node:20` と書くと steps はそのイメージの Node で走るので、
-//       `actions/setup-node` を 1 つも置かずに別 major で検証できてしまう
-//       (setup-node だけを見る検査はこれを緑のまま通す。実測)。
-//       **ステップ単位の `uses: docker://<image>` も同じ口**で、こちらは
-//       3 つ目の検査でも拾えない (`uses:` が `./` で始まらないので「リポジトリの
-//       コードを実行するステップ」に数えられず、そのジョブが要求の対象から外れる。実測)。
-//       しかも `container:` と違って `setup-node` が効かない (そのステップは
-//       イメージの中で丸ごと走る) ので、**イメージ名を問わず**落とす —
+//       **ステップを丸ごとイメージの中で走らせる形も落とす。**
+//       `uses: docker://<image>` はそのステップだけをイメージの中で走らせるので、
+//       同じジョブに正しい `setup-node` を置いても効かない。3 つ目の検査でも拾えない
+//       (`uses:` が `./` で始まらないため「リポジトリのコードを実行するステップ」に
+//        数えられず、ジョブが要求の対象から外れる。実測)。**イメージ名は問わない** —
 //       `node` という名前に絞ると `docker://ghcr.io/acme/ci-node:20` が素通りした (実測)。
-//       Node を持ち込まないイメージは `NODE_UNRELATED_JOBS` へ理由付きで登録する。
+//       Node を持ち込まないイメージは `NODE_GUARD_EXEMPTIONS` の `image` へ登録する。
+//       **ジョブの `container:` はここでは見ない。** その中でも `setup-node` は動いて
+//       `.nvmrc` の Node を入れるので、`container: node:26-alpine` + 正しい setup-node は
+//       正当な形。一律に落としていたときは、この形に**直しようの無い要求**が出ていた (実測)。
+//       誤りは「setup-node が無いこと」のほうで、それは 3 つ目の検査が container の
+//       有無に関係なく落とす。
 //       **3 つ目の口は「setup-node を書き忘れる」形。** ランナーには Node が
 //       最初から入っているため、`setup-node` の無いジョブで `npm ci && npm run test`
 //       と書くとランナー既定の major でスイートが丸ごと走る。上の 2 つを塞いでも
 //       これは緑のまま通る (実測) ので、**このリポジトリのコードを実行するジョブ**
 //       (`run:` を持つ / ローカルの composite action を呼ぶ) には
 //       **無条件の `setup-node` がそのコードより前にある**ことまで求める。
-//       置いてあるかだけでは足りない — `run: npm ci` の後ろに置いた形と、
-//       `if:` / `continue-on-error:` を付けた形はどれも実測で素通りした
-//       (前半 / 全体がランナー既定の Node で走るのに全件緑。とくに
-//        `continue-on-error: true` は setup-node が失敗してもジョブが成功で終わる)。Node と無関係なジョブは `NODE_UNRELATED_JOBS` へ
-//       理由付きで登録する (判定を `run:` の文言から当てる形は、綴りが変わるだけで
-//       黙って外れた。実測は同定数の docstring に記録した)。
+//       置いてあるかだけでは足りない — `run: npm ci` の後ろに置いた形、`if:` を
+//       付けた形、ステップ / **ジョブ**の `continue-on-error: true` はどれも実測で
+//       素通りした (前半 / 全体がランナー既定の Node で走る、あるいはジョブが失敗しても
+//       ワークフローが成功で報告されるのに全件緑)。Node と無関係なジョブは
+//       `NODE_GUARD_EXEMPTIONS` の `setupNode` へ理由付きで登録する (判定を `run:` の
+//       文言から当てる形は、綴りが変わるだけで黙って外れた。実測は同定数の docstring に記録)。
+//       **免除は検査ごとに分ける** — 1 つの理由で両方を免除できると、「イメージは Node と
+//       無関係」と登録しただけで同じジョブの `run: npm ci` に対する要求まで外れる (実測)。
 //       CI が入れる Node は必ず `.nvmrc` 由来にする、が守りたい 1 つの性質で、
 //       版が入り込む口を 3 つとも塞いでおかないとその性質は保証にならない。
 //       **読めないワークフローが 1 本でもあれば、その時点で落とす。**
@@ -93,6 +96,11 @@
 //   次の抜け道が出てくる終わりのない作業になる (この repo が CSP の静的解析で
 //   実際に踏んだ形)。**「増やしたことに気付く」ための網であって証明ではない**、
 //   と理解して使うこと。
+//   **見えない形の担保は、静的な検査ではなく CI の 1 ステップが持つ。**
+//   `scripts/verify-node-major.mjs` が、スイートを動かすその Node 自身に
+//   「`.nvmrc` と同じ major か」を申告させる (綴りに依存しないので、`run:` の中で
+//    入れ替える形・式で決まるイメージ・他リポジトリの再利用可能ワークフローを
+//    まとめて覆う)。この検査はそれが CI から消えていないことも見る。
 //   **判定そのものの挙動は、このファイル末尾のテーブル駆動テストが固定する。**
 //   実際の `ci.yml` が準拠しているだけでは、判定を潰しても (`isUnconditionalSetupNode`
 //   を `return true` にする等) 全件緑のまま通ってしまい、「塞いだ」証拠が
@@ -144,6 +152,12 @@ import {
 
 // ピン留めの出どころ (package.json の engines は「下限」なので別扱い。冒頭コメント参照)
 const NVMRC_PATH = resolve(REPO_ROOT, ".nvmrc");
+// 実行時に「走っている Node が .nvmrc と同じ major か」を確かめるスクリプト。
+// 静的な検出網では見えない形 (run: の中で volta / nvm、式で決まるイメージ、
+// 他リポジトリの再利用可能ワークフロー) を、綴りに依存せずまとめて塞ぐのがこれ。
+// **どのジョブからも呼ばれなくなったら、静的な網だけが残って性質の担保が消える**ので、
+// 少なくとも 1 つのワークフローが走らせていることを下の検査で固定する
+const RUNTIME_VERIFIER = "scripts/verify-node-major.mjs";
 // ワークフローは**ファイル名を書き並べず、置き場ごと**見る。
 // 特定の 1 本 (ci.yml) だけを対象にすると、Node を用意する別のワークフローを足した瞬間に
 // その 1 本だけが黙って検査から外れる (痕跡はテスト件数すら変わらない)
@@ -558,30 +572,41 @@ function isNodeImage(image: string): boolean {
 }
 
 /**
- * Node と無関係なのに、このリポジトリのコードを実行するジョブの**理由付きの除外表**。
+ * 検出網を通さない例外を、**理由と適用範囲つき**で 1 枚にまとめた表。
  *
- * キーは `jobKey` と同じ「ワークフローのファイル名 : ジョブ名」。
+ * キーは `jobKey` と同じ「ワークフローのファイル名 : ジョブ名」。値は**どの検査を
+ * 免除するか**を明示する (省略した検査には効かない)。
+ *   - `setupNode` … このジョブはリポジトリのコードを Node で走らせない
+ *     (例: `run: shellcheck scripts/x.sh` だけのジョブ)。
+ *   - `image` … このジョブの `uses: docker://` はイメージに Node を持ち込まない
+ *     (例: `docker://hadolint/hadolint`)。
  *
- * **これがあるので下の検査を fail-closed にできる。** 「Node を使っているか」を
- * `run:` の文言から当てる形 (以前の `NODE_TOOLING_COMMAND`) は、綴りが変わるだけで
- * 黙って対象から外れた (実測: `./node_modules/.bin/vitest run` や
- * `/usr/local/bin/node server.js` はどれも拾えず、スイートがランナー既定の Node で
- * 丸ごと走る状態が全件緑のまま通った)。そこで判定を**構造**
- * (`run:` があるか / ローカル action を呼ぶか) に変え、当てはまらない例外だけを
- * ここへ 1 行ずつ登録する形にした。表に無いジョブは検査が拾って落ちるので、
- * **次に同じ形のジョブを足す人は「setup-node を置くか、除外するか」を必ず一度決める**
- * ことになる (incident-insight の除外表と同じ考え方)。
+ * **範囲を分けているのが要点。** 1 つの理由で両方を免除する形にすると、
+ * 「イメージは Node と無関係」と登録しただけで**同じジョブの `run: npm ci` に対する
+ * `setup-node` の要求まで黙って外れる** — しかも失敗文言が登録を勧めるので、
+ * 検出網が自分で塞いだ穴の開け方を案内することになる (実測で全件緑。
+ * `docker://hadolint` + `run: npm ci && npm run test` が通った)。
  *
- * **この表は 2 つの検査に効く** — 「`setup-node` の置き方」と「イメージ任せにしない」。
- * 後者にも効かせるのは、ステップの `uses: docker://` をイメージ名で絞らない
- * (絞ると `docker://ghcr.io/acme/ci-node:20` が素通りした＝実測) 代わりに、
- * Node を持ち込まないイメージを通す道が 1 つも無いと**直しようの無い要求**になるため。
+ * **これがあるので検査を fail-closed にできる。** 「Node を使っているか」を `run:` の
+ * 文言から当てる形 (以前の `NODE_TOOLING_COMMAND`) は、綴りが変わるだけで黙って対象から
+ * 外れた (実測: `./node_modules/.bin/vitest run` も `/usr/local/bin/node server.js` も
+ * 拾えなかった)。判定は**構造**で行い、当てはまらない例外だけをここへ 1 行ずつ登録する。
+ * 表に無いジョブは検査が拾って落ちるので、**次に同じ形のジョブを足す人は
+ * 「setup-node を置くか、除外するか」を必ず一度決める**ことになる
+ * (incident-insight の除外表と同じ考え方)。
  *
  * **現在は空** — 除外の必要なジョブがまだ無い。エントリが増える差分は、
  * 理由の妥当性をレビューで必ず確認する (署名からは「Node と無関係か」を判定できない、
  * 人が判断するエスケープハッチ)。
  */
-const NODE_UNRELATED_JOBS: Readonly<Record<string, string>> = {};
+interface JobExemption {
+  // setup-node の要求を免除する理由 (省略 = 免除しない)
+  setupNode?: string;
+  // uses: docker:// のイメージ検査を免除する理由 (省略 = 免除しない)
+  image?: string;
+}
+
+const NODE_GUARD_EXEMPTIONS: Readonly<Record<string, JobExemption>> = {};
 
 /**
  * 除外表のうち、**実在しないジョブ**を指しているキーを集める。
@@ -591,18 +616,30 @@ const NODE_UNRELATED_JOBS: Readonly<Record<string, string>> = {};
  * 腐りを見逃すようになるので、合成した表を渡すテストで判定自体を固定する。
  */
 function staleExclusions(
-  table: Readonly<Record<string, string>>,
+  table: Readonly<Record<string, JobExemption>>,
   existingJobKeys: ReadonlySet<string>,
 ): string[] {
   // 実在するジョブのキーに無いものだけを残す
   return Object.keys(table).filter((key) => !existingJobKeys.has(key));
 }
 
-/** 除外表のうち、理由が空・空白だけのキーを集める。 */
-function exclusionsWithoutReason(table: Readonly<Record<string, string>>): string[] {
-  // 値を読まない検査だと、空白を入れるだけで黙らせられるので理由の中身まで見る
+/**
+ * 除外表のうち、**理由として読めない登録**を集める。
+ *
+ * 2 通りある: 書いた理由が空・空白だけ (値を読まない検査だと空白で黙らせられる) と、
+ * 免除する検査を 1 つも書いていない登録 (何も免除しないのに「除外済み」に見える)。
+ */
+function exclusionsWithoutReason(table: Readonly<Record<string, JobExemption>>): string[] {
+  // 登録を 1 つずつ見て、読めない理由を持つキーだけを残す
   return Object.entries(table)
-    .filter(([, reason]) => reason.trim() === "")
+    .filter(([, exemption]) => {
+      // 書かれている理由だけを取り出す
+      const reasons = [exemption.setupNode, exemption.image].filter(
+        (reason): reason is string => reason !== undefined,
+      );
+      // 1 つも書いていない、または空白だけの理由があれば読めない登録
+      return reasons.length === 0 || reasons.some((reason) => reason.trim() === "");
+    })
     .map(([key]) => key);
 }
 
@@ -686,7 +723,7 @@ interface MissingSetupNodeJob {
  *     条件の中身は静的に決まらないので、「無条件でない」ことをもって落とす。
  *
  * 判定を `run:` の**文言**から当てないのは、綴りを変えるだけで黙って外れるから
- * (以前の形の実測は `NODE_UNRELATED_JOBS` の docstring に書いた)。構造で見て、
+ * (以前の形の実測は `NODE_GUARD_EXEMPTIONS` の docstring に書いた)。構造で見て、
  * 例外は理由付きの表へ登録させる (fail-closed)。
  *
  * すでに `container:` の検査が名指ししたジョブは除く (同じジョブを 2 通りの文言で
@@ -702,8 +739,8 @@ function collectJobsMissingSetupNode(
     const key = jobKey(job.file, job.name);
     // container: の検査が既に名指ししたジョブは、そちらの文言に任せる
     if (excludedJobKeys.has(key)) return [];
-    // 理由付きで除外登録されたジョブは対象外 (表の健全性は専用の検査が見る)
-    if (key in NODE_UNRELATED_JOBS) return [];
+    // setup-node の要求を免除すると登録されたジョブは対象外 (表の健全性は専用の検査が見る)
+    if (NODE_GUARD_EXEMPTIONS[key]?.setupNode !== undefined) return [];
     // steps が無いジョブ (再利用可能ワークフローの呼び出し) は要求しても置く場所が無い
     const steps = stepRecordsOf(job);
     if (steps === null) return [];
@@ -711,6 +748,21 @@ function collectJobsMissingSetupNode(
     const firstRepoCode = steps.findIndex(runsRepositoryCode);
     // 1 つも無ければ、第三者アクションだけのジョブなので対象外
     if (firstRepoCode === -1) return [];
+    // **ジョブ単位の `continue-on-error` も同じ結末を招く。** 付いているとジョブが
+    // 失敗してもワークフローは成功で報告されるので、setup-node が失敗して
+    // lint / typecheck / test が 1 つも走らなくても CI は緑になる (実測で素通りした)。
+    // ステップ側と同じく、明示的な false 以外を「効かなくても進む書き方」として扱う
+    const jobContinues =
+      "continue-on-error" in job.definition && job.definition["continue-on-error"] !== false;
+    if (jobContinues) {
+      return [
+        {
+          file: job.file,
+          job: job.name,
+          reason: "ジョブに continue-on-error が付いている (失敗しても CI は緑になる)",
+        },
+      ];
+    }
     // 必ず効く setup-node の位置 (if: / continue-on-error 付きは数えない)
     const setupIndex = steps.findIndex(isUnconditionalSetupNode);
     // 無条件の setup-node が 1 つも無い場合は、条件付きの有無で文言を分ける
@@ -737,53 +789,30 @@ function collectJobsMissingSetupNode(
 }
 
 /**
- * node イメージを据えている箇所を集める (ジョブの `container:` と、ステップの
- * `uses: docker://<image>`)。
+ * ステップの `uses: docker://<image>` を集める (イメージ名は問わない)。
  *
- * **`actions/setup-node` を見るだけでは足りない**のがここを足した理由。
- * ジョブに `container: node:20` と書くと steps はそのイメージの中で走るため、
- * setup-node を 1 本も置かないまま `.nvmrc` と別の major で `npm ci && npm run test`
- * を回せてしまう。setup-node だけを見る検査はこれを**全件緑のまま通す** (実測)。
- * これは版が入り込む 2 つ目の口で、3 つ目 (`setup-node` の置き方) と合わせて
- * すべて塞いで初めて「CI が入れる Node はピンそのもの」が保証になる。
+ * **`setup-node` が効かない唯一の口。** ジョブの `container:` と違い、この形は
+ * **そのステップだけをイメージの中で丸ごと走らせる**ので、同じジョブに正しい
+ * `setup-node` を置いても、そのステップの Node には何の影響も無い。
+ * イメージ名で絞ると `docker://ghcr.io/acme/ci-node:20` のような形が素通りする
+ * (実測で全件緑) ため、**名前を問わず**集めて、Node を持ち込まないと確認できた
+ * ものだけを `NODE_GUARD_EXEMPTIONS` の `image` で通す。
  *
- * **ステップ単位の `uses: docker://node:20` も同じ口。** そのステップだけがイメージの
- * Node で走るので、ジョブに `container:` が無くても `.nvmrc` とは別の major で
- * リポジトリのコードを回せる。しかも `setup-node` の置き方を見る検査では拾えない
- * (`uses:` が `./` で始まらないため「リポジトリのコードを実行するステップ」に数えられず、
- *  そのジョブは要求の対象から外れる)。実測でこの形は全件緑のまま通っていた。
- * `container:` と同じく**宣言として YAML に現れる値**なので、塞げる口はここで塞ぐ。
- *
- * `container:` は文字列 (`container: node:20`) でも
- * マップ (`container: { image: node:20 }`) でも書けるので、両方の書き方を読む。
- * node 以外のイメージは対象外 — Node の版が入り込まないので、要求する内容が無い。
+ * **`container:` はここでは見ない。** `container: node:20` でも `setup-node` は
+ * コンテナの中で動いて `.nvmrc` の Node を入れるので、それ自体は誤りではない。
+ * 誤りなのは「リポジトリのコードを走らせるのに `setup-node` が無い」ことのほうで、
+ * それは `collectJobsMissingSetupNode` が `container:` の有無に関係なく落とす。
+ * ここで node イメージを一律に落としていたときは、`container: node:26-alpine` +
+ * 正しい `setup-node` という**正当な形に直しようの無い要求**が出ていた (実測)。
  */
-function collectNodeImageUses(jobs: readonly WorkflowJob[]): NodeImageUse[] {
-  // 共有の走査で平らに並べたジョブを受け取り、2 つの書き方を順に見る
+function collectImageOnlySteps(jobs: readonly WorkflowJob[]): NodeImageUse[] {
+  // 共有の走査で平らに並べたジョブを受け取り、各ステップの uses: を見る
   return jobs.flatMap((job) => {
-    // 理由付きで除外登録されたジョブは対象外 (Node と無関係だと人が判断したもの)。
-    // この検査にも効かせるのは、`docker://` を名前で絞らない代わりに
-    // 「Node を持ち込まないイメージ」を通す道が 1 つも無いと、正当な形に対して
-    // **直しようの無い要求**を出すことになるため
-    if (jobKey(job.file, job.name) in NODE_UNRELATED_JOBS) return [];
-    // 見つけた箇所を溜める入れ物 (1 ジョブに container: とステップの両方がありうる)
+    // イメージの検査を免除すると登録されたジョブは対象外
+    if (NODE_GUARD_EXEMPTIONS[jobKey(job.file, job.name)]?.image !== undefined) return [];
+    // 見つけた箇所を溜める入れ物
     const found: NodeImageUse[] = [];
-    // container の値を取り出す (未指定ならこのジョブに container は無い)
-    const container = job.definition.container;
-    // 文字列ならそれ自体がイメージ名、マップなら image キーがイメージ名
-    const containerImage =
-      typeof container === "string" ? container : String(asRecord(container).image ?? "");
-    // **`container:` は node イメージだけを対象にする。** ubuntu 等の中でも
-    // `setup-node` は動いて `.nvmrc` の Node を入れるので、そちらは正当な形
-    if (isNodeImage(containerImage)) {
-      found.push({
-        file: job.file,
-        job: job.name,
-        image: containerImage,
-        location: `container: ${containerImage}`,
-      });
-    }
-    // 各ステップの uses: docker:// も同じ扱いで見る (steps が無いジョブは空で回す)
+    // 各ステップを順に見る (steps が無いジョブは空で回す)
     for (const step of stepRecordsOf(job) ?? []) {
       // uses を文字列として取り出す
       const uses = usesOf(step);
@@ -791,17 +820,8 @@ function collectNodeImageUses(jobs: readonly WorkflowJob[]): NodeImageUse[] {
       if (!uses.startsWith(DOCKER_USES_PREFIX)) continue;
       // 接頭辞を落としてイメージ名だけにする
       const image = uses.slice(DOCKER_USES_PREFIX.length);
-      // **ステップの `docker://` は、イメージの名前を問わず控える。**
-      // `container:` と違い `setup-node` が効かない (そのステップはイメージの中で
-      // 丸ごと走る) ので、`node` という名前でなくても中の Node で repo のコードが
-      // 走りうる。名前で絞ると `docker://ghcr.io/acme/ci-node:20` のような形が
-      // 素通りした (実測で全件緑)。Node と無関係なイメージは除外表で通す
-      found.push({
-        file: job.file,
-        job: job.name,
-        image,
-        location: `${uses}`,
-      });
+      // どのワークフローのどのジョブが、どのイメージを走らせているかを控える
+      found.push({ file: job.file, job: job.name, image, location: uses });
     }
     // このジョブで見つかった箇所をすべて返す
     return found;
@@ -813,8 +833,14 @@ function collectNodeImageUses(jobs: readonly WorkflowJob[]): NodeImageUse[] {
  *
  * **最初の 1 件だけを見ない。** 多段ビルドで `FROM node:22-alpine AS tools` のような
  * 別 major の段が足されると、先頭だけを見る実装では揃っているように見えてしまい、
- * まさに検出したいドリフトを見逃す。すべての `FROM node:<major>` を集め、
+ * まさに検出したいドリフトを見逃す。すべての `FROM` の node イメージを集め、
  * 揃っていなければ「読めなかった」として呼び出し側で落とす。
+ *
+ * **イメージ名は `isNodeImage` と同じ解析に通す。** 以前は `FROM node:(\d+)` という
+ * 狭い正規表現で、`FROM docker.io/library/node:22-alpine AS tools` や
+ * `FROM --platform=linux/amd64 node:22` を**素通り**させていた (実測で全件緑。
+ * まさに多段ビルドのドリフトを見逃す形)。ワークフロー側で同じ取りこぼしを塞いだ
+ * 判定があるので、そこへ寄せて書き写しも増やさない (§6 DRY)。
  */
 function readDockerfileNodeMajor(): number | null {
   // Dockerfile を読む (読めなければ null)
@@ -824,8 +850,23 @@ function readDockerfileNodeMajor(): number | null {
   const majors = new Set<number>();
   for (const line of stripComments(text)) {
     // 行頭の FROM 命令だけを対象にする (大文字小文字は Docker 側が区別しない)
-    const matched = line.match(/^\s*FROM\s+node:(\d+)/i);
-    if (matched) majors.add(Number(matched[1]));
+    const matched = line.match(/^\s*FROM\s+(.+)$/i);
+    // FROM でなければ次の行へ
+    if (!matched) continue;
+    // `--platform=...` のようなフラグを読み飛ばし、最初の非フラグ語をイメージ名として取る
+    const image = matched[1]
+      .trim()
+      .split(/\s+/)
+      .find((word) => !word.startsWith("--"));
+    // イメージ名が無い行 (壊れた FROM) は対象外
+    if (image === undefined) continue;
+    // 公式の node イメージでなければ対象外 (ビルドに使う別イメージの段は見ない)
+    if (!isNodeImage(image)) continue;
+    // タグから major を取り出す (`node:26-alpine` → 26。ダイジェストだけの指定は読めない)
+    const tag = image.split("@")[0].split(":")[1] ?? "";
+    const major = tag.match(/^(\d+)/);
+    // 数字で始まるタグだけを採用する (`node:lts` のような形は「読めない」に倒す)
+    if (major) majors.add(Number(major[1]));
   }
   // ちょうど 1 つに揃っているときだけ採用する (0 件 = 読めない / 2 件以上 = 段ごとに食い違い)
   return majors.size === 1 ? [...majors][0] : null;
@@ -1060,20 +1101,19 @@ describe("実行する Node の major を宣言しているすべての場所の
         `(cache などの他の入力は付けてよい)。実際の指定: ${misconfigured.join(" / ")}。` +
         `版を直書きすると ${displayPath(NVMRC_PATH)} とずれても CI は緑のまま通り、出荷する Node を検証していない状態に戻る。`,
     ).toEqual([]);
-    // **版が入り込む 2 つ目の口**も塞ぐ。`container: node:20` を据えたジョブは
-    // setup-node を 1 本も置かずにそのイメージの Node で steps を回せるため、
-    // 上の検査だけでは素通りする (実測で全件緑のまま通った)。
-    // ステップ単位の `uses: docker://node:20` も同じ口なので一緒に見る
-    // (こちらは setup-node の置き方を見る検査でも拾えない。実測)
-    const nodeImageUses = collectNodeImageUses(workflows.jobs);
-    const nodeImages = nodeImageUses.map((use) => `${use.file}: ${use.job} (${use.location})`);
+    // **版が入り込む 2 つ目の口**は、ステップを丸ごとイメージの中で走らせる形。
+    // `uses: docker://<image>` は同じジョブに正しい setup-node を置いても効かないので、
+    // イメージ名を問わず落とす (名前で絞ると docker://ghcr.io/acme/ci-node:20 が
+    // 素通りした。実測)。`container:` はここでは見ない — その中でも setup-node は
+    // 動くので、誤りなのは「setup-node が無いこと」のほうで、下の検査が落とす
+    const imageOnlySteps = collectImageOnlySteps(workflows.jobs);
+    const imageSteps = imageOnlySteps.map((use) => `${use.file}: ${use.job} (${use.location})`);
     expect.soft(
-      nodeImages,
-      `CI の Node をイメージ任せにしないこと (ジョブの container: の node イメージ / ステップの uses: docker://)。` +
-        `実際の指定: ${nodeImages.join(" / ")}。` +
-        "そのイメージの中でステップが走るので、.nvmrc と別の major で検証している状態になりうる。" +
+      imageSteps,
+      `ステップをイメージの中で丸ごと走らせないこと (uses: docker://)。実際の指定: ${imageSteps.join(" / ")}。` +
+        "そのステップだけはイメージの Node で走り、同じジョブに setup-node を置いても効かない。" +
         `Node は actions/setup-node に node-version-file: '${displayPath(NVMRC_PATH)}' を渡して用意すること。` +
-        "Node を持ち込まないイメージだと確認できている場合は、NODE_UNRELATED_JOBS へ理由付きで登録すること。",
+        "Node を持ち込まないイメージだと確認できている場合は、NODE_GUARD_EXEMPTIONS の image へ理由付きで登録すること。",
     ).toEqual([]);
     // **版が入り込む 3 つ目の口**は「書き忘れ」で到達する。ランナーには Node が
     // 最初から入っているので、setup-node を置かないジョブで npm を叩くと
@@ -1082,14 +1122,27 @@ describe("実行する Node の major を宣言しているすべての場所の
     // 同じ結果になるので、位置と効き方まで見る
     const missingSetup = collectJobsMissingSetupNode(
       workflows.jobs,
-      new Set(nodeImageUses.map((use) => jobKey(use.file, use.job))),
+      new Set(imageOnlySteps.map((use) => jobKey(use.file, use.job))),
     ).map((job) => `${job.file}: ${job.job} (${job.reason})`);
+    // **実行時の検証が CI から消えていないことも見る。** 上の 3 つは宣言しか見ないので、
+    // 見えない形 (run: の中で Node を入れ替える等) の担保はこのスクリプトだけが持つ。
+    // 呼び出しが消えても静的な検査はすべて緑のままになる
+    const runsVerifier = workflows.jobs.some((job) =>
+      (stepRecordsOf(job) ?? []).some((step) => String(step.run ?? "").includes(RUNTIME_VERIFIER)),
+    );
+    expect.soft(
+      runsVerifier,
+      `どのジョブも ${RUNTIME_VERIFIER} を実行していない。` +
+        "静的な検査は宣言として YAML に現れる Node しか見られないので、" +
+        "実際に走る Node を確かめるこのステップが無くなると、run: の中で入れ替える形などが" +
+        "まったく検証されない状態になる。",
+    ).toBe(true);
     expect.soft(
       missingSetup,
       `このリポジトリのコードを実行するジョブ (run: / ローカル action の呼び出し) には、` +
         `無条件の actions/setup-node をそのコードより前に置くこと。足りていないジョブ: ${missingSetup.join(" / ")}。` +
         "ランナーに最初から入っている Node でそのまま走るため、.nvmrc とは無関係な major で検証している状態になる。" +
-        "Node と無関係なジョブは NODE_UNRELATED_JOBS へ理由付きで登録すること。",
+        "Node と無関係なジョブは NODE_GUARD_EXEMPTIONS の setupNode へ理由付きで登録すること。",
     ).toEqual([]);
   });
 
@@ -1108,17 +1161,18 @@ describe("実行する Node の major を宣言しているすべての場所の
     const existing = new Set(workflows.jobs.map((job) => jobKey(job.file, job.name)));
     // **実在しないジョブの登録**を落とす。ジョブ名を変えた・消したあとも残っていると、
     // 将来その名前のジョブを足した人に黙って除外が効く (差分にも現れない)
-    const stale = inputsBroken ? [] : staleExclusions(NODE_UNRELATED_JOBS, existing);
+    const stale = inputsBroken ? [] : staleExclusions(NODE_GUARD_EXEMPTIONS, existing);
     expect(
       stale,
-      `NODE_UNRELATED_JOBS に実在しないジョブが登録されている: ${stale.join(" / ")}。` +
+      `NODE_GUARD_EXEMPTIONS に実在しないジョブが登録されている: ${stale.join(" / ")}。` +
         "ジョブを消した・改名したなら、除外もこの差分で消すこと (残すと将来同じ名前のジョブへ黙って効く)。",
     ).toEqual([]);
     // **理由の空欄**を落とす。値を誰も読まないと、空白を入れて検査を黙らせられる
-    const withoutReason = exclusionsWithoutReason(NODE_UNRELATED_JOBS);
+    const withoutReason = exclusionsWithoutReason(NODE_GUARD_EXEMPTIONS);
     expect(
       withoutReason,
-      `NODE_UNRELATED_JOBS の除外には理由を書くこと (空・空白は不可): ${withoutReason.join(" / ")}。`,
+      `NODE_GUARD_EXEMPTIONS の除外には、免除する検査 (setupNode / image) と理由を書くこと` +
+        ` (空・空白・免除先なしは不可): ${withoutReason.join(" / ")}。`,
     ).toEqual([]);
   });
 
@@ -1465,46 +1519,60 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
     // steps を持たないジョブ (再利用可能ワークフローの呼び出し) も対象外
     const reusable = jobOf({ uses: "other-org/repo/.github/workflows/x.yml@v1" });
     expect(collectJobsMissingSetupNode([reusable], new Set())).toEqual([]);
+    // ジョブ単位の continue-on-error は、失敗しても CI が緑になるので名指しする
+    const jobContinues = jobOf({
+      "continue-on-error": true,
+      steps: [{ uses: "actions/setup-node@v7" }, { run: "npm ci" }],
+    });
+    expect(collectJobsMissingSetupNode([jobContinues], new Set())).toHaveLength(1);
+    // 明示的な false は「効かなくても進む書き方」ではないので通す
+    const jobStops = jobOf({
+      "continue-on-error": false,
+      steps: [{ uses: "actions/setup-node@v7" }, { run: "npm ci" }],
+    });
+    expect(collectJobsMissingSetupNode([jobStops], new Set())).toEqual([]);
     // イメージ側の検査が名指ししたジョブは、そちらの文言に任せる (重複させない)
     const excluded = new Set([jobKey("synthetic.yml", "job")]);
     expect(collectJobsMissingSetupNode([missing], excluded)).toEqual([]);
   });
 
-  it("collectNodeImageUses が、container: の node と docker:// のイメージを拾う", () => {
-    // 文字列の container:
-    expect(collectNodeImageUses([jobOf({ container: "node:20" })])).toHaveLength(1);
-    // マップの container:
-    expect(collectNodeImageUses([jobOf({ container: { image: "node:20-alpine" } })])).toHaveLength(
+  it("collectImageOnlySteps が、docker:// のステップだけをイメージ名を問わず拾う", () => {
+    // イメージ名が node でなくても、中の Node で repo のコードが走りうるので拾う
+    const dockerStep = jobOf({ steps: [{ uses: "docker://ghcr.io/acme/ci-node:20" }] });
+    expect(collectImageOnlySteps([dockerStep])).toHaveLength(1);
+    // 公式の node イメージでも同じ扱い
+    expect(collectImageOnlySteps([jobOf({ steps: [{ uses: "docker://node:20" }] })])).toHaveLength(
       1,
     );
-    // container: が node 以外なら正当 (その中で setup-node が .nvmrc の Node を入れる)
-    expect(collectNodeImageUses([jobOf({ container: "ubuntu:24.04" })])).toEqual([]);
-    // ステップの docker:// は setup-node が効かないので、イメージ名を問わず拾う
-    const dockerStep = jobOf({ steps: [{ uses: "docker://ghcr.io/acme/ci-node:20" }] });
-    expect(collectNodeImageUses([dockerStep])).toHaveLength(1);
-    // container: とステップの両方にあるジョブは、2 箇所として報告する
-    const both = jobOf({ container: "node:20", steps: [{ uses: "docker://node:22" }] });
-    expect(collectNodeImageUses([both])).toHaveLength(2);
+    // **container: はこの検査の対象外** — その中でも setup-node は効くので、
+    // 誤りは「setup-node が無いこと」のほうであり、別の検査が落とす
+    expect(collectImageOnlySteps([jobOf({ container: "node:20" })])).toEqual([]);
+    // 第三者アクションや run: だけのステップは対象外
+    expect(collectImageOnlySteps([jobOf({ steps: [{ uses: "actions/checkout@v7" }] })])).toEqual([]);
     // 文言に使う場所の文字列は、YAML に現れるとおりで空白を挟まない
-    expect(collectNodeImageUses([dockerStep])[0]?.location).toBe("docker://ghcr.io/acme/ci-node:20");
-    expect(collectNodeImageUses([jobOf({ container: "node:20" })])[0]?.location).toBe(
-      "container: node:20",
-    );
+    expect(collectImageOnlySteps([dockerStep])[0]?.location).toBe("docker://ghcr.io/acme/ci-node:20");
   });
 
   it("除外表の腐りを見る判定が、実際に腐りだけを拾う", () => {
     // 実在するジョブのキー (合成)
     const existing = new Set(["ci.yml:lint-and-test"]);
     // 実在するキーだけの表は腐っていない
-    expect(staleExclusions({ "ci.yml:lint-and-test": "理由" }, existing)).toEqual([]);
+    expect(staleExclusions({ "ci.yml:lint-and-test": { setupNode: "理由" } }, existing)).toEqual([]);
     // 実在しないキーは名指しする (ジョブを改名・削除したあとの置き去り)
-    expect(staleExclusions({ "ci.yml:gone": "理由" }, existing)).toEqual(["ci.yml:gone"]);
+    expect(staleExclusions({ "ci.yml:gone": { setupNode: "理由" } }, existing)).toEqual([
+      "ci.yml:gone",
+    ]);
     // 空の表は腐りようが無い
     expect(staleExclusions({}, existing)).toEqual([]);
-    // 理由が空・空白だけの登録を名指しする (値を読まないと空白で黙らせられる)
-    expect(exclusionsWithoutReason({ "a:b": "理由あり" })).toEqual([]);
-    expect(exclusionsWithoutReason({ "a:b": "   " })).toEqual(["a:b"]);
-    expect(exclusionsWithoutReason({ "a:b": "" })).toEqual(["a:b"]);
+    // 理由が書かれていれば読める登録 (免除先ごとに書ける)
+    expect(exclusionsWithoutReason({ "a:b": { setupNode: "理由あり" } })).toEqual([]);
+    expect(exclusionsWithoutReason({ "a:b": { image: "理由あり" } })).toEqual([]);
+    // 空白だけの理由は名指しする (値を読まないと空白で黙らせられる)
+    expect(exclusionsWithoutReason({ "a:b": { setupNode: "   " } })).toEqual(["a:b"]);
+    expect(exclusionsWithoutReason({ "a:b": { image: "" } })).toEqual(["a:b"]);
+    // **免除先を 1 つも書いていない登録**も名指しする (何も免除しないのに
+    // 「除外済み」に見えるうえ、実在チェックだけを通ってしまう)
+    expect(exclusionsWithoutReason({ "a:b": {} })).toEqual(["a:b"]);
   });
 
   it("describeInputs が、循環参照を含む with: でも例外を投げない", () => {

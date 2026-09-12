@@ -28,6 +28,13 @@ jobs:
           node-version-file: '.nvmrc'
           cache: 'npm'
 
+      # 実際に走る Node が .nvmrc と同じ major かを、その Node 自身に確かめる。
+      # 上の配線を静的に見る検査（tests/node-runtime-alignment.test.ts）は
+      # 「宣言として YAML に書かれた Node」までしか見えないので、run: の中で
+      # 入れ替える形などは原理的に見えない。ここは綴りに依存しない最後の砦。
+      - name: Verify Node major matches .nvmrc
+        run: node scripts/verify-node-major.mjs
+
       - name: Install dependencies
         run: npm ci
 
