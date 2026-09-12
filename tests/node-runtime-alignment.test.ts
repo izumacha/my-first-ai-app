@@ -341,6 +341,10 @@ interface WorkflowJob {
   name: string;
   // そのジョブの定義 (steps / continue-on-error などを読む)
   definition: Record<string, unknown>;
+  // ワークフロー全体の `env:` (トップレベル)。ジョブ単位の env と同じく
+  // **宣言として YAML に現れる差し替え**なので、PATH の宣言をここからも読む。
+  // 合成したジョブを渡すテストのために省略可
+  workflowEnv?: unknown;
 }
 
 /**
@@ -382,6 +386,61 @@ interface WorkflowScan {
 }
 
 /**
+ * 解釈できたワークフロー 1 本から、ジョブを平らに取り出す (読めない箇所は原因を返す)。
+ *
+ * **走査本体から切り出してあるのは、ここがテストから叩けないと退行が拾えないから。**
+ * `scanWorkflows` は実在の `.github/workflows/` を読むので、合成した中身を
+ * 食わせられない。実測でも、**ワークフロー全体の `env:` を運ぶのをやめる変異が
+ * 全件緑のまま通った** (運ぶ先の判定はテストがあるのに、運ぶ配線だけ無検証だった)。
+ *
+ * 読めない形を 3 段すべてで落とすのは、1 段でも緩いとそのジョブだけが検査から
+ * 静かに外れるため (実測で 1 段ずつ見つかった)。
+ */
+function jobsOfWorkflow(
+  file: string,
+  value: unknown,
+): { jobs: WorkflowJob[]; problems: string[] } {
+  // 取り出せたジョブ
+  const jobs: WorkflowJob[] = [];
+  // 読めなかった箇所の原因
+  const problems: string[] = [];
+  // **ワークフロー全体の `env:`** も一緒に運ぶ (ジョブ単位の env と同じく
+  // そのジョブの全ステップに効くので、PATH の宣言をここからも読む)
+  const workflowEnv = asRecord(value).env;
+  // **`jobs` が対応表になっていることまで確かめる。**
+  // `readParsed` が見るのはトップレベルだけなので、`jobs: "extra"` のような形は
+  // 例外にならず `asRecord` が `{}` に潰す = そのワークフローが黙って検査から外れる
+  // (トップレベルで塞いだのと同じ fail-open が 1 段下に残っていた。実測)
+  const jobsValue = asRecord(value).jobs;
+  if (!isPlainMapping(jobsValue)) {
+    problems.push(`${file}: jobs が対応表ではありません (${describeShape(jobsValue)})`);
+    return { jobs, problems };
+  }
+  // jobs 直下をジョブ名付きで平らに並べる
+  for (const [name, definition] of Object.entries(jobsValue)) {
+    // ジョブの中身も対応表でなければ、steps も continue-on-error も読めない = 見逃す側に倒れる
+    if (!isPlainMapping(definition)) {
+      problems.push(
+        `${file}: ジョブ ${name} の定義が対応表ではありません (${describeShape(definition)})`,
+      );
+      continue;
+    }
+    // **`steps` の 1 段下も同じ扱いで見る。** `steps: "npm ci"` や
+    // `steps: ["npm ci"]` は例外にならず、配列判定 / `asRecord` が黙って潰すため、
+    // そのジョブが検査すべてから外れる (実測で全件緑のまま通った)
+    const stepsProblem = describeStepsProblem(definition.steps);
+    if (stepsProblem !== null) {
+      problems.push(`${file}: ジョブ ${name} の ${stepsProblem}`);
+      continue;
+    }
+    // 読めたジョブを、どのワークフローの何という名前か・全体の env と一緒に控える
+    jobs.push({ file, name, definition, workflowEnv });
+  }
+  // 取り出せたジョブと、読めなかった箇所を返す
+  return { jobs, problems };
+}
+
+/**
  * 置き場のワークフローすべてを読み、ジョブを平らに並べる。
  *
  * **走査を 1 か所に集めるのが目的。** Node の版が入り込む口は 3 つ
@@ -417,36 +476,11 @@ function scanWorkflows(): WorkflowScan {
       unreadable.push(`${file}: ${describeReadError(read.error, REPO_ROOT)}`);
       continue;
     }
-    // **`jobs` が対応表になっていることまで確かめる。**
-    // `readParsed` が見るのはトップレベルだけなので、`jobs: "extra"` のような形は
-    // 例外にならず `asRecord` が `{}` に潰す = そのワークフローが黙って検査から外れる
-    // (トップレベルで塞いだのと同じ fail-open が 1 段下に残っていた。実測)
-    const jobsValue = asRecord(read.value).jobs;
-    if (!isPlainMapping(jobsValue)) {
-      unreadable.push(`${file}: jobs が対応表ではありません (${describeShape(jobsValue)})`);
-      continue;
-    }
-    // jobs 直下をジョブ名付きで平らに並べる
-    for (const [name, definition] of Object.entries(jobsValue)) {
-      // ジョブの中身も対応表でなければ、steps も continue-on-error も読めない = 見逃す側に倒れる
-      if (!isPlainMapping(definition)) {
-        unreadable.push(
-          `${file}: ジョブ ${name} の定義が対応表ではありません (${describeShape(definition)})`,
-        );
-        continue;
-      }
-      // **`steps` の 1 段下も同じ扱いで見る。** `steps: "npm ci"` や
-      // `steps: ["npm ci"]` は例外にならず、配列判定 / `asRecord` が黙って潰すため、
-      // そのジョブが 3 つの検査すべてから外れる (`jobs` と ジョブ定義で塞いだのと
-      // 同じ fail-open が 1 段下に残っていた。実測で全件緑のまま通った)
-      const stepsProblem = describeStepsProblem(definition.steps);
-      if (stepsProblem !== null) {
-        unreadable.push(`${file}: ジョブ ${name} の ${stepsProblem}`);
-        continue;
-      }
-      // 読めたジョブを、どのワークフローの何という名前かと一緒に控える
-      jobs.push({ file, name, definition });
-    }
+    // 解釈できた 1 本からジョブを取り出す (判定の中身は jobsOfWorkflow が持つ)
+    const extracted = jobsOfWorkflow(file, read.value);
+    // 読めたジョブを積み、読めなかった箇所は原因付きで控える
+    jobs.push(...extracted.jobs);
+    unreadable.push(...extracted.problems);
   }
   // ジョブ・読めなかったファイル・置き場の読み取り失敗を返す (すべて呼び出し側が検査する)
   return { jobs, unreadable, listError: listing.error };
@@ -467,6 +501,25 @@ function scanWorkflows(): WorkflowScan {
  * `.nvmrc` と別の major で CI が回る (実測で全件緑のまま通った)。
  */
 const SETUP_NODE_USES = /^actions\/setup-node(@|$)/i;
+
+/**
+ * ステップの `with:` を、**キーを小文字にそろえた**対応表として読む。
+ *
+ * **GitHub はアクションの入力名を大文字小文字を無視して解決する。** ランナーは
+ * `with: { Node-Version: '20' }` を `INPUT_NODE-VERSION=20` として渡し、
+ * `core.getInput('node-version')` は名前を大文字化して引くので、**setup-node は
+ * これを `node-version` の指定として受け取り Node 20 を入れる**。
+ * キーをそのまま比べると、この綴りだけが検査から外れて版の直書きが通る (実測で全件緑)。
+ * `uses:` の照合を `/i` にしたのとまったく同じ事情なので、同じ扱いにそろえる。
+ *
+ * 値は触らない — 見るのは「どのキーが書かれているか」と `node-version-file` の綴りだけ。
+ */
+function normalizeInputs(withValue: unknown): Record<string, unknown> {
+  // with: が対応表でなければ空として扱う (指定なしと同じ)
+  const raw = asRecord(withValue);
+  // キーを小文字にそろえて詰め直す
+  return Object.fromEntries(Object.entries(raw).map(([key, value]) => [key.toLowerCase(), value]));
+}
 
 /**
  * ジョブの `steps` を対応表の配列として取り出す (steps を持たないジョブは null)。
@@ -607,7 +660,7 @@ function collectSetupNodeSteps(jobs: readonly WorkflowJob[]): SetupNodeStep[] {
     // setup-node のステップに絞り、その with をファイル名・ジョブ名付きで返す
     return steps
       .filter(isSetupNodeStep)
-      .map((step) => ({ file: job.file, job: job.name, inputs: asRecord(step.with) }));
+      .map((step) => ({ file: job.file, job: job.name, inputs: normalizeInputs(step.with) }));
   });
 }
 
@@ -896,6 +949,24 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
         },
       ];
     }
+    // **ジョブ / ワークフロー単位の `env: PATH:` は、そのジョブの全ステップに効く。**
+    // ステップ単位のものと同じく**宣言として YAML に現れる**のに読まないと、
+    // ジョブ単位で `/opt/node20/bin` を先頭に置き、実行時検証のステップだけ
+    // step 単位の `env:` で正しい PATH に戻す、という 2 段構えで
+    // **両方の網が緑のまま**スイートが別の Node で走る (実測)。
+    // 位置に関係なく効くので、宣言があること自体を落とす (直し方は「宣言しない」)。
+    const scopedPathEnv = ["ジョブ", "ワークフロー"].filter((_, index) =>
+      declaresPathEnv(index === 0 ? job.definition : { env: job.workflowEnv }),
+    );
+    if (scopedPathEnv.length > 0) {
+      return [
+        {
+          file: job.file,
+          job: job.name,
+          reason: `${scopedPathEnv.join(" / ")}単位の env: で PATH を宣言している (そのジョブの全ステップの探索パスが変わる)`,
+        },
+      ];
+    }
     // 必ず効く setup-node の位置 (if: / continue-on-error 付きは数えない)
     const setupIndex = steps.findIndex(isUnconditionalSetupNode);
     // 無条件の setup-node が 1 つも無い場合は、条件付きの有無で文言を分ける
@@ -997,8 +1068,16 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
           reason:
             `${RUNTIME_VERIFIER} より後ろに Node を差し替えうるステップがある ` +
             `(${swappers.map(describeSwapper).join(" / ")})。検証した Node のまま走る保証が無い。` +
-            `Node と無関係なステップ (actions/cache 等) なら、検証より前か、` +
-            `最後にリポジトリのコードを実行するステップより後ろへ移すこと`,
+            // **直し方は 2 通りあり、ローカル action だけ別**。第三者アクションや
+            // `env: PATH:` は位置を変えれば済むが、`uses: ./...` は**それ自身が
+            // リポジトリのコード**なので、前へ出せば「検証より前」、後ろへ出そうにも
+            // 自分が最後のリポジトリのコード — どちらの案内も成立しない。
+            // 案内どおりに直せない要求は、いずれ検査ごと緩められる (この repo が
+            // 繰り返し避けている形) ので、取れる手段だけを書く
+            (swappers.some((step) => usesOf(step).startsWith("./"))
+              ? "ローカル action の中身は読めないので、Node を使う処理はジョブ側の run: で行うこと"
+              : "Node と無関係なステップ (actions/cache 等) なら、検証より前か、" +
+                "最後にリポジトリのコードを実行するステップより後ろへ移すこと"),
         },
       ];
     }
@@ -1304,6 +1383,9 @@ describe("実行する Node の major を宣言しているすべての場所の
     // すべてのステップが `.nvmrc` を参照していることを確かめる。
     // **`node-version` を書いた形は、値が合っていても許さない** — 合っているかどうかは
     // その瞬間の話で、片方だけ書き換えれば静かにずれる (版を書き写せる構造そのものを断つ)。
+    // **キーは大文字小文字を無視して読む** (normalizeInputs)。`Node-Version` と
+    // 書いても GitHub は `node-version` として解決するので、区別すると
+    // その綴りだけが検査から外れる (実測)。
     // **綴りは素の `.nvmrc` だけを認める (意図的)。** `'./.nvmrc'` は setup-node では
     // 同じファイルを指すがここでは落ちる。許す綴りを増やすと「同じものを指す書き方」の
     // 一覧を抱え込むことになり、しかも誤りは**赤へ倒れる**ので見逃す側には転ばない
@@ -1805,8 +1887,7 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
         reason:
           `${RUNTIME_VERIFIER} より後ろに Node を差し替えうるステップがある ` +
           "(./.github/actions/run-suite)。検証した Node のまま走る保証が無い。" +
-          "Node と無関係なステップ (actions/cache 等) なら、検証より前か、" +
-          "最後にリポジトリのコードを実行するステップより後ろへ移すこと",
+          "ローカル action の中身は読めないので、Node を使う処理はジョブ側の run: で行うこと",
       },
     ]);
     // **`needs:` の先から伝播してくるスキップも名指しする。** ゲートジョブが
@@ -1848,6 +1929,36 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
     expect(collectJobsMissingSetupNode([otherFileGate, dependsOnPlain, plain])).toEqual(
       [],
     );
+    // **ジョブ単位 / ワークフロー単位の `env: PATH:` も名指しする。** そのジョブの
+    // 全ステップに効くので、実行時検証のステップだけ step 単位で正しい PATH に
+    // 戻す 2 段構えにすると、両方の網が緑のままスイートが別の Node で走る (実測)
+    const jobPathEnv = jobOf({ env: { PATH: "/opt/node20/bin:/usr/bin" }, steps: compliantSteps });
+    expect(collectJobsMissingSetupNode([jobPathEnv])).toEqual([
+      {
+        file: "synthetic.yml",
+        job: "job",
+        reason: "ジョブ単位の env: で PATH を宣言している (そのジョブの全ステップの探索パスが変わる)",
+      },
+    ]);
+    // ワークフロー全体の env: も同じ扱い
+    const workflowPathEnv = {
+      file: "synthetic.yml",
+      name: "job",
+      definition: { steps: compliantSteps },
+      workflowEnv: { PATH: "/opt/node20/bin:/usr/bin" },
+    };
+    expect(collectJobsMissingSetupNode([workflowPathEnv])).toEqual([
+      {
+        file: "synthetic.yml",
+        job: "job",
+        reason:
+          "ワークフロー単位の env: で PATH を宣言している (そのジョブの全ステップの探索パスが変わる)",
+      },
+    ]);
+    // PATH 以外の env: は通す (誤検知を出さない)
+    expect(
+      collectJobsMissingSetupNode([jobOf({ env: { CI: "true" }, steps: compliantSteps })]),
+    ).toEqual([]);
     // **ステップの `env: PATH:` も差し替えとして名指しする。** `uses:` と同じく
     // 宣言として YAML に現れるので静的に読める — 読まないと、正しい setup-node と
     // 検証を置いたうえで `env:` を添えるだけでスイートが別の Node で走り、
@@ -1949,6 +2060,51 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
     const imageOnly = jobOf({ steps: [{ uses: "docker://node:20" }] });
     expect(collectImageOnlySteps([imageOnly])).toHaveLength(1);
     expect(collectJobsMissingSetupNode([imageOnly])).toEqual([]);
+  });
+
+  it("collectSetupNodeSteps が、with: のキーを大文字小文字を無視して読む", () => {
+    // GitHub はアクションの入力名を大文字小文字を無視して解決するので、
+    // `Node-Version` と書いても setup-node は `node-version` として受け取り
+    // Node 20 を入れる。区別するとこの綴りだけが検査から外れる (実測で全件緑)
+    const cased = jobOf({
+      steps: [
+        {
+          uses: "actions/setup-node@v7",
+          with: { "Node-Version": "20", "NODE-VERSION-FILE": ".nvmrc" },
+        },
+      ],
+    });
+    // 取り出した with: は、キーが小文字にそろっている
+    expect(collectSetupNodeSteps([cased])[0]?.inputs).toEqual({
+      "node-version": "20",
+      "node-version-file": ".nvmrc",
+    });
+    // 素の綴りはそのまま読める (誤検知を出さない)
+    const plain = jobOf({
+      steps: [{ uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } }],
+    });
+    expect(collectSetupNodeSteps([plain])[0]?.inputs).toEqual({ "node-version-file": ".nvmrc" });
+  });
+
+  it("jobsOfWorkflow が、ワークフロー全体の env: をジョブへ運ぶ", () => {
+    // **運ぶ配線そのものを固定する。** 運び先の判定にはテストがあるのに、
+    // 運ぶ側が無検証だと「全体の env を読まない」変異が全件緑で通る (実測)
+    const extracted = jobsOfWorkflow("synthetic.yml", {
+      env: { PATH: "/opt/node20/bin:/usr/bin" },
+      jobs: { build: { steps: [{ run: "npm ci" }] } },
+    });
+    // 読めない箇所は無い
+    expect(extracted.problems).toEqual([]);
+    // ジョブ 1 つに、全体の env がそのまま付いている
+    expect(extracted.jobs).toHaveLength(1);
+    expect(extracted.jobs[0]?.workflowEnv).toEqual({ PATH: "/opt/node20/bin:/usr/bin" });
+    // 全体の env が無いワークフローでは undefined のまま (誤検知を出さない)
+    const noEnv = jobsOfWorkflow("synthetic.yml", { jobs: { build: { steps: [] } } });
+    expect(noEnv.jobs[0]?.workflowEnv).toBeUndefined();
+    // 読めない形は 3 段それぞれで原因を返す
+    expect(jobsOfWorkflow("x.yml", { jobs: "extra" }).problems).toHaveLength(1);
+    expect(jobsOfWorkflow("x.yml", { jobs: { a: [] } }).problems).toHaveLength(1);
+    expect(jobsOfWorkflow("x.yml", { jobs: { a: { steps: "npm ci" } } }).problems).toHaveLength(1);
   });
 
   it("describeInputs が、循環参照を含む with: でも例外を投げない", () => {
