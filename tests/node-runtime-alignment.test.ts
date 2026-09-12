@@ -101,7 +101,12 @@
 //   `scripts/verify-node-major.mjs` が、スイートを動かすその Node 自身に
 //   「`.nvmrc` と同じ major か」を申告させる (綴りに依存しないので、`run:` の中で
 //    入れ替える形・式で決まるイメージ・他リポジトリの再利用可能ワークフローを
-//    まとめて覆う)。この検査はそれが CI から消えていないことも見る。
+//    まとめて覆う)。この検査は、**リポジトリのコードを実行するジョブすべてが**
+//   それを無条件で、しかも `setup-node` より後ろで走らせていることまで見る
+//   (「どこかの 1 ジョブが走らせていればよい」にすると、スイートを走らせる 2 本目の
+//    ジョブで `run: nvm install 20` と書いても全件緑で通った。setup-node より前に
+//    置くとランナー既定の Node を検証する空振りになる。パスを含むだけの
+//    `echo 'skipping …'` も「実行した」と数えてしまう。いずれも実測)。
 //   **判定そのものの挙動は、このファイル末尾のテーブル駆動テストが固定する。**
 //   実際の `ci.yml` が準拠しているだけでは、判定を潰しても (`isUnconditionalSetupNode`
 //   を `return true` にする等) 全件緑のまま通ってしまい、「塞いだ」証拠が
@@ -702,6 +707,21 @@ function describeInputs(inputs: Record<string, unknown>): string {
     .join(", ");
 }
 
+/**
+ * そのステップが**実行時検証を実際に起動している**かを判定する。
+ *
+ * パスを含むかどうかだけを見ると、`echo 'skipping scripts/verify-node-major.mjs'` や
+ * 複数行 `run:` の中のコメント行でも満たせてしまう (スクリプトは 1 度も走らない)。
+ * そこで `run:` を行に割り、**`node <パス>` そのものの行**があることを求める。
+ */
+function invokesRuntimeVerifier(step: Record<string, unknown>): boolean {
+  // run: を行に割り、前後の空白を落とす
+  return String(step.run ?? "")
+    .split("\n")
+    .map((line) => line.trim())
+    .some((line) => new RegExp(`^node\\s+${RUNTIME_VERIFIER.replace(/[.]/g, "\\.")}$`).test(line));
+}
+
 /** 失敗文言に出す、ステップ 1 つの短い説明。 */
 function describeStep(step: Record<string, unknown>): string {
   // run: なら最初の 1 行だけを出す (複数行をそのまま出すと文言が読めなくなる)
@@ -767,20 +787,18 @@ function collectJobsMissingSetupNode(
     const firstRepoCode = steps.findIndex(runsRepositoryCode);
     // 1 つも無ければ、第三者アクションだけのジョブなので対象外
     if (firstRepoCode === -1) return [];
-    // **ジョブ単位の `continue-on-error` も同じ結末を招く。** 付いているとジョブが
-    // 失敗してもワークフローは成功で報告されるので、setup-node が失敗して
-    // lint / typecheck / test が 1 つも走らなくても CI は緑になる (実測で素通りした)。
-    // ステップ側と同じく、明示的な false 以外を「効かなくても進む書き方」として扱う
-    const jobContinues =
-      "continue-on-error" in job.definition && job.definition["continue-on-error"] !== false;
-    if (jobContinues) {
-      return [
-        {
-          file: job.file,
-          job: job.name,
-          reason: "ジョブに continue-on-error が付いている (失敗しても CI は緑になる)",
-        },
-      ];
+    // **ジョブ単位の `if:` / `continue-on-error` も同じ結末を招く。** どちらも
+    // 「ジョブが走らない・失敗してもワークフローは成功」になるため、lint / typecheck /
+    // test / e2e が 1 つも動かないまま CI が緑になる (どちらも実測で素通りした)。
+    // 条件の中身は静的に決まらないので、ステップ側と同じく「無条件でないこと」で落とす。
+    // 意図して条件を付けるジョブは NODE_GUARD_EXEMPTIONS の setupNode へ理由付きで登録する
+    if (!isUnconditionalStep(job.definition)) {
+      // どちらが付いているかを文言で分ける (直す先が違うため)
+      const reason =
+        "if" in job.definition
+          ? "ジョブに if: が付いている (スキップされても CI は緑になる)"
+          : "ジョブに continue-on-error が付いている (失敗しても CI は緑になる)";
+      return [{ file: job.file, job: job.name, reason }];
     }
     // 必ず効く setup-node の位置 (if: / continue-on-error 付きは数えない)
     const setupIndex = steps.findIndex(isUnconditionalSetupNode);
@@ -791,6 +809,31 @@ function collectJobsMissingSetupNode(
         ? "setup-node に if: / continue-on-error が付いている (効かなくても後続が走る)"
         : "setup-node が無い";
       return [{ file: job.file, job: job.name, reason }];
+    }
+    // **実行時検証も同じジョブで、無条件・setup-node より後ろに置く。**
+    // 「どこかの 1 ジョブが走らせていればよい」にすると、スイートを走らせる 2 本目の
+    // ジョブで `run: nvm install 20` と書いても全件緑のまま通る (実測)。
+    // setup-node より前に置くと、ランナー既定の Node を検証するだけの空振りになる
+    const verifierIndex = steps.findIndex(
+      (step) => invokesRuntimeVerifier(step) && isUnconditionalStep(step),
+    );
+    // 1 つも無ければ、そのジョブは「宣言として見えない形」を何も検証していない
+    if (verifierIndex === -1) {
+      // 実体が無いのか、条件付きなのかを文言で分ける
+      const reason = steps.some(invokesRuntimeVerifier)
+        ? `${RUNTIME_VERIFIER} に if: / continue-on-error が付いている`
+        : `${RUNTIME_VERIFIER} を実行していない`;
+      return [{ file: job.file, job: job.name, reason }];
+    }
+    // setup-node より前だと、用意した Node ではなくランナー既定の Node を見てしまう
+    if (verifierIndex < setupIndex) {
+      return [
+        {
+          file: job.file,
+          job: job.name,
+          reason: `${RUNTIME_VERIFIER} が setup-node より前にある (用意した Node を検証していない)`,
+        },
+      ];
     }
     // 置いてあっても、リポジトリのコードより後ろなら前半はランナー既定の Node で走る
     if (setupIndex > firstRepoCode) {
@@ -884,8 +927,11 @@ function readDockerfileNodeMajor(): number | null {
     if (image === undefined) continue;
     // 公式の node イメージでなければ対象外 (ビルドに使う別イメージの段は見ない)
     if (!isNodeImage(image)) continue;
-    // タグから major を取り出す (`node:26-alpine` → 26。ダイジェストだけの指定は読めない)
-    const tag = image.split("@")[0].split(":")[1] ?? "";
+    // タグから major を取り出す。**最後のパス要素だけを見る** —
+    // 参照全体を `:` で割ると `registry.corp.example:5000/node:26` の
+    // ポート番号 (5000) を major と読み違える (実測で「Dockerfile=5000」と報告された)
+    const lastSegment = image.split("@")[0].split("/").pop() ?? "";
+    const tag = lastSegment.split(":")[1] ?? "";
     const major = tag.match(/^(\d+)/);
     // 数字で始まるタグだけを採用する (`node:lts` のような形は「読めない」に倒す)
     if (major) majors.add(Number(major[1]));
@@ -1146,25 +1192,6 @@ describe("実行する Node の major を宣言しているすべての場所の
       workflows.jobs,
       new Set(imageOnlySteps.map((use) => jobKey(use.file, use.job))),
     ).map((job) => `${job.file}: ${job.job} (${job.reason})`);
-    // **実行時の検証が CI から消えていないことも見る。** 上の 3 つは宣言しか見ないので、
-    // 見えない形 (run: の中で Node を入れ替える等) の担保はこのスクリプトだけが持つ。
-    // 呼び出しが消えても静的な検査はすべて緑のままになる
-    // **「必ず効く置き方で呼んでいるか」まで見る。** パスを grep するだけだと、
-    // そのステップに `if:` / `continue-on-error: true` を足すだけで実行時の担保が
-    // 消えるのに検査は全件緑のまま通る (実測)。setup-node に対して同じ形を
-    // 塞いでいるのに、その要である「最後の砦」に掛けていなければ意味が無い
-    const runsVerifier = workflows.jobs.some((job) =>
-      (stepRecordsOf(job) ?? []).some(
-        (step) => String(step.run ?? "").includes(RUNTIME_VERIFIER) && isUnconditionalStep(step),
-      ),
-    );
-    expect.soft(
-      runsVerifier,
-      `どのジョブも ${RUNTIME_VERIFIER} を無条件で実行していない (if: / continue-on-error が付いていないか)。` +
-        "静的な検査は宣言として YAML に現れる Node しか見られないので、" +
-        "実際に走る Node を確かめるこのステップが無くなると、run: の中で入れ替える形などが" +
-        "まったく検証されない状態になる。",
-    ).toBe(true);
     expect.soft(
       missingSetup,
       `このリポジトリのコードを実行するジョブ (run: / ローカル action の呼び出し) には、` +
@@ -1526,15 +1553,17 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
     expect(describeStepsProblem(steps) === null).toBe(readable);
   });
 
+  // 期待どおりの置き方のステップ列 (checkout → setup-node → 実行時検証 → npm)
+  const compliantSteps = [
+    { uses: "actions/checkout@v7" },
+    { uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } },
+    { run: "node scripts/verify-node-major.mjs" },
+    { run: "npm ci" },
+  ];
+
   it("collectJobsMissingSetupNode が、置き方の誤りだけを名指しする", () => {
-    // 期待どおりの置き方 (checkout → setup-node → npm) は名指ししない
-    const compliant = jobOf({
-      steps: [
-        { uses: "actions/checkout@v7" },
-        { uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } },
-        { run: "npm ci" },
-      ],
-    });
+    // 期待どおりの置き方は名指ししない
+    const compliant = jobOf({ steps: compliantSteps });
     expect(collectJobsMissingSetupNode([compliant], new Set())).toEqual([]);
     // setup-node がリポジトリのコードより後ろにある形は名指しする
     const tooLate = jobOf({ steps: [{ run: "npm ci" }, { uses: "actions/setup-node@v7" }] });
@@ -1549,17 +1578,40 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
     const reusable = jobOf({ uses: "other-org/repo/.github/workflows/x.yml@v1" });
     expect(collectJobsMissingSetupNode([reusable], new Set())).toEqual([]);
     // ジョブ単位の continue-on-error は、失敗しても CI が緑になるので名指しする
-    const jobContinues = jobOf({
-      "continue-on-error": true,
-      steps: [{ uses: "actions/setup-node@v7" }, { run: "npm ci" }],
-    });
+    const jobContinues = jobOf({ "continue-on-error": true, steps: compliantSteps });
     expect(collectJobsMissingSetupNode([jobContinues], new Set())).toHaveLength(1);
     // 明示的な false は「効かなくても進む書き方」ではないので通す
-    const jobStops = jobOf({
-      "continue-on-error": false,
-      steps: [{ uses: "actions/setup-node@v7" }, { run: "npm ci" }],
-    });
+    const jobStops = jobOf({ "continue-on-error": false, steps: compliantSteps });
     expect(collectJobsMissingSetupNode([jobStops], new Set())).toEqual([]);
+    // **ジョブ単位の if: も同じ結末**（スキップされてもワークフローは成功で報告される）
+    const jobConditional = jobOf({ if: "github.event_name == 'push'", steps: compliantSteps });
+    expect(collectJobsMissingSetupNode([jobConditional], new Set())).toHaveLength(1);
+    // 実行時検証を置いていないジョブも名指しする (宣言として見えない形を何も検証していない)
+    const noVerifier = jobOf({
+      steps: [
+        { uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } },
+        { run: "npm ci" },
+      ],
+    });
+    expect(collectJobsMissingSetupNode([noVerifier], new Set())).toHaveLength(1);
+    // 実行時検証が setup-node より前だと、ランナー既定の Node を見る空振りになる
+    const verifierTooEarly = jobOf({
+      steps: [
+        { run: "node scripts/verify-node-major.mjs" },
+        { uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } },
+        { run: "npm ci" },
+      ],
+    });
+    expect(collectJobsMissingSetupNode([verifierTooEarly], new Set())).toHaveLength(1);
+    // パスに触れているだけの run: は「実行している」と認めない
+    const mentionsOnly = jobOf({
+      steps: [
+        { uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } },
+        { run: "echo 'skipping scripts/verify-node-major.mjs for now'" },
+        { run: "npm ci" },
+      ],
+    });
+    expect(collectJobsMissingSetupNode([mentionsOnly], new Set())).toHaveLength(1);
     // イメージ側の検査が名指ししたジョブは、そちらの文言に任せる (重複させない)
     const excluded = new Set([jobKey("synthetic.yml", "job")]);
     expect(collectJobsMissingSetupNode([missing], excluded)).toEqual([]);
@@ -1601,6 +1653,7 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
     const mixed = jobOf({
       steps: [{ uses: "docker://hadolint/hadolint:latest" }, { run: "npm ci && npm run test" }],
     });
+    // (setup-node も実行時検証も無いので、免除しなければ両方の検査が名指しする)
     // このジョブを指すキー
     const key = jobKey("synthetic.yml", "job");
     // image だけを免除しても、setup-node の要求は残る (免除の取り違えを落とす)
