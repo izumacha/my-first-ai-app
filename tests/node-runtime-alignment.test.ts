@@ -97,11 +97,14 @@
 //   次の抜け道が出てくる終わりのない作業になる (この repo が CSP の静的解析で
 //   実際に踏んだ形)。**「増やしたことに気付く」ための網であって証明ではない**、
 //   と理解して使うこと。
-//   **見えない形の担保は、静的な検査ではなく CI の 1 ステップが持つ。**
-//   `scripts/verify-node-major.mjs` が、スイートを動かすその Node 自身に
-//   「`.nvmrc` と同じ major か」を申告させる (綴りに依存しないので、`run:` の中で
-//    入れ替える形・式で決まるイメージ・他リポジトリの再利用可能ワークフローを
-//    まとめて覆う)。この検査は、**リポジトリのコードを実行するジョブすべてが**
+//   **宣言として見えない入れ替えの一部は、静的な検査ではなく CI の 1 ステップが持つ。**
+//   `scripts/verify-node-major.mjs` が、その行を走らせる Node 自身に
+//   「`.nvmrc` と同じ major か」を申告させる (綴りに依存しない)。
+//   **覆えるのは「ジョブ全体に効く入れ替え」まで** — `$GITHUB_PATH` への追記、
+//   ツールキャッシュの差し替え、コンテナイメージ、`setup-node` の指定。
+//   **同じ `run:` の中だけで完結する入れ替え** (`. nvm.sh && nvm use 20 && npm test`) は
+//   `run:` ごとにシェルが新しくなるため、別ステップのこの検証からは観測できない (実測)。
+//   そこは静的にも見えない**残る境界**で、レビューで見るしかない。この検査は、**リポジトリのコードを実行するジョブすべてが**
 //   それを無条件で、しかも `setup-node` より後ろで走らせていることまで見る
 //   (「どこかの 1 ジョブが走らせていればよい」にすると、スイートを走らせる 2 本目の
 //    ジョブで `run: nvm install 20` と書いても全件緑で通った。setup-node より前に
@@ -164,6 +167,10 @@ const NVMRC_PATH = resolve(REPO_ROOT, ".nvmrc");
 // **どのジョブからも呼ばれなくなったら、静的な網だけが残って性質の担保が消える**ので、
 // 少なくとも 1 つのワークフローが走らせていることを下の検査で固定する
 const RUNTIME_VERIFIER = "scripts/verify-node-major.mjs";
+// 上のスクリプトを**実際に起動している** `run:` の 1 行。パスを含むだけの行
+// (`echo 'skipping scripts/verify-node-major.mjs'`) と区別するために形で照合する。
+// 組み立ては 1 度だけ (`SETUP_NODE_USES` と同じく module スコープの定数にそろえる)
+const RUNTIME_VERIFIER_LINE = new RegExp(`^node\\s+${RUNTIME_VERIFIER.replace(/[.]/g, "\\.")}$`);
 // ワークフローは**ファイル名を書き並べず、置き場ごと**見る。
 // 特定の 1 本 (ci.yml) だけを対象にすると、Node を用意する別のワークフローを足した瞬間に
 // その 1 本だけが黙って検査から外れる (痕跡はテスト件数すら変わらない)
@@ -465,15 +472,8 @@ function isSetupNodeStep(step: Record<string, unknown>): boolean {
 /**
  * その `setup-node` ステップが **必ず効く** 置き方かを判定する。
  *
- * 「置いてあること」だけでは足りない。**効かなくても後続が走る**書き方が 2 つあり、
- * どちらも結果は同じ（ランナー既定の Node でスイートが走るのに CI は緑）:
- *   - `if:` … 条件が偽なら実行されない。条件の中身は静的に決まらないので、
- *     「無条件でない」ことをもって落とす。
- *   - `continue-on-error:` … ステップが失敗しても**ジョブは成功で終わる**。
- *     `.nvmrc` の版が setup-node のマニフェストにまだ無い等で失敗したとき、
- *     以降の `npm ci` / `npm run test` はランナー既定の Node で走り、しかも緑になる
- *     (実測: これを付けた形は検査を全件緑のまま通っていた)。
- *     明示的な `false` だけは、効かない書き方ではないので通す。
+ * 「置いてあること」だけでは足りない理由と、どの書き方を「効かない」とみなすかは
+ * `isUnconditionalStep` が持つ (写しを置くと、規則を直したとき片方だけが残る)。
  */
 function isUnconditionalSetupNode(step: Record<string, unknown>): boolean {
   // setup-node のステップでなければ対象外
@@ -598,7 +598,10 @@ function isNodeImage(image: string): boolean {
  * キーは `jobKey` と同じ「ワークフローのファイル名 : ジョブ名」。値は**どの検査を
  * 免除するか**を明示する (省略した検査には効かない)。
  *   - `setupNode` … このジョブはリポジトリのコードを Node で走らせない
- *     (例: `run: shellcheck scripts/x.sh` だけのジョブ)。
+ *     (例: `run: shellcheck scripts/x.sh` だけのジョブ)。**実行時検証の要求も一緒に外れる**
+ *     — 「Node を使わない」と宣言している以上、`node scripts/verify-node-major.mjs` を
+ *     置けと求めるのは筋が通らないため。裏を返すと、**このジョブに後から `npm` を足す人は
+ *     除外を外す必要がある** (外さないと setup-node も検証も無いまま走る)。
  *   - `image` … このジョブの `uses: docker://` はイメージに Node を持ち込まない
  *     (例: `docker://hadolint/hadolint`)。
  *
@@ -715,11 +718,11 @@ function describeInputs(inputs: Record<string, unknown>): string {
  * そこで `run:` を行に割り、**`node <パス>` そのものの行**があることを求める。
  */
 function invokesRuntimeVerifier(step: Record<string, unknown>): boolean {
-  // run: を行に割り、前後の空白を落とす
+  // run: を行に割り、前後の空白を落としてから、起動の行そのものを探す
   return String(step.run ?? "")
     .split("\n")
     .map((line) => line.trim())
-    .some((line) => new RegExp(`^node\\s+${RUNTIME_VERIFIER.replace(/[.]/g, "\\.")}$`).test(line));
+    .some((line) => RUNTIME_VERIFIER_LINE.test(line));
 }
 
 /** 失敗文言に出す、ステップ 1 つの短い説明。 */
@@ -835,6 +838,20 @@ function collectJobsMissingSetupNode(
         },
       ];
     }
+    // **リポジトリのコードより後ろでもいけない。** 先にスイートを走らせてから検証すると、
+    // 検証は「そのステップの Node」を見るだけで、既に走り終えた検証 (lint / test / e2e) が
+    // どの Node で動いたかは分からない。`$GITHUB_PATH` などジョブ全体に効く入れ替えを
+    // 挟む形が、後置だと素通りした (実測)。検証自身も `run:` なので、期待どおりの
+    // 並びでは検証が「最初のリポジトリのコード」になる
+    if (verifierIndex > firstRepoCode) {
+      return [
+        {
+          file: job.file,
+          job: job.name,
+          reason: `${RUNTIME_VERIFIER} がリポジトリのコードより後ろにある (先に走った検証の Node が分からない)`,
+        },
+      ];
+    }
     // 置いてあっても、リポジトリのコードより後ろなら前半はランナー既定の Node で走る
     if (setupIndex > firstRepoCode) {
       return [
@@ -933,8 +950,13 @@ function readDockerfileNodeMajor(): number | null {
     const lastSegment = image.split("@")[0].split("/").pop() ?? "";
     const tag = lastSegment.split(":")[1] ?? "";
     const major = tag.match(/^(\d+)/);
-    // 数字で始まるタグだけを採用する (`node:lts` のような形は「読めない」に倒す)
-    if (major) majors.add(Number(major[1]));
+    // **読めない段は黙って飛ばさない。** `node:lts-alpine` / `node@sha256:...` /
+    // タグ無しの `FROM node` は major を取り出せないが、飛ばすと残りの段だけで
+    // 「揃っている」ことになり、まさに検出したい多段ビルドのドリフトが素通りする
+    // (実測で 3 形すべて全件緑)。読めない段があった時点で「読めなかった」に倒す
+    if (!major) return null;
+    // 数字で始まるタグだけを採用する
+    majors.add(Number(major[1]));
   }
   // ちょうど 1 つに揃っているときだけ採用する (0 件 = 読めない / 2 件以上 = 段ごとに食い違い)
   return majors.size === 1 ? [...majors][0] : null;
