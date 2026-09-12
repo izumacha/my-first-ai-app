@@ -52,8 +52,26 @@ function fail(message) {
   // 目印 (リポジトリの絶対パス) を取り除いた、実際に出す 1 行
   const line = `${message.split(repoRoot).join("")}\n`;
   try {
-    // 同期で stderr へ書く (process.exit に追い越されないため)
-    writeSync(2, line);
+    // **書けた分を数えて、全部書けるまで繰り返す。** stderr がノンブロッキングな
+    // パイプ (CI のログ収集がこの形) でバッファに空きが足りないと、write(2) は
+    // 例外ではなく**要求より小さいバイト数**を返す (部分書き込み)。戻り値を捨てると
+    // 次の行の process.exit が残りを道連れにして、`CI が走っている Node (26.1.0) の
+    // major が .nvm` のように文が途中で切れた状態で終了コード 1 になる —
+    // この関数がまさに避けようとしている「終了コード 1 だが理由が分からない」状態。
+    // バイト列にしてから進めるのは、文字数で数えるとマルチバイト (この文言は日本語)
+    // で位置がずれるため
+    const payload = Buffer.from(line, "utf8");
+    // 書き終えたバイト数
+    let written = 0;
+    // 全部書けるまで、書けた分だけ先へ進める
+    while (written < payload.length) {
+      // 残りを書き、実際に書けたバイト数を受け取る
+      const wrote = writeSync(2, payload, written, payload.length - written);
+      // 1 バイトも進まないなら、これ以上待っても終わらないので抜ける (無限ループ防止)
+      if (wrote <= 0) break;
+      // 書けた分だけ位置を進める
+      written += wrote;
+    }
   } catch {
     // **書き込み自体が失敗しても文言を捨てない。** stderr がノンブロッキングな
     // パイプ (CI のログ収集がこの形) でバッファが満杯だと writeSync は EAGAIN を

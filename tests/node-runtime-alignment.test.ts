@@ -30,7 +30,8 @@
 //       (`uses:` が `./` で始まらないため「リポジトリのコードを実行するステップ」に
 //        数えられず、ジョブが要求の対象から外れる。実測)。**イメージ名は問わない** —
 //       `node` という名前に絞ると `docker://ghcr.io/acme/ci-node:20` が素通りした (実測)。
-//       Node を持ち込まないイメージは `NODE_GUARD_EXEMPTIONS` の `image` へ登録する。
+//       Node を持ち込まないイメージでも落ちるが、除外表は置いていない (理由は
+//       `collectImageOnlySteps` の手前の注記)。その形が現れたら検査自体を直す。
 //       **ジョブの `container:` はここでは見ない。** その中でも `setup-node` は動いて
 //       `.nvmrc` の Node を入れるので、`container: node:26-alpine` + 正しい setup-node は
 //       正当な形。一律に落としていたときは、この形に**直しようの無い要求**が出ていた (実測)。
@@ -45,11 +46,9 @@
 //       置いてあるかだけでは足りない — `run: npm ci` の後ろに置いた形、`if:` を
 //       付けた形、ステップ / **ジョブ**の `continue-on-error: true` はどれも実測で
 //       素通りした (前半 / 全体がランナー既定の Node で走る、あるいはジョブが失敗しても
-//       ワークフローが成功で報告されるのに全件緑)。Node と無関係なジョブは
-//       `NODE_GUARD_EXEMPTIONS` の `setupNode` へ理由付きで登録する (判定を `run:` の
-//       文言から当てる形は、綴りが変わるだけで黙って外れた。実測は同定数の docstring に記録)。
-//       **免除は検査ごとに分ける** — 1 つの理由で両方を免除できると、「イメージは Node と
-//       無関係」と登録しただけで同じジョブの `run: npm ci` に対する要求まで外れる (実測)。
+//       ワークフローが成功で報告されるのに全件緑)。判定を `run:` の文言から当てる形は、
+//       綴りが変わるだけで黙って外れた (実測)。**除外表は置いていない** — 空のまま
+//       fail-open を 4 つ抱えていたため外した (理由は `runsRepositoryCode` の手前の注記)。
 //       CI が入れる Node は必ず `.nvmrc` 由来にする、が守りたい 1 つの性質で、
 //       版が入り込む口を 3 つとも塞いでおかないとその性質は保証にならない。
 //       **読めないワークフローが 1 本でもあれば、その時点で落とす。**
@@ -630,90 +629,31 @@ function isNodeImage(image: string): boolean {
 }
 
 /**
- * 検出網を通さない例外を、**理由と適用範囲つき**で 1 枚にまとめた表。
+ * **除外表は置かない (意図的)。**
  *
- * キーは `jobKey` と同じ「ワークフローのファイル名 : ジョブ名」。値は**どの検査を
- * 免除するか**を明示する (省略した検査には効かない)。
- *   - `setupNode` … このジョブはリポジトリのコードを Node で走らせない
- *     (例: `run: shellcheck scripts/x.sh` だけのジョブ)。**実行時検証の要求も一緒に外れる**
- *     — 「Node を使わない」と宣言している以上、`node scripts/verify-node-major.mjs` を
- *     置けと求めるのは筋が通らないため。裏を返すと、**このジョブに後から `npm` を足す人は
- *     除外を外す必要がある** (外さないと setup-node も検証も無いまま走る)。
- *   - `image` … このジョブの `uses: docker://` はイメージに Node を持ち込まない
- *     (例: `docker://hadolint/hadolint`)。
- *   - `runtimeVerifier` … 実行時検証の**置き方だけ**を免除する (検証より前にどうしても
- *     `run:` が要る / 検証より後ろの `uses:` は Node を差し替えないと確認済み)。
- *     **検証を置かないこと自体は免除しない** — 置き場所の事情と「そもそも検証していない」は
- *     別の話で、後者まで外せると担保の中心が鍵 1 つで空洞になる。
+ * 以前はジョブ単位の `NODE_GUARD_EXEMPTIONS` (鍵 `setupNode` / `image` /
+ * `runtimeVerifier`) を持っていたが、**一度も使われないまま fail-open を 4 つ抱えていた**:
+ *   - `image` の免除がジョブ単位だったため、`docker://hadolint` を理由に登録したジョブへ
+ *     後から `docker://node:20` を足すと、その step も一緒に免除された。しかもその形は
+ *     `run:` を持たないので `collectJobsMissingSetupNode` も素通りし、**スイートが
+ *     丸ごと別の Node で走るのに全件緑**になった (実測)。
+ *   - `setupNode` の免除が steps を読む前に打ち切っていたため、ジョブ単位の `if:` /
+ *     `continue-on-error` の検査も、実行時検証の要求も、まとめて外れた (実測)。
+ *   - `runtimeVerifier` の 1 つの理由が「検証より前に `run:` が要る」と
+ *     「検証より後ろの `uses:` は差し替えない」という**別々の主張**を同時に許していた。
  *
- * **範囲を分けているのが要点。** 1 つの理由で両方を免除する形にすると、
- * 「イメージは Node と無関係」と登録しただけで**同じジョブの `run: npm ci` に対する
- * `setup-node` の要求まで黙って外れる** — しかも失敗文言が登録を勧めるので、
- * 検出網が自分で塞いだ穴の開け方を案内することになる (実測で全件緑。
- * `docker://hadolint` + `run: npm ci && npm run test` が通った)。
+ * いずれも「1 つの理由が、その理由では正当化できない検査まで免除する」という同じ形で、
+ * 鍵を分けるたびに次の組み合わせで再発した。**表そのものが空で、実在するジョブは
+ * `ci.yml` の `lint-and-test` 1 つだけ**だったので、存在しない事情のために作った
+ * 逃げ道が、守るはずの保証を黙って外す口になっていたことになる。
  *
- * **これがあるので検査を fail-closed にできる。** 「Node を使っているか」を `run:` の
- * 文言から当てる形 (以前の `NODE_TOOLING_COMMAND`) は、綴りが変わるだけで黙って対象から
- * 外れた (実測: `./node_modules/.bin/vitest run` も `/usr/local/bin/node server.js` も
- * 拾えなかった)。判定は**構造**で行い、当てはまらない例外だけをここへ 1 行ずつ登録する。
- * 表に無いジョブは検査が拾って落ちるので、**次に同じ形のジョブを足す人は
- * 「setup-node を置くか、除外するか」を必ず一度決める**ことになる
- * (incident-insight の除外表と同じ考え方)。
- *
- * **現在は空** — 除外の必要なジョブがまだ無い。エントリが増える差分は、
- * 理由の妥当性をレビューで必ず確認する (署名からは「Node と無関係か」を判定できない、
- * 人が判断するエスケープハッチ)。
+ * そこで表ごと外し、検査はすべて無条件で掛ける。実在するワークフローの挙動は変わらない
+ * (表は空だったので、もともと全ジョブが検査対象だった)。**本当に除外が要るジョブが
+ * 現れたら、そのときの具体例に合わせて範囲を設計する** — この判断は、同じファイルが
+ * `.github/actions/` の走査について書いているのと同じ考え方 (存在しない事情のために
+ * 対象範囲を広げない。CLAUDE.md §6「将来を見越した過度な抽象化は避ける」)。
+ * 逃げ道が無いぶん、例外が要るときは**この検査自体を直す差分**になり、レビューを必ず通る。
  */
-interface JobExemption {
-  // setup-node の要求を免除する理由 (省略 = 免除しない)
-  setupNode?: string;
-  // uses: docker:// のイメージ検査を免除する理由 (省略 = 免除しない)
-  image?: string;
-  // **実行時検証の置き方だけ**を免除する理由 (省略 = 免除しない)。
-  // `setupNode` とは別の鍵にしてある — 「検証より前にどうしても `run:` が要る」
-  // (例: `run: corepack enable`) ジョブを `setupNode` へ登録させると、
-  // **同じジョブの setup-node の要求まで黙って外れる**。
-  // `setupNode` と `image` を分けたのとまったく同じ理由 (1 つの理由で 2 つの検査を
-  // 免除できると、検出網が自分で塞いだ穴の開け方を案内することになる)
-  runtimeVerifier?: string;
-}
-
-const NODE_GUARD_EXEMPTIONS: Readonly<Record<string, JobExemption>> = {};
-
-/**
- * 除外表のうち、**実在しないジョブ**を指しているキーを集める。
- *
- * 判定を関数に出しているのは、表が空のあいだ `Object.keys({})` が常に `[]` を返し、
- * **判定を反転させても全件緑のまま通る**から (実測)。最初の除外が足された時点で
- * 腐りを見逃すようになるので、合成した表を渡すテストで判定自体を固定する。
- */
-function staleExclusions(
-  table: Readonly<Record<string, JobExemption>>,
-  existingJobKeys: ReadonlySet<string>,
-): string[] {
-  // 実在するジョブのキーに無いものだけを残す
-  return Object.keys(table).filter((key) => !existingJobKeys.has(key));
-}
-
-/**
- * 除外表のうち、**理由として読めない登録**を集める。
- *
- * 2 通りある: 書いた理由が空・空白だけ (値を読まない検査だと空白で黙らせられる) と、
- * 免除する検査を 1 つも書いていない登録 (何も免除しないのに「除外済み」に見える)。
- */
-function exclusionsWithoutReason(table: Readonly<Record<string, JobExemption>>): string[] {
-  // 登録を 1 つずつ見て、読めない理由を持つキーだけを残す
-  return Object.entries(table)
-    .filter(([, exemption]) => {
-      // 書かれている理由だけを取り出す
-      const reasons = [exemption.setupNode, exemption.image, exemption.runtimeVerifier].filter(
-        (reason): reason is string => reason !== undefined,
-      );
-      // 1 つも書いていない、または空白だけの理由があれば読めない登録
-      return reasons.length === 0 || reasons.some((reason) => reason.trim() === "");
-    })
-    .map(([key]) => key);
-}
 
 /**
  * そのステップが**このリポジトリのコードを実行する**かを判定する。
@@ -800,8 +740,9 @@ interface MissingSetupNodeJob {
  *     条件の中身は静的に決まらないので、「無条件でない」ことをもって落とす。
  *
  * 判定を `run:` の**文言**から当てないのは、綴りを変えるだけで黙って外れるから
- * (以前の形の実測は `NODE_GUARD_EXEMPTIONS` の docstring に書いた)。構造で見て、
- * 例外は理由付きの表へ登録させる (fail-closed)。
+ * (実測: `./node_modules/.bin/vitest run` も `/usr/local/bin/node server.js` も
+ * 拾えなかった)。構造で見て、当てはまるジョブはすべて対象にする (fail-closed。
+ * 例外の逃げ道を持たない理由は `runsRepositoryCode` の手前の注記)。
  *
  * すでにイメージ側の検査 (`uses: docker://`) が名指ししたジョブは除く
  * (同じジョブを 2 通りの文言で報告すると、どちらを直せばよいのか読み手に伝わらない)。
@@ -809,7 +750,6 @@ interface MissingSetupNodeJob {
 function collectJobsMissingSetupNode(
   jobs: readonly WorkflowJob[],
   excludedJobKeys: ReadonlySet<string>,
-  exemptions: Readonly<Record<string, JobExemption>> = NODE_GUARD_EXEMPTIONS,
 ): MissingSetupNodeJob[] {
   // 平らに並べたジョブを 1 つずつ見る
   return jobs.flatMap((job) => {
@@ -817,10 +757,6 @@ function collectJobsMissingSetupNode(
     const key = jobKey(job.file, job.name);
     // イメージ側の検査が既に名指ししたジョブは、そちらの文言に任せる
     if (excludedJobKeys.has(key)) return [];
-    // setup-node の要求を免除すると登録されたジョブは対象外 (表の健全性は専用の検査が見る)。
-    // **表は引数で受け取る** — module の定数を直に読むと、表が空のあいだ
-    // `setupNode` と `image` の読み違えが起きても全件緑のまま通る (実測)
-    if (exemptions[key]?.setupNode !== undefined) return [];
     // steps が無いジョブ (再利用可能ワークフローの呼び出し) は要求しても置く場所が無い
     const steps = stepRecordsOf(job);
     if (steps === null) return [];
@@ -832,7 +768,6 @@ function collectJobsMissingSetupNode(
     // 「ジョブが走らない・失敗してもワークフローは成功」になるため、lint / typecheck /
     // test / e2e が 1 つも動かないまま CI が緑になる (どちらも実測で素通りした)。
     // 条件の中身は静的に決まらないので、ステップ側と同じく「無条件でないこと」で落とす。
-    // 意図して条件を付けるジョブは NODE_GUARD_EXEMPTIONS の setupNode へ理由付きで登録する
     if (!isUnconditionalStep(job.definition)) {
       // どちらが付いているかを文言で分ける (直す先が違うため)
       const reason =
@@ -890,7 +825,7 @@ function collectJobsMissingSetupNode(
     // **免除するのは「置き方」だけで、`verifierIndex === -1` (検証が無い) は上で
     // 既に名指ししてある** — 置き場所の事情と「そもそも検証していない」は別の話で、
     // 後者まで外せると担保の中心が鍵 1 つで空洞になる。
-    if (verifierIndex > firstRepoCode && exemptions[key]?.runtimeVerifier === undefined) {
+    if (verifierIndex > firstRepoCode) {
       return [
         {
           file: job.file,
@@ -899,26 +834,15 @@ function collectJobsMissingSetupNode(
         },
       ];
     }
-    // **`setup-node` がリポジトリのコードより後ろ、を明示的に見る。**
-    // 免除が無ければ `setupIndex <= verifierIndex <= firstRepoCode` が確定するので
-    // この判定は一度も成立しない (以前ここに死んだ分岐があったのはそのため)。
-    // だが `runtimeVerifier` の免除は右側の不等号 (`verifierIndex <= firstRepoCode`) を
-    // 外すので、**免除を登録したジョブでは `setupIndex > firstRepoCode` が成立しうる**。
-    // 実測: `[run: npm ci, setup-node, 検証, run: npm run test]` ＋ 免除で名指しが
-    // 消えていた — `npm ci` はランナー既定の Node で走り、そこで入る / ビルドされる
-    // node_modules は検証していない Node のものになる。
-    // **この判定は免除の対象にしない** — `runtimeVerifier` が免除するのは
-    // 「実行時検証の置き方」だけで、`setup-node` を先に置くことは別の保証。
-    // 1 つの鍵で 2 つの保証が外れるのは、鍵を分けた理由そのものに反する。
-    if (setupIndex > firstRepoCode) {
-      return [
-        {
-          file: job.file,
-          job: job.name,
-          reason: `setup-node がリポジトリのコードより後ろにある (先に走る分はランナー既定の Node で動く)`,
-        },
-      ];
-    }
+    // **「setup-node がリポジトリのコードより後ろ」を別途見る必要は無い。**
+    // ここまでの判定で `setupIndex <= verifierIndex <= firstRepoCode` が確定しており、
+    // 実行時検証自身も `run:` (= リポジトリのコード) なので、setup-node は必ず
+    // 最初のリポジトリのコードより前にある。**この不変条件は「どの判定も免除されない」
+    // ことに依存する** — 除外表を持っていた頃は `runtimeVerifier` の免除が右側の
+    // 不等号を外し、`[run: npm ci, setup-node, 検証, run: npm run test]` が
+    // 名指しされないまま `npm ci` をランナー既定の Node で走らせていた (実測)。
+    // 除外表を外したのでこの穴は閉じており、ここに分岐を置くと一度も出ない
+    // 死んだコードになる (§6 デッドコードを残さない)。
     // **実行時検証の「後ろ」で Node を差し替える形を落とす。**
     // 上の並び順の要求により、実行時検証は必ず**最初のリポジトリのコード**になる。
     // つまり検証が見るのは「その時点」の Node で、**それより後ろで入れ替えられると
@@ -930,37 +854,34 @@ function collectJobsMissingSetupNode(
     // **最後のリポジトリのコードより後ろは見ない** — そこに置かれた
     // `actions/upload-artifact` はもう誰の Node にも影響しないので、
     // 落とすと正当な形に直しようの無い要求を出すことになる。
-    // 意図して挟むジョブは NODE_GUARD_EXEMPTIONS の runtimeVerifier へ理由付きで登録する。
     // **`run:` による差し替え (`echo ... >> $GITHUB_PATH`) はここでも見えない** —
     // 中身を解釈しない限り区別できず、冒頭コメントに「残る境界」として書いてある。
-    if (exemptions[key]?.runtimeVerifier === undefined) {
-      // 最後にリポジトリのコードを実行するステップの位置 (それより後ろは影響しない)
-      const lastRepoCode = steps.map(runsRepositoryCode).lastIndexOf(true);
-      // 検証より後ろ・最後のリポジトリのコードまでにある uses: のステップを集める。
-      // **終端を含める (`+ 1`)。** 最後のリポジトリのコードが `run:` なら `usesOf` が
-      // 空文字列なので下の絞り込みで落ち、含めても何も変わらない。一方それが
-      // **ローカルの composite action (`uses: ./...`)** のときは、そのステップ自身が
-      // 「中身を読めない uses:」と「スイートの実行」を兼ねる — 終端を除いていたときは
-      // `[setup-node, 検証, uses: ./.github/actions/run-suite]` が**名指しされず**、
-      // action.yml の中で Node を入れ替えてからスイートを走らせる形が
-      // 静的な網からも実行時検証からも見えなかった (実測で空配列)。
-      // 後ろにもう 1 つ `run:` を足すと同じ差し替えが捕まっていたので、
-      // 見落としは純粋にこの境界だけが原因。
-      const swappers = steps
-        .slice(verifierIndex + 1, lastRepoCode + 1)
-        .filter((step) => usesOf(step) !== "");
-      // 1 つでもあれば、検証済みの Node で残りが走る保証が無い
-      if (swappers.length > 0) {
-        return [
-          {
-            file: job.file,
-            job: job.name,
-            reason:
-              `${RUNTIME_VERIFIER} より後ろに uses: のステップがある ` +
-              `(${swappers.map(usesOf).join(" / ")})。検証した Node のまま走る保証が無い`,
-          },
-        ];
-      }
+    // 最後にリポジトリのコードを実行するステップの位置 (それより後ろは影響しない)
+    const lastRepoCode = steps.map(runsRepositoryCode).lastIndexOf(true);
+    // 検証より後ろ・最後のリポジトリのコードまでにある uses: のステップを集める。
+    // **終端を含める (`+ 1`)。** 最後のリポジトリのコードが `run:` なら `usesOf` が
+    // 空文字列なので下の絞り込みで落ち、含めても何も変わらない。一方それが
+    // **ローカルの composite action (`uses: ./...`)** のときは、そのステップ自身が
+    // 「中身を読めない uses:」と「スイートの実行」を兼ねる — 終端を除いていたときは
+    // `[setup-node, 検証, uses: ./.github/actions/run-suite]` が**名指しされず**、
+    // action.yml の中で Node を入れ替えてからスイートを走らせる形が
+    // 静的な網からも実行時検証からも見えなかった (実測で空配列)。
+    // 後ろにもう 1 つ `run:` を足すと同じ差し替えが捕まっていたので、
+    // 見落としは純粋にこの境界だけが原因。
+    const swappers = steps
+      .slice(verifierIndex + 1, lastRepoCode + 1)
+      .filter((step) => usesOf(step) !== "");
+    // 1 つでもあれば、検証済みの Node で残りが走る保証が無い
+    if (swappers.length > 0) {
+      return [
+        {
+          file: job.file,
+          job: job.name,
+          reason:
+            `${RUNTIME_VERIFIER} より後ろに uses: のステップがある ` +
+            `(${swappers.map(usesOf).join(" / ")})。検証した Node のまま走る保証が無い`,
+        },
+      ];
     }
     // ここまでのどの判定にも掛からなければ、置き方は満たされている
     return [];
@@ -975,7 +896,7 @@ function collectJobsMissingSetupNode(
  * `setup-node` を置いても、そのステップの Node には何の影響も無い。
  * イメージ名で絞ると `docker://ghcr.io/acme/ci-node:20` のような形が素通りする
  * (実測で全件緑) ため、**名前を問わず**集めて、Node を持ち込まないと確認できた
- * ものだけを `NODE_GUARD_EXEMPTIONS` の `image` で通す。
+ * ものも落ちる (除外表は置いていない。理由は `runsRepositoryCode` の手前の注記)。
  *
  * **`container:` はここでは見ない。** `container: node:20` でも `setup-node` は
  * コンテナの中で動いて `.nvmrc` の Node を入れるので、それ自体は誤りではない。
@@ -984,14 +905,9 @@ function collectJobsMissingSetupNode(
  * ここで node イメージを一律に落としていたときは、`container: node:26-alpine` +
  * 正しい `setup-node` という**正当な形に直しようの無い要求**が出ていた (実測)。
  */
-function collectImageOnlySteps(
-  jobs: readonly WorkflowJob[],
-  exemptions: Readonly<Record<string, JobExemption>> = NODE_GUARD_EXEMPTIONS,
-): NodeImageUse[] {
+function collectImageOnlySteps(jobs: readonly WorkflowJob[]): NodeImageUse[] {
   // 共有の走査で平らに並べたジョブを受け取り、各ステップの uses: を見る
   return jobs.flatMap((job) => {
-    // イメージの検査を免除すると登録されたジョブは対象外 (表は上と同じ理由で引数から)
-    if (exemptions[jobKey(job.file, job.name)]?.image !== undefined) return [];
     // 見つけた箇所を溜める入れ物
     const found: NodeImageUse[] = [];
     // 各ステップを順に見る (steps が無いジョブは空で回す)
@@ -1303,7 +1219,7 @@ describe("実行する Node の major を宣言しているすべての場所の
       `ステップをイメージの中で丸ごと走らせないこと (uses: docker://)。実際の指定: ${imageSteps.join(" / ")}。` +
         "そのステップだけはイメージの Node で走り、同じジョブに setup-node を置いても効かない。" +
         `Node は actions/setup-node に node-version-file: '${displayPath(NVMRC_PATH)}' を渡して用意すること。` +
-        "Node を持ち込まないイメージだと確認できている場合は、NODE_GUARD_EXEMPTIONS の image へ理由付きで登録すること。",
+        "Node を持ち込まないイメージだと確認できている場合は、この検査自体を直すこと (除外表は置いていない)。",
     ).toEqual([]);
     // **版が入り込む 3 つ目の口**は「書き忘れ」で到達する。ランナーには Node が
     // 最初から入っているので、setup-node を置かないジョブで npm を叩くと
@@ -1319,40 +1235,8 @@ describe("実行する Node の major を宣言しているすべての場所の
       `このリポジトリのコードを実行するジョブ (run: / ローカル action の呼び出し) には、` +
         `無条件の actions/setup-node をそのコードより前に置くこと。足りていないジョブ: ${missingSetup.join(" / ")}。` +
         "ランナーに最初から入っている Node でそのまま走るため、.nvmrc とは無関係な major で検証している状態になる。" +
-        "Node と無関係なジョブは NODE_GUARD_EXEMPTIONS の setupNode へ、" +
-        `${RUNTIME_VERIFIER} の置き方だけに事情があるジョブは runtimeVerifier へ、それぞれ理由付きで登録すること。` +
-        "**置き方の事情で setupNode を選ばないこと** — あちらはジョブ全体の要求を外すので、" +
-        "同じジョブの setup-node の要求まで黙って落ちる。",
-    ).toEqual([]);
-  });
-
-  it("Node と無関係なジョブの除外表が、実在するジョブだけを理由付きで挙げている", () => {
-    // 判定は関数に切り出してある (表が空だと判定そのものが一度も動かないため、
-    // 合成した表を渡すテストを末尾に置いている)
-    // 除外表は「検査を fail-closed にするためのエスケープハッチ」なので、
-    // 表そのものが腐ると検査が黙って緩む。2 つの腐り方を落とす
-    const workflows = workflowScan;
-    // **入力側が壊れているときは「実在するか」を判定しない。**
-    // 読めなかったワークフローのジョブは `existing` に入らないので、正しい除外まで
-    // 「実在しない」と報告してしまう — その指示に従って消すと、上の検査が
-    // 本当に Node と無関係なジョブで落ち続ける。原因は姉妹の検査が名指しする
-    const inputsBroken = workflows.listError !== null || workflows.unreadable.length > 0;
-    // いま実在するジョブのキー一覧
-    const existing = new Set(workflows.jobs.map((job) => jobKey(job.file, job.name)));
-    // **実在しないジョブの登録**を落とす。ジョブ名を変えた・消したあとも残っていると、
-    // 将来その名前のジョブを足した人に黙って除外が効く (差分にも現れない)
-    const stale = inputsBroken ? [] : staleExclusions(NODE_GUARD_EXEMPTIONS, existing);
-    expect(
-      stale,
-      `NODE_GUARD_EXEMPTIONS に実在しないジョブが登録されている: ${stale.join(" / ")}。` +
-        "ジョブを消した・改名したなら、除外もこの差分で消すこと (残すと将来同じ名前のジョブへ黙って効く)。",
-    ).toEqual([]);
-    // **理由の空欄**を落とす。値を誰も読まないと、空白を入れて検査を黙らせられる
-    const withoutReason = exclusionsWithoutReason(NODE_GUARD_EXEMPTIONS);
-    expect(
-      withoutReason,
-      `NODE_GUARD_EXEMPTIONS の除外には、免除する検査 (setupNode / image / runtimeVerifier) と理由を書くこと` +
-        ` (空・空白・免除先なしは不可): ${withoutReason.join(" / ")}。`,
+        "Node と無関係なジョブや、どうしても置き方に事情があるジョブが現れたら、" +
+        "この検査自体を直すこと (除外表は置いていない — 空のまま fail-open を 4 つ抱えていたため外した)。",
     ).toEqual([]);
   });
 
@@ -1765,15 +1649,9 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
       steps: [...compliantSteps, { uses: "actions/upload-artifact@v4" }],
     });
     expect(collectJobsMissingSetupNode([uploadAfterSuite], new Set())).toEqual([]);
-    // その免除は runtimeVerifier の鍵だけに効く (setupNode とは別の鍵)
-    expect(
-      collectJobsMissingSetupNode([swappedAfterVerifier], new Set(), {
-        "synthetic.yml:job": { runtimeVerifier: "差し替えではないと確認済み" },
-      }),
-    ).toEqual([]);
-    // **検証より前にどうしても `run:` が要る形**。`JobExemption` の docstring が
-    // runtimeVerifier の用途として唯一挙げているのがこれ (例: `run: corepack enable`)。
-    // 免除が無ければ「リポジトリのコードより後ろ」として名指しする
+    // **検証より前に `run:` を置いた形**は「リポジトリのコードより後ろ」として名指しする。
+    // 逃げ道 (除外表) は持たないので、この形が要るジョブが現れたらこの検査自体を
+    // 直す差分になる — 除外表を置いていた頃は、その鍵が別の検査まで一緒に外していた
     const setupBeforeVerifier = jobOf({
       steps: [
         { uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } },
@@ -1789,41 +1667,9 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
         reason: `${RUNTIME_VERIFIER} がリポジトリのコードより後ろにある (先に走った検証の Node が分からない)`,
       },
     ]);
-    // **その形は runtimeVerifier で免除できる。** ここが効かないと逃げ道が setupNode
-    // (ジョブ全体) しか無くなり、同じジョブの setup-node の要求まで黙って外れる —
-    // 鍵を分けた理由そのものの事故を、検出網が失敗文言で案内することになる (実測で
-    // この形は免除を登録しても名指しされ続けていた)
-    expect(
-      collectJobsMissingSetupNode([setupBeforeVerifier], new Set(), {
-        "synthetic.yml:job": { runtimeVerifier: "corepack の有効化が検証より前に要る" },
-      }),
-    ).toEqual([]);
-    // **免除しても、setup-node を先に置く保証までは外れない。** runtimeVerifier は
-    // `verifierIndex <= firstRepoCode` を外すので、免除したジョブでは
-    // `setupIndex > firstRepoCode` が成立しうる — その形を名指ししないと
-    // `npm ci` がランナー既定の Node で走る (実測でこの形が空配列になっていた)
-    const setupAfterRepoCode = jobOf({
-      steps: [
-        { run: "npm ci" },
-        { uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } },
-        { run: "node scripts/verify-node-major.mjs" },
-        { run: "npm run test" },
-      ],
-    });
-    expect(
-      collectJobsMissingSetupNode([setupAfterRepoCode], new Set(), {
-        "synthetic.yml:job": { runtimeVerifier: "検証より前に run: が要る" },
-      }),
-    ).toEqual([
-      {
-        file: "synthetic.yml",
-        job: "job",
-        reason: "setup-node がリポジトリのコードより後ろにある (先に走る分はランナー既定の Node で動く)",
-      },
-    ]);
     // **最後のリポジトリのコードがローカル action のときも、差し替えとして見る。**
     // そのステップは「中身を読めない uses:」と「スイートの実行」を兼ねるので、
-    // 終端を除いていたときは action.yml の中で Node を入れ替える形が
+    // 走査の終端を除いていたときは action.yml の中で Node を入れ替える形が
     // 両方の網から見えなかった (実測で空配列)
     const localActionRunsSuite = jobOf({
       steps: [
@@ -1839,20 +1685,6 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
         reason:
           `${RUNTIME_VERIFIER} より後ろに uses: のステップがある ` +
           "(./.github/actions/run-suite)。検証した Node のまま走る保証が無い",
-      },
-    ]);
-    // **免除するのは「置き方」だけ。** 検証を 1 つも置いていないジョブは、鍵があっても
-    // 名指しする (置き場所の事情と「そもそも検証していない」は別の話で、後者まで
-    // 外せると担保の中心が鍵 1 つで空洞になる)
-    expect(
-      collectJobsMissingSetupNode([noVerifier], new Set(), {
-        "synthetic.yml:job": { runtimeVerifier: "置き方の事情" },
-      }),
-    ).toEqual([
-      {
-        file: "synthetic.yml",
-        job: "job",
-        reason: `${RUNTIME_VERIFIER} を実行していない`,
       },
     ]);
     // 実行時検証が setup-node より前だと、ランナー既定の Node を見る空振りになる
@@ -1909,44 +1741,24 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
     expect(isUnconditionalStep(step)).toBe(expected);
   });
 
-  it("免除は登録した検査にだけ効く（setupNode と image を取り違えない）", () => {
-    // `docker://` のステップと `run: npm ci` を両方持つジョブ (実測で穴になっていた形)
+  it("docker:// と run: を両方持つジョブは、2 つの検査がそれぞれ名指しする", () => {
+    // `docker://` のステップと `run: npm ci` を両方持つジョブ
     const mixed = jobOf({
       steps: [{ uses: "docker://hadolint/hadolint:latest" }, { run: "npm ci && npm run test" }],
     });
-    // (setup-node も実行時検証も無いので、免除しなければ両方の検査が名指しする)
-    // このジョブを指すキー
-    const key = jobKey("synthetic.yml", "job");
-    // image だけを免除しても、setup-node の要求は残る (免除の取り違えを落とす)
-    const imageOnly = { [key]: { image: "hadolint は Node を持ち込まない" } };
-    expect(collectImageOnlySteps([mixed], imageOnly)).toEqual([]);
-    expect(collectJobsMissingSetupNode([mixed], new Set(), imageOnly)).toHaveLength(1);
-    // 逆に setupNode だけを免除しても、イメージの検査は残る
-    const setupOnly = { [key]: { setupNode: "Node を使わないジョブ" } };
-    expect(collectImageOnlySteps([mixed], setupOnly)).toHaveLength(1);
-    expect(collectJobsMissingSetupNode([mixed], new Set(), setupOnly)).toEqual([]);
-  });
-
-  it("除外表の腐りを見る判定が、実際に腐りだけを拾う", () => {
-    // 実在するジョブのキー (合成)
-    const existing = new Set(["ci.yml:lint-and-test"]);
-    // 実在するキーだけの表は腐っていない
-    expect(staleExclusions({ "ci.yml:lint-and-test": { setupNode: "理由" } }, existing)).toEqual([]);
-    // 実在しないキーは名指しする (ジョブを改名・削除したあとの置き去り)
-    expect(staleExclusions({ "ci.yml:gone": { setupNode: "理由" } }, existing)).toEqual([
-      "ci.yml:gone",
+    // イメージ側は「ステップを丸ごとイメージの中で走らせている」ことを名指しする
+    expect(collectImageOnlySteps([mixed])).toEqual([
+      { file: "synthetic.yml", job: "job", location: "docker://hadolint/hadolint:latest" },
     ]);
-    // 空の表は腐りようが無い
-    expect(staleExclusions({}, existing)).toEqual([]);
-    // 理由が書かれていれば読める登録 (免除先ごとに書ける)
-    expect(exclusionsWithoutReason({ "a:b": { setupNode: "理由あり" } })).toEqual([]);
-    expect(exclusionsWithoutReason({ "a:b": { image: "理由あり" } })).toEqual([]);
-    // 空白だけの理由は名指しする (値を読まないと空白で黙らせられる)
-    expect(exclusionsWithoutReason({ "a:b": { setupNode: "   " } })).toEqual(["a:b"]);
-    expect(exclusionsWithoutReason({ "a:b": { image: "" } })).toEqual(["a:b"]);
-    // **免除先を 1 つも書いていない登録**も名指しする (何も免除しないのに
-    // 「除外済み」に見えるうえ、実在チェックだけを通ってしまう)
-    expect(exclusionsWithoutReason({ "a:b": {} })).toEqual(["a:b"]);
+    // setup-node 側も、重複除けを渡さなければ同じジョブを名指しする
+    expect(collectJobsMissingSetupNode([mixed], new Set())).toEqual([
+      { file: "synthetic.yml", job: "job", reason: "setup-node が無い" },
+    ]);
+    // **イメージ側が名指ししたジョブは、重複除けを渡せば setup-node 側が譲る。**
+    // 同じジョブを 2 通りの文言で報告すると、どちらを直せばよいか読み手に伝わらない
+    expect(collectJobsMissingSetupNode([mixed], new Set([jobKey("synthetic.yml", "job")]))).toEqual(
+      [],
+    );
   });
 
   it("describeInputs が、循環参照を含む with: でも例外を投げない", () => {
