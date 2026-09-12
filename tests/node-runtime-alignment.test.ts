@@ -100,11 +100,15 @@
 //   **宣言として見えない入れ替えの一部は、静的な検査ではなく CI の 1 ステップが持つ。**
 //   `scripts/verify-node-major.mjs` が、その行を走らせる Node 自身に
 //   「`.nvmrc` と同じ major か」を申告させる (綴りに依存しない)。
-//   **覆えるのは「ジョブ全体に効く入れ替え」まで** — `$GITHUB_PATH` への追記、
-//   ツールキャッシュの差し替え、コンテナイメージ、`setup-node` の指定。
-//   **同じ `run:` の中だけで完結する入れ替え** (`. nvm.sh && nvm use 20 && npm test`) は
-//   `run:` ごとにシェルが新しくなるため、別ステップのこの検証からは観測できない (実測)。
-//   そこは静的にも見えない**残る境界**で、レビューで見るしかない。この検査は、**リポジトリのコードを実行するジョブすべてが**
+//   **覆えるのは「その行より前に行われた、ジョブ全体に効く入れ替え」まで** —
+//   `setup-node` の指定、それ以前の `$GITHUB_PATH` への追記、ツールキャッシュの
+//   差し替え、コンテナイメージ。**検証が申告できるのは自分が走った時点の Node だけ**
+//   なので、次の 2 つは覆えない: (1) **同じ `run:` の中だけで完結する入れ替え**
+//   (`. nvm.sh && nvm use 20 && npm test`。`run:` ごとにシェルが新しくなるため)、
+//   (2) **この検証より後ろのステップが行う入れ替え**。(2) のうち後続の `uses:`
+//   (`volta-cli/action` 等) は静的な検査が落とすが (実測で素通りしていたため塞いだ)、
+//   後続の `run:` による `echo … >> $GITHUB_PATH` は中身を解釈しない限り区別できない。
+//   どちらも**残る境界**で、レビューで見るしかない (実測)。この検査は、**リポジトリのコードを実行するジョブすべてが**
 //   それを無条件で、しかも `setup-node` より後ろで走らせていることまで見る
 //   (「どこかの 1 ジョブが走らせていればよい」にすると、スイートを走らせる 2 本目の
 //    ジョブで `run: nvm install 20` と書いても全件緑で通った。setup-node より前に
@@ -661,6 +665,13 @@ interface JobExemption {
   setupNode?: string;
   // uses: docker:// のイメージ検査を免除する理由 (省略 = 免除しない)
   image?: string;
+  // **実行時検証の置き方だけ**を免除する理由 (省略 = 免除しない)。
+  // `setupNode` とは別の鍵にしてある — 「検証より前にどうしても `run:` が要る」
+  // (例: `run: corepack enable`) ジョブを `setupNode` へ登録させると、
+  // **同じジョブの setup-node の要求まで黙って外れる**。
+  // `setupNode` と `image` を分けたのとまったく同じ理由 (1 つの理由で 2 つの検査を
+  // 免除できると、検出網が自分で塞いだ穴の開け方を案内することになる)
+  runtimeVerifier?: string;
 }
 
 const NODE_GUARD_EXEMPTIONS: Readonly<Record<string, JobExemption>> = {};
@@ -691,7 +702,7 @@ function exclusionsWithoutReason(table: Readonly<Record<string, JobExemption>>):
   return Object.entries(table)
     .filter(([, exemption]) => {
       // 書かれている理由だけを取り出す
-      const reasons = [exemption.setupNode, exemption.image].filter(
+      const reasons = [exemption.setupNode, exemption.image, exemption.runtimeVerifier].filter(
         (reason): reason is string => reason !== undefined,
       );
       // 1 つも書いていない、または空白だけの理由があれば読めない登録
@@ -874,6 +885,40 @@ function collectJobsMissingSetupNode(
           reason: `${RUNTIME_VERIFIER} がリポジトリのコードより後ろにある (先に走った検証の Node が分からない)`,
         },
       ];
+    }
+    // **実行時検証の「後ろ」で Node を差し替える形を落とす。**
+    // 上の並び順の要求により、実行時検証は必ず**最初のリポジトリのコード**になる。
+    // つまり検証が見るのは「その時点」の Node で、**それより後ろで入れ替えられると
+    // 静的な網からも実行時検証からも見えない**。実測で、正しい setup-node と検証の
+    // 後ろに `uses: volta-cli/action@v4 (node-version: '20')` を足した形は
+    // **全件緑のまま通り**、lint / test / e2e は実際には Node 20 で走る。
+    // アクションの名前で絞らないのは、`docker://ghcr.io/acme/ci-node:20` が
+    // 素通りしたのと同じ理由 (名前から Node を持ち込むかは判定できない)。
+    // **最後のリポジトリのコードより後ろは見ない** — そこに置かれた
+    // `actions/upload-artifact` はもう誰の Node にも影響しないので、
+    // 落とすと正当な形に直しようの無い要求を出すことになる。
+    // 意図して挟むジョブは NODE_GUARD_EXEMPTIONS の runtimeVerifier へ理由付きで登録する。
+    // **`run:` による差し替え (`echo ... >> $GITHUB_PATH`) はここでも見えない** —
+    // 中身を解釈しない限り区別できず、冒頭コメントに「残る境界」として書いてある。
+    if (exemptions[key]?.runtimeVerifier === undefined) {
+      // 最後にリポジトリのコードを実行するステップの位置 (それより後ろは影響しない)
+      const lastRepoCode = steps.map(runsRepositoryCode).lastIndexOf(true);
+      // 検証より後ろ・最後のリポジトリのコードより前にある uses: のステップを集める
+      const swappers = steps
+        .slice(verifierIndex + 1, lastRepoCode)
+        .filter((step) => usesOf(step) !== "");
+      // 1 つでもあれば、検証済みの Node で残りが走る保証が無い
+      if (swappers.length > 0) {
+        return [
+          {
+            file: job.file,
+            job: job.name,
+            reason:
+              `${RUNTIME_VERIFIER} より後ろに uses: のステップがある ` +
+              `(${swappers.map(usesOf).join(" / ")})。検証した Node のまま走る保証が無い`,
+          },
+        ];
+      }
     }
     // **「setup-node がリポジトリのコードより後ろ」を別途見る必要は無い。**
     // ここまでの 2 つの判定で `setupIndex <= verifierIndex <= firstRepoCode` が
@@ -1657,6 +1702,38 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
       ],
     });
     expect(collectJobsMissingSetupNode([noVerifier], new Set())).toHaveLength(1);
+    // **実行時検証より後ろで Node を差し替えうる uses: は名指しする。**
+    // 検証はもう終わっているので実行時には見えず、ここで落とさないと
+    // lint / test / e2e が別の Node で走ったまま CI が緑になる (実測)
+    const swappedAfterVerifier = jobOf({
+      steps: [
+        { uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } },
+        { run: "node scripts/verify-node-major.mjs" },
+        { uses: "volta-cli/action@v4", with: { "node-version": "20" } },
+        { run: "npm ci && npm run test" },
+      ],
+    });
+    expect(collectJobsMissingSetupNode([swappedAfterVerifier], new Set())).toEqual([
+      {
+        file: "synthetic.yml",
+        job: "job",
+        reason:
+          `${RUNTIME_VERIFIER} より後ろに uses: のステップがある ` +
+          "(volta-cli/action@v4)。検証した Node のまま走る保証が無い",
+      },
+    ]);
+    // **最後のリポジトリのコードより後ろの uses: は通す (誤検知を出さない)。**
+    // そこに置かれた成果物のアップロード等は、もう誰の Node にも影響しない
+    const uploadAfterSuite = jobOf({
+      steps: [...compliantSteps, { uses: "actions/upload-artifact@v4" }],
+    });
+    expect(collectJobsMissingSetupNode([uploadAfterSuite], new Set())).toEqual([]);
+    // その免除は runtimeVerifier の鍵だけに効く (setupNode とは別の鍵)
+    expect(
+      collectJobsMissingSetupNode([swappedAfterVerifier], new Set(), {
+        "synthetic.yml:job": { runtimeVerifier: "差し替えではないと確認済み" },
+      }),
+    ).toEqual([]);
     // 実行時検証が setup-node より前だと、ランナー既定の Node を見る空振りになる
     const verifierTooEarly = jobOf({
       steps: [
@@ -1913,22 +1990,37 @@ describe("実行時検証スクリプトそのものの挙動", () => {
       "lts/iron",
       "v",
       `${runningMajor}abc`,
+      // **0 埋め**。両方とも「読める」と答えるのに、値の解釈が割れていた形 (実測)
+      `0${runningMajor}`,
     ];
     // 1 つずつ、両方の読み手に同じ文字列を食わせる
     for (const content of candidates) {
-      // 検査側が「読めない」と判断したか
-      const unreadableHere = parseNvmrcMajor(content) === null;
-      // スクリプト側が「書式が読めない」と言って落ちたか
-      // (major の食い違いで落ちる場合は別の文言なので、読めた側として数える)
-      const unreadableThere = runVerifier(content).output.includes(FORMAT_ERROR_MARKER);
-      // 2 つの答えが一致していることを固定する
+      // 検査側が取り出した major (読めなければ null)
+      const parsedHere = parseNvmrcMajor(content);
+      // スクリプトを実際に走らせた結果
+      const run = runVerifier(content);
+      // **「読めるか」だけでなく「取り出した値」まで突き合わせる。**
+      // 読めるかだけを比べていたときは、`022` のような 0 埋めで
+      // 検査側 (Number で 22) とスクリプト側 (文字列 "022") の答えが割れるのに
+      // **両方とも「読める」なので検査が通った** (実測)。走っている Node と
+      // 同じ major を指す内容なら、スクリプトは成功しなければならない
+      const shouldPass = parsedHere === Number(runningMajor);
+      // 書式が読めない場合は、スクリプト側も書式の文言で落ちること
+      if (parsedHere === null) {
+        expect(
+          run.output,
+          `.nvmrc の書式解釈が割れている (${JSON.stringify(content)}): ` +
+            `検査側は読めないと判断したが、${RUNTIME_VERIFIER} は別の理由で扱った。`,
+        ).toContain(FORMAT_ERROR_MARKER);
+      }
+      // 成否そのものを突き合わせる (値の割れはここで落ちる)
       expect(
-        unreadableThere,
+        run.status === 0,
         `.nvmrc の解釈が割れている (${JSON.stringify(content)}): ` +
-          `検査側は${unreadableHere ? "読めない" : "読める"}、` +
-          `${RUNTIME_VERIFIER} は${unreadableThere ? "読めない" : "読める"}と判断した。` +
-          "どちらかだけを直すと、片方が緑でもう片方が赤という食い違いが残る。",
-      ).toBe(unreadableHere);
+          `検査側は ${JSON.stringify(parsedHere)} と読み、走っている Node は ${runningMajor}。` +
+          `よって ${shouldPass ? "成功" : "失敗"} のはずだが、${RUNTIME_VERIFIER} は ` +
+          `${run.status === 0 ? "成功" : "失敗"} した: ${run.output.trim()}`,
+      ).toBe(shouldPass);
     }
   });
 });
