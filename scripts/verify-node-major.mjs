@@ -51,6 +51,10 @@ const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 function fail(message) {
   // 目印 (リポジトリの絶対パス) を取り除いた、実際に出す 1 行
   const line = `${message.split(repoRoot).join("")}\n`;
+  // 書き終えたバイト数 (catch が「残り」だけを出せるよう try の外で持つ)
+  let written = 0;
+  // 書き出すバイト列 (同上)
+  let payload = Buffer.alloc(0);
   try {
     // **書けた分を数えて、全部書けるまで繰り返す。** stderr がノンブロッキングな
     // パイプ (CI のログ収集がこの形) でバッファに空きが足りないと、write(2) は
@@ -60,9 +64,7 @@ function fail(message) {
     // この関数がまさに避けようとしている「終了コード 1 だが理由が分からない」状態。
     // バイト列にしてから進めるのは、文字数で数えるとマルチバイト (この文言は日本語)
     // で位置がずれるため
-    const payload = Buffer.from(line, "utf8");
-    // 書き終えたバイト数
-    let written = 0;
+    payload = Buffer.from(line, "utf8");
     // 全部書けるまで、書けた分だけ先へ進める
     while (written < payload.length) {
       // 残りを書き、実際に書けたバイト数を受け取る
@@ -78,8 +80,11 @@ function fail(message) {
     // 投げる。そのまま抜けると、丁寧に書いた理由の代わりに素のスタックトレースが
     // 残る — この関数がまさに避けようとしている「終了コード 1 だが理由が分からない」
     // 状態そのもの。最後の手段として console.error へ落とす (非同期なので届かない
-    // ことはありうるが、握り潰すよりは残る見込みがある。§6 エラーを握り潰さない)
-    console.error(line.trimEnd());
+    // ことはありうるが、握り潰すよりは残る見込みがある。§6 エラーを握り潰さない)。
+    // **まだ書けていない分だけを出す。** 行を丸ごと出し直すと、部分書き込みで
+    // 既に流れた先頭が二重になり (`…の majorCI が走っている Node …`)、
+    // この関数がまさに避けようとしている「読めない診断」を自分で作ることになる
+    console.error(payload.subarray(written).toString("utf8").trimEnd());
   }
   // 比較の土台が無い / 食い違っている状態で通さない
   process.exit(1);

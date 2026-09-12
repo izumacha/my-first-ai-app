@@ -104,10 +104,15 @@
 //   差し替え、コンテナイメージ。**検証が申告できるのは自分が走った時点の Node だけ**
 //   なので、次の 2 つは覆えない: (1) **同じ `run:` の中だけで完結する入れ替え**
 //   (`. nvm.sh && nvm use 20 && npm test`。`run:` ごとにシェルが新しくなるため)、
-//   (2) **この検証より後ろのステップが行う入れ替え**。(2) のうち後続の `uses:`
-//   (`volta-cli/action` 等) は静的な検査が落とすが (実測で素通りしていたため塞いだ)、
-//   後続の `run:` による `echo … >> $GITHUB_PATH` は中身を解釈しない限り区別できない。
-//   どちらも**残る境界**で、レビューで見るしかない (実測)。この検査は、**リポジトリのコードを実行するジョブすべてが**
+//   (2) **この検証より後ろのステップが行う入れ替え**。(2) のうち**宣言として YAML に
+//   現れるもの**は静的な検査が落とす — 後続の `uses:` (`volta-cli/action` 等) と、
+//   ステップの `env: PATH:` (どちらも実測で素通りしていたため塞いだ)。
+//   一方**後続の `run:` による `echo … >> $GITHUB_PATH` や `export PATH=…` は
+//   中身を解釈しない限り区別できない**。ここが**残る境界**で、レビューで見るしかない
+//   (実測)。**「ジョブがそもそも走らない」形も同じ結末を招く**ので別に見ている —
+//   ジョブ単位の `if:` / `continue-on-error` に加えて、`needs:` の先が `if:` で
+//   スキップされると依存先も連鎖でスキップされ、それでもワークフローは成功を報告する
+//   (実測で全件緑のまま通った)。この検査は、**リポジトリのコードを実行するジョブすべてが**
 //   それを無条件で、しかも `setup-node` より後ろで走らせていることまで見る
 //   (「どこかの 1 ジョブが走らせていればよい」にすると、スイートを走らせる 2 本目の
 //    ジョブで `run: nvm install 20` と書いても全件緑で通った。setup-node より前に
@@ -117,7 +122,7 @@
 //   実際の `ci.yml` が準拠しているだけでは、判定を潰しても (`isUnconditionalSetupNode`
 //   を `return true` にする等) 全件緑のまま通ってしまい、「塞いだ」証拠が
 //   コミットメッセージにしか残らない (実測)。落とす側と通す側の両方を、合成した
-//   ジョブ・ステップと合成した除外表で固定してある。ここを広げたくなったら、まず実際にその形が現れてから、
+//   ジョブ・ステップで固定してある (除外表は置いていない。理由は本文中の注記)。ここを広げたくなったら、まず実際にその形が現れてから、
 //   正当なワークフローを巻き添えにしない判定を決めて足すこと。
 //
 // Node を上げるときの手順 (この検査が要求する形):
@@ -499,6 +504,38 @@ function usesOf(step: Record<string, unknown>): string {
   return String(step.uses ?? "");
 }
 
+/**
+ * そのステップが `env:` で `PATH` を宣言しているか。
+ *
+ * **`uses:` と同じ「宣言として YAML に現れる差し替え」**なので、静的に読める。
+ * ステップの `env.PATH` はそのステップのプロセスの探索パスを丸ごと置き換えるので、
+ * `/opt/node20/bin` を先頭に置けば `npm` も `node` も別の major になる。
+ * 読まないと、実行時検証の後ろに `env:` を添えるだけで**両方の網が緑のまま**
+ * スイートが別の Node で走る (実測)。
+ *
+ * 大文字小文字を区別しないのは、ランナー (Linux) では `PATH` だが、
+ * YAML のキーを `Path` と書いても GitHub は環境変数名としてそのまま渡すため
+ * (Windows ランナーでは実際に効く)。拾いすぎても赤くなるだけで、見逃す側には倒れない。
+ */
+function declaresPathEnv(step: Record<string, unknown>): boolean {
+  // env: が対応表でなければ、宣言として読める PATH は無い
+  if (!isPlainMapping(step.env)) return false;
+  // キーに PATH があるかを、大文字小文字を無視して見る
+  return Object.keys(step.env).some((key) => key.toUpperCase() === "PATH");
+}
+
+/**
+ * 差し替えうるステップを、失敗文言に出す 1 つの語句にする。
+ *
+ * `uses:` ならその参照を、`env: PATH:` ならその旨を出す (どちらを直せばよいか分かるように)。
+ */
+function describeSwapper(step: Record<string, unknown>): string {
+  // uses: があるならそれを見せる (ワークフローを grep して見つけられる綴りのまま)
+  const uses = usesOf(step);
+  // 無ければ env: PATH: の指定であることを伝える
+  return uses !== "" ? uses : "env: PATH: の指定";
+}
+
 /** そのステップが `actions/setup-node` を呼んでいるか。 */
 function isSetupNodeStep(step: Record<string, unknown>): boolean {
   // uses を文字列として照合する (未指定なら空文字列 = 一致しない)
@@ -713,6 +750,68 @@ function invokesRuntimeVerifier(step: Record<string, unknown>): boolean {
     .some((line) => RUNTIME_VERIFIER_LINE.test(line));
 }
 
+/**
+ * ジョブの `needs:` を名前の配列として読む (未指定なら空配列)。
+ *
+ * `needs` は 1 本なら文字列、複数なら配列で書ける。どちらも同じ意味なので、
+ * 読み方をここ 1 か所に置く。
+ */
+function needsOf(definition: Record<string, unknown>): string[] {
+  // 文字列 1 本の形
+  if (typeof definition.needs === "string") return [definition.needs];
+  // 配列の形 (要素は文字列だけを採る)
+  if (Array.isArray(definition.needs)) {
+    return definition.needs.filter((name): name is string => typeof name === "string");
+  }
+  // 指定なし
+  return [];
+}
+
+/**
+ * `needs:` をたどって、**スキップが伝播してくるジョブ**の名前を返す (無ければ null)。
+ *
+ * **ジョブ自身の `if:` を見るだけでは足りない。** GitHub は `if:` が偽で
+ * スキップされたジョブの**依存先も連鎖でスキップ**し、それでもワークフローは
+ * 成功として報告する。つまり `if: ${{ false }}` のゲートジョブを 1 つ置き、
+ * スイートのジョブに `needs: gate` と書くだけで、**lint / typecheck / test / e2e も
+ * 実行時検証も 1 つも動かないまま CI が緑**になる (実測で全件緑のまま通った)。
+ * これは隣の「ジョブ単位の `if:` / `continue-on-error`」の判定が塞いだのと
+ * まったく同じ結末で、読む YAML のキーが違うだけ。
+ *
+ * **`continue-on-error` は伝播しない** ので見ない。付いたジョブは失敗しても
+ * 「成功」として扱われ、依存先はそのまま走る (そのジョブ自身の問題は隣の判定が落とす)。
+ *
+ * 伝播は連鎖するので推移的にたどる。同じジョブを 2 度たどらないので、
+ * `needs` が循環していても止まる (GitHub 側では構文エラーになる形)。
+ */
+function skipPropagatingNeed(
+  definition: Record<string, unknown>,
+  siblings: ReadonlyMap<string, Record<string, unknown>>,
+): string | null {
+  // これからたどる名前 (最初は直接の needs)
+  const queue = needsOf(definition);
+  // 一度たどった名前 (循環と重複を避ける)
+  const seen = new Set<string>();
+  // たどる先が無くなるまで繰り返す
+  while (queue.length > 0) {
+    // 次の名前を取り出す
+    const name = queue.shift() as string;
+    // 既に見たならたどらない
+    if (seen.has(name)) continue;
+    // 見たことにする
+    seen.add(name);
+    // 同じワークフローの中の定義を引く (無ければたどれないので飛ばす)
+    const needed = siblings.get(name);
+    if (needed === undefined) continue;
+    // `if:` が付いていれば、そこからスキップが伝播してくる
+    if ("if" in needed) return name;
+    // さらに先の needs もたどる
+    queue.push(...needsOf(needed));
+  }
+  // 伝播してくるジョブは無い
+  return null;
+}
+
 /** `setup-node` の置き方が足りていないジョブ 1 つ分。 */
 interface MissingSetupNodeJob {
   // 失敗メッセージに出す、どのワークフローかを示すファイル名
@@ -776,6 +875,23 @@ function collectJobsMissingSetupNode(
           : "ジョブに continue-on-error が付いている (失敗しても CI は緑になる)";
       return [{ file: job.file, job: job.name, reason }];
     }
+    // **`needs:` の先から伝播してくるスキップも同じ結末を招く。**
+    // 判定は skipPropagatingNeed が持つ (理由はその docstring)。
+    // 同じワークフローのジョブだけを引く — ジョブ名はワークフローごとに独立している
+    const siblings = new Map(
+      jobs.filter((other) => other.file === job.file).map((other) => [other.name, other.definition]),
+    );
+    // 伝播してくるジョブがあれば、そのジョブ名を添えて名指しする
+    const skippedNeed = skipPropagatingNeed(job.definition, siblings);
+    if (skippedNeed !== null) {
+      return [
+        {
+          file: job.file,
+          job: job.name,
+          reason: `needs: の先に if: 付きのジョブ (${skippedNeed}) がある (そのジョブがスキップされると、このジョブも走らないまま CI は緑になる)`,
+        },
+      ];
+    }
     // 必ず効く setup-node の位置 (if: / continue-on-error 付きは数えない)
     const setupIndex = steps.findIndex(isUnconditionalSetupNode);
     // 無条件の setup-node が 1 つも無い場合は、条件付きの有無で文言を分ける
@@ -816,15 +932,6 @@ function collectJobsMissingSetupNode(
     // どの Node で動いたかは分からない。`$GITHUB_PATH` などジョブ全体に効く入れ替えを
     // 挟む形が、後置だと素通りした (実測)。検証自身も `run:` なので、期待どおりの
     // 並びでは検証が「最初のリポジトリのコード」になる
-    // **この位置の要求だけは `runtimeVerifier` の免除で外せる。** `JobExemption` の
-    // docstring が唯一の用途として挙げているのが「検証より前にどうしても `run:` が要る」
-    // (例: `run: corepack enable`) ジョブで、その形はまさにここへ落ちてくる。
-    // 免除を効かせないと逃げ道が `setupNode` (ジョブ全体) しか無くなり、
-    // **同じジョブの setup-node の要求まで黙って外れる** — 鍵を分けた理由そのものの事故を、
-    // 検出網が失敗文言で案内することになる (実測でこの形が名指しされ続けていた)。
-    // **免除するのは「置き方」だけで、`verifierIndex === -1` (検証が無い) は上で
-    // 既に名指ししてある** — 置き場所の事情と「そもそも検証していない」は別の話で、
-    // 後者まで外せると担保の中心が鍵 1 つで空洞になる。
     if (verifierIndex > firstRepoCode) {
       return [
         {
@@ -868,9 +975,15 @@ function collectJobsMissingSetupNode(
     // 静的な網からも実行時検証からも見えなかった (実測で空配列)。
     // 後ろにもう 1 つ `run:` を足すと同じ差し替えが捕まっていたので、
     // 見落としは純粋にこの境界だけが原因。
+    // **ステップの `env: PATH:` も同じ扱いで見る。** これは `run:` の中身と違って
+    // **宣言として YAML に現れる**ので、静的に読める — 読まないと
+    // `run: npm ci && npm run test` に `env: { PATH: /opt/node20/bin:... }` を添えるだけで
+    // スイートが別の Node で走り、**両方の網が緑のまま**になる (実測)。
+    // `run:` の中の `export PATH=...` は中身を解釈しないと分からないので引き続き見えず、
+    // そちらは冒頭コメントに「残る境界」として書いてある。
     const swappers = steps
       .slice(verifierIndex + 1, lastRepoCode + 1)
-      .filter((step) => usesOf(step) !== "");
+      .filter((step) => usesOf(step) !== "" || declaresPathEnv(step));
     // 1 つでもあれば、検証済みの Node で残りが走る保証が無い
     if (swappers.length > 0) {
       return [
@@ -878,8 +991,10 @@ function collectJobsMissingSetupNode(
           file: job.file,
           job: job.name,
           reason:
-            `${RUNTIME_VERIFIER} より後ろに uses: のステップがある ` +
-            `(${swappers.map(usesOf).join(" / ")})。検証した Node のまま走る保証が無い`,
+            `${RUNTIME_VERIFIER} より後ろに Node を差し替えうるステップがある ` +
+            `(${swappers.map(describeSwapper).join(" / ")})。検証した Node のまま走る保証が無い。` +
+            `Node と無関係なステップ (actions/cache 等) なら、検証より前か、` +
+            `最後にリポジトリのコードを実行するステップより後ろへ移すこと`,
         },
       ];
     }
@@ -1639,8 +1754,10 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
         file: "synthetic.yml",
         job: "job",
         reason:
-          `${RUNTIME_VERIFIER} より後ろに uses: のステップがある ` +
-          "(volta-cli/action@v4)。検証した Node のまま走る保証が無い",
+          `${RUNTIME_VERIFIER} より後ろに Node を差し替えうるステップがある ` +
+          "(volta-cli/action@v4)。検証した Node のまま走る保証が無い。" +
+          "Node と無関係なステップ (actions/cache 等) なら、検証より前か、" +
+          "最後にリポジトリのコードを実行するステップより後ろへ移すこと",
       },
     ]);
     // **最後のリポジトリのコードより後ろの uses: は通す (誤検知を出さない)。**
@@ -1683,10 +1800,82 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
         file: "synthetic.yml",
         job: "job",
         reason:
-          `${RUNTIME_VERIFIER} より後ろに uses: のステップがある ` +
-          "(./.github/actions/run-suite)。検証した Node のまま走る保証が無い",
+          `${RUNTIME_VERIFIER} より後ろに Node を差し替えうるステップがある ` +
+          "(./.github/actions/run-suite)。検証した Node のまま走る保証が無い。" +
+          "Node と無関係なステップ (actions/cache 等) なら、検証より前か、" +
+          "最後にリポジトリのコードを実行するステップより後ろへ移すこと",
       },
     ]);
+    // **`needs:` の先から伝播してくるスキップも名指しする。** ゲートジョブが
+    // `if:` でスキップされると依存先も連鎖でスキップされ、それでもワークフローは
+    // 成功として報告される — 隣の「ジョブ単位の if:」と同じ結末に、別のキーで届く
+    // (実測で全件緑のまま通った)
+    const gate = { file: "synthetic.yml", name: "gate", definition: { if: "${{ false }}" } };
+    const gated = {
+      file: "synthetic.yml",
+      name: "suite",
+      definition: { needs: "gate", steps: compliantSteps },
+    };
+    expect(collectJobsMissingSetupNode([gate, gated], new Set())).toEqual([
+      {
+        file: "synthetic.yml",
+        job: "suite",
+        reason:
+          "needs: の先に if: 付きのジョブ (gate) がある (そのジョブがスキップされると、このジョブも走らないまま CI は緑になる)",
+      },
+    ]);
+    // 連鎖でもたどる (gate → mid → suite)
+    const mid = { file: "synthetic.yml", name: "mid", definition: { needs: ["gate"] } };
+    const chained = {
+      file: "synthetic.yml",
+      name: "suite",
+      definition: { needs: ["mid"], steps: compliantSteps },
+    };
+    expect(collectJobsMissingSetupNode([gate, mid, chained], new Set())).toHaveLength(1);
+    // 条件の無いジョブへの needs: は伝播しないので通す (誤検知を出さない)
+    const plain = { file: "synthetic.yml", name: "build", definition: { steps: compliantSteps } };
+    const dependsOnPlain = {
+      file: "synthetic.yml",
+      name: "suite",
+      definition: { needs: "build", steps: compliantSteps },
+    };
+    expect(collectJobsMissingSetupNode([plain, dependsOnPlain], new Set())).toEqual([]);
+    // 別のワークフローに同名のジョブがあっても取り違えない
+    const otherFileGate = { file: "other.yml", name: "gate", definition: { if: "${{ false }}" } };
+    expect(collectJobsMissingSetupNode([otherFileGate, dependsOnPlain, plain], new Set())).toEqual(
+      [],
+    );
+    // **ステップの `env: PATH:` も差し替えとして名指しする。** `uses:` と同じく
+    // 宣言として YAML に現れるので静的に読める — 読まないと、正しい setup-node と
+    // 検証を置いたうえで `env:` を添えるだけでスイートが別の Node で走り、
+    // 両方の網が緑のままになる (実測)
+    const pathEnvAfterVerifier = jobOf({
+      steps: [
+        { uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } },
+        { run: "node scripts/verify-node-major.mjs" },
+        { run: "npm ci && npm run test", env: { PATH: "/opt/node20/bin:/usr/bin:/bin" } },
+      ],
+    });
+    expect(collectJobsMissingSetupNode([pathEnvAfterVerifier], new Set())).toEqual([
+      {
+        file: "synthetic.yml",
+        job: "job",
+        reason:
+          `${RUNTIME_VERIFIER} より後ろに Node を差し替えうるステップがある ` +
+          "(env: PATH: の指定)。検証した Node のまま走る保証が無い。" +
+          "Node と無関係なステップ (actions/cache 等) なら、検証より前か、" +
+          "最後にリポジトリのコードを実行するステップより後ろへ移すこと",
+      },
+    ]);
+    // PATH 以外の env: は差し替えではないので通す (誤検知を出さない)
+    const otherEnv = jobOf({
+      steps: [
+        { uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } },
+        { run: "node scripts/verify-node-major.mjs" },
+        { run: "npm ci", env: { CI: "true" } },
+      ],
+    });
+    expect(collectJobsMissingSetupNode([otherEnv], new Set())).toEqual([]);
     // 実行時検証が setup-node より前だと、ランナー既定の Node を見る空振りになる
     const verifierTooEarly = jobOf({
       steps: [
