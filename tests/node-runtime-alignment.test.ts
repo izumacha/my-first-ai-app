@@ -125,10 +125,25 @@
 // Vitest の DSL
 import { describe, expect, it } from "vitest";
 // ピン留めを書いた素のテキスト (.nvmrc / Dockerfile / README) と、
-// ワークフローの一覧 (ファイル名を書き並べず、ディレクトリから列挙する) を読むため
-import { readdirSync, readFileSync } from "node:fs";
+// ワークフローの一覧 (ファイル名を書き並べず、ディレクトリから列挙する) を読むため。
+// 実行時検証スクリプトの挙動を見る検査は、使い捨ての作業場を作って本物を置くので
+// ディレクトリ作成・複写・後片付けも要る
+import {
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+// 実行時検証スクリプトを**別プロセスとして実際に起動する**ため
+// (終了コードで fail-closed を主張しているので、その終了コードごと固定する)
+import { spawnSync } from "node:child_process";
+// 使い捨ての作業場を OS の一時領域に作るため
+import { tmpdir } from "node:os";
 // 検査対象のパスを組み立てるため
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 // ワークフローを構造として読むため (正規表現で近似すると、解説コメント中の
 // `node-version-file:` を設定値と取り違える)
 import { parse as parseYaml } from "yaml";
@@ -250,6 +265,24 @@ function readNvmrcMajor(): number | null {
   // ファイルを読む (読めなければ null)
   const text = readTextOrNull(NVMRC_PATH);
   if (text === null) return null;
+  // 中身の解釈は純粋関数へ (同じ規則をスクリプト側と突き合わせるため)
+  return parseNvmrcMajor(text);
+}
+
+/**
+ * `.nvmrc` の**中身**から major を読み取る (ファイル入出力を伴わない純粋関数)。
+ *
+ * **読み取りから切り離してあるのは、同じ規則を守る読み手がもう 1 つあるから。**
+ * `scripts/verify-node-major.mjs` も同じ `.nvmrc` を読むが、あちらは `npm ci` より前・
+ * 依存ゼロで走る必要があるのでこのモジュールを import できず、規則が**構造上どうしても
+ * 2 か所に現れる**。書き写しを消せない以上、せめて**食い違いを機械的に落とす**必要があり、
+ * そのために「同じ文字列を両方へ食わせて答え合わせをする」検査が中身だけを渡せる形を要る
+ * (下の「`.nvmrc` の書式解釈が、検査側と実行時検証で一致している」)。
+ *
+ * 規則そのものの根拠は `readNvmrcMajor` の docstring を参照 (実際に読む
+ * `actions/setup-node` / `nvm` が trim しかしないので、コメントも小数点も許さない)。
+ */
+function parseNvmrcMajor(text: string): number | null {
   // 前後の空白だけを落として、先頭の `v` 付きの数字だけを受け取る
   const matched = text.trim().match(/^v?(\d+)$/);
   // 形が合わなければ読めなかった扱い (呼び出し側が fail-closed で落とす)
@@ -1718,5 +1751,162 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
     expect(describeInputs(circular)).toBe("node-version=20, self=object");
     // 指定が無い場合も読み手に伝わる文言にする
     expect(describeInputs({})).toBe("with: の指定なし");
+  });
+});
+
+// **実行時検証スクリプトそのものの挙動を固定する。**
+//
+// なぜ要るか: この PR は「宣言として YAML に現れる Node しか静的には見えない」という
+// 理由で、担保の中心を静的解析から `scripts/verify-node-major.mjs` の 1 ステップへ
+// 移している。ところが上の検出網が照合しているのは **`run:` にその起動行があるか**
+// (`invokesRuntimeVerifier`) という**配線だけ**で、スクリプトの中身は一度も走らない。
+// つまり中身を `console.log("ok")` だけに潰しても**全件緑のまま通り、CI も緑になる**
+// (実測。235 件すべて成功・`node scripts/verify-node-major.mjs` の終了コードも 0)。
+// 担保の置き場所を移した先が無検証だと、検出網の中心が空洞になる。
+//
+// これは新しい教訓ではなく、このリポジトリが Stripe の API 版ガードで既に踏んで
+// 学んでいる形そのもの (CLAUDE.md: 静的な検査は「呼び出しが配線されているか」を
+// 名前で照合するだけなので、実行時チェックの挙動を別途固定しないと
+// **中身を空にしても全テストが緑のまま通る**)。同じ対処をここにも置く。
+//
+// 判定は**本物のスクリプトを別プロセスで起動して**行う。中身を読んで真似ると、
+// 「テストの中の写し」が緑になるだけでスクリプト本体の退行を拾えない。
+describe("実行時検証スクリプトそのものの挙動", () => {
+  // スクリプト本体の絶対パス (起動するのは常にこの**実物**)
+  const verifierPath = resolve(REPO_ROOT, RUNTIME_VERIFIER);
+  // 「`.nvmrc` の形が読めない」ときにスクリプトが出す文言の目印。
+  // 「major が違う」との**理由の違い**を区別するために使う (下の書式一致の検査)
+  const FORMAT_ERROR_MARKER = ".nvmrc は major だけを書くこと";
+
+  /** スクリプトを 1 回起動した結果 (終了コードと、人向けの出力)。 */
+  interface VerifierRun {
+    // 終了コード (シグナルで落ちた場合は null)
+    status: number | null;
+    // 成功時の記録と失敗時の理由を、まとめて 1 つの文字列として見る
+    output: string;
+  }
+
+  /**
+   * 使い捨ての作業場に**本物のスクリプトを複写**し、`.nvmrc` を差し替えて起動する。
+   *
+   * スクリプトは `.nvmrc` を**自分のファイル位置からの相対**で探す (実行時の cwd に
+   * 依存させない設計) ので、中身を差し替えるには同じ配置の作業場が要る。
+   * 複写するのは実物のバイト列なので、本体を潰せばこの検査が落ちる。
+   *
+   * @param nvmrcContent 作業場に置く `.nvmrc` の中身。`null` ならファイルを置かない
+   *                     (削除・改名の事故を再現する)
+   */
+  function runVerifier(nvmrcContent: string | null): VerifierRun {
+    // OS の一時領域に、この検査専用の作業場を作る (名前が衝突しないよう mkdtemp)
+    const sandbox = mkdtempSync(join(tmpdir(), "verify-node-major-"));
+    try {
+      // 実物と同じ `scripts/` の下に置く (スクリプトは `../.nvmrc` を見るため)
+      mkdirSync(join(sandbox, "scripts"));
+      // 本物のスクリプトをそのまま複写する (中身を真似ない = 退行を拾える)
+      copyFileSync(verifierPath, join(sandbox, "scripts", "verify-node-major.mjs"));
+      // 中身が指定されていれば `.nvmrc` を置く (null のときは置かない)
+      if (nvmrcContent !== null) writeFileSync(join(sandbox, ".nvmrc"), nvmrcContent);
+      // いま走っている Node と同じ実行ファイルで起動する
+      // (テストを走らせている Node の major が、そのまま「実際に走っている Node」になる)
+      const result = spawnSync(process.execPath, [join(sandbox, "scripts", "verify-node-major.mjs")], {
+        // 出力を文字列として受け取る
+        encoding: "utf8",
+      });
+      // 成否の理由は stdout / stderr のどちらにも出うるので、まとめて 1 つの文字列で見る
+      return { status: result.status, output: `${result.stdout ?? ""}${result.stderr ?? ""}` };
+    } finally {
+      // 作業場は必ず片付ける (§8 リソースを確実に解放する)
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  }
+
+  // いま走っている Node の major (文字列。`.nvmrc` に書く形にそろえる)
+  const runningMajor = process.versions.node.split(".")[0];
+  // わざと 1 つずらした major (「違えば落ちる」ことを確かめるため)
+  const otherMajor = String(Number(runningMajor) + 1);
+
+  it("走っている Node と同じ major なら成功する (v 付きも同じ扱い)", () => {
+    // 素の数字で一致する場合
+    const plain = runVerifier(runningMajor);
+    // 終了コード 0 で通る
+    expect(plain.status, `同じ major なのに落ちた: ${plain.output}`).toBe(0);
+    // 「検証された」と分かる記録を残す設計なので、版が出ていることも見る
+    expect(plain.output).toContain(process.versions.node);
+    // `v26` の書き方も `.nvmrc` の慣習として許す
+    expect(runVerifier(`v${runningMajor}`).status).toBe(0);
+    // 前後の空白・末尾改行は落として読む (エディタが付けるため)
+    expect(runVerifier(`  ${runningMajor}\n`).status).toBe(0);
+  });
+
+  it("major が違えば落ち、どちらがどうずれているかを出す", () => {
+    // 走っている Node とは違う major を書いた場合
+    const run = runVerifier(otherMajor);
+    // **ここが担保の本体**: 食い違いは終了コード 1 で CI を止める
+    expect(run.status, `major が違うのに通った: ${run.output}`).toBe(1);
+    // 直す先が分かるよう、実際の Node と `.nvmrc` の値の両方を出す
+    expect(run.output).toContain(process.versions.node);
+    expect(run.output).toContain(otherMajor);
+  });
+
+  it("`.nvmrc` の形が読めなければ、検証せずに落ちる (fail-closed)", () => {
+    // 読めない書き方を並べる (小数点付き・コメント付き・空・数字でない)
+    for (const content of [`${runningMajor}.1.0`, `${runningMajor} # LTS`, "", "lts/iron"]) {
+      // 1 件ずつ起動して結果を見る
+      const run = runVerifier(content);
+      // 比較の土台が無いまま通すと、この検査があること自体が誤った安心になる
+      expect(run.status, `読めない .nvmrc (${JSON.stringify(content)}) が通った`).toBe(1);
+      // 何が入っていたかを添えているので、直す先が分かる
+      expect(run.output).toContain(FORMAT_ERROR_MARKER);
+    }
+  });
+
+  it("`.nvmrc` が無ければ落ち、実行機の絶対パスを出さない", () => {
+    // ファイルを置かずに起動する (削除・改名・権限の事故を再現)
+    const run = runVerifier(null);
+    // 読めないまま通さない
+    expect(run.status, `.nvmrc が無いのに通った: ${run.output}`).toBe(1);
+    // 素の例外ではなく、こちらが書いた文言で落ちていること
+    expect(run.output).toContain(".nvmrc");
+    // **絶対パスを載せない** (CI と手元で文言をそろえる設計。検査側の
+    // describeReadError と同じ扱いで、出力は相対の綴りだけになる)
+    expect(run.output, `実行機の絶対パスが出力に混ざっている: ${run.output}`).not.toContain(
+      tmpdir(),
+    );
+  });
+
+  it("`.nvmrc` の書式解釈が、検査側と実行時検証で一致している", () => {
+    // **同じ `.nvmrc` を読む手が 2 つある。** 検査側 (parseNvmrcMajor) と
+    // スクリプト側で解釈が割れると、「片方が緑でもう片方が赤」という一番たちの悪い
+    // 食い違いになる (例: `26 # LTS` を検査側だけが 26 と読むと、検査は緑なのに
+    // CI の Node 準備が壊れる)。スクリプトは `npm ci` より前・依存ゼロで走るため
+    // このモジュールを import できず、規則は構造上 2 か所に現れる。
+    // 消せない写しなので、**答え合わせを機械的に固定する**
+    const candidates = [
+      runningMajor,
+      `v${runningMajor}`,
+      `  ${runningMajor}  `,
+      `${runningMajor}.1.0`,
+      `${runningMajor} # LTS`,
+      "",
+      "lts/iron",
+      "v",
+      `${runningMajor}abc`,
+    ];
+    // 1 つずつ、両方の読み手に同じ文字列を食わせる
+    for (const content of candidates) {
+      // 検査側が「読めない」と判断したか
+      const unreadableHere = parseNvmrcMajor(content) === null;
+      // スクリプト側が「書式が読めない」と言って落ちたか
+      // (major の食い違いで落ちる場合は別の文言なので、読めた側として数える)
+      const unreadableThere = runVerifier(content).output.includes(FORMAT_ERROR_MARKER);
+      // 2 つの答えが一致していることを固定する
+      expect(
+        unreadableThere,
+        `.nvmrc の解釈が割れている (${JSON.stringify(content)}): ` +
+          `検査側は${unreadableHere ? "読めない" : "読める"}、` +
+          `${RUNTIME_VERIFIER} は${unreadableThere ? "読めない" : "読める"}と判断した。` +
+          "どちらかだけを直すと、片方が緑でもう片方が赤という食い違いが残る。",
+      ).toBe(unreadableHere);
+    }
   });
 });
