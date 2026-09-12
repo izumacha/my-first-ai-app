@@ -899,6 +899,26 @@ function collectJobsMissingSetupNode(
         },
       ];
     }
+    // **`setup-node` がリポジトリのコードより後ろ、を明示的に見る。**
+    // 免除が無ければ `setupIndex <= verifierIndex <= firstRepoCode` が確定するので
+    // この判定は一度も成立しない (以前ここに死んだ分岐があったのはそのため)。
+    // だが `runtimeVerifier` の免除は右側の不等号 (`verifierIndex <= firstRepoCode`) を
+    // 外すので、**免除を登録したジョブでは `setupIndex > firstRepoCode` が成立しうる**。
+    // 実測: `[run: npm ci, setup-node, 検証, run: npm run test]` ＋ 免除で名指しが
+    // 消えていた — `npm ci` はランナー既定の Node で走り、そこで入る / ビルドされる
+    // node_modules は検証していない Node のものになる。
+    // **この判定は免除の対象にしない** — `runtimeVerifier` が免除するのは
+    // 「実行時検証の置き方」だけで、`setup-node` を先に置くことは別の保証。
+    // 1 つの鍵で 2 つの保証が外れるのは、鍵を分けた理由そのものに反する。
+    if (setupIndex > firstRepoCode) {
+      return [
+        {
+          file: job.file,
+          job: job.name,
+          reason: `setup-node がリポジトリのコードより後ろにある (先に走る分はランナー既定の Node で動く)`,
+        },
+      ];
+    }
     // **実行時検証の「後ろ」で Node を差し替える形を落とす。**
     // 上の並び順の要求により、実行時検証は必ず**最初のリポジトリのコード**になる。
     // つまり検証が見るのは「その時点」の Node で、**それより後ろで入れ替えられると
@@ -916,9 +936,18 @@ function collectJobsMissingSetupNode(
     if (exemptions[key]?.runtimeVerifier === undefined) {
       // 最後にリポジトリのコードを実行するステップの位置 (それより後ろは影響しない)
       const lastRepoCode = steps.map(runsRepositoryCode).lastIndexOf(true);
-      // 検証より後ろ・最後のリポジトリのコードより前にある uses: のステップを集める
+      // 検証より後ろ・最後のリポジトリのコードまでにある uses: のステップを集める。
+      // **終端を含める (`+ 1`)。** 最後のリポジトリのコードが `run:` なら `usesOf` が
+      // 空文字列なので下の絞り込みで落ち、含めても何も変わらない。一方それが
+      // **ローカルの composite action (`uses: ./...`)** のときは、そのステップ自身が
+      // 「中身を読めない uses:」と「スイートの実行」を兼ねる — 終端を除いていたときは
+      // `[setup-node, 検証, uses: ./.github/actions/run-suite]` が**名指しされず**、
+      // action.yml の中で Node を入れ替えてからスイートを走らせる形が
+      // 静的な網からも実行時検証からも見えなかった (実測で空配列)。
+      // 後ろにもう 1 つ `run:` を足すと同じ差し替えが捕まっていたので、
+      // 見落としは純粋にこの境界だけが原因。
       const swappers = steps
-        .slice(verifierIndex + 1, lastRepoCode)
+        .slice(verifierIndex + 1, lastRepoCode + 1)
         .filter((step) => usesOf(step) !== "");
       // 1 つでもあれば、検証済みの Node で残りが走る保証が無い
       if (swappers.length > 0) {
@@ -933,15 +962,7 @@ function collectJobsMissingSetupNode(
         ];
       }
     }
-    // **「setup-node がリポジトリのコードより後ろ」を別途見る必要は無い。**
-    // ここまでの 2 つの判定で `setupIndex <= verifierIndex <= firstRepoCode` が
-    // 確定しており、実行時検証自身も `run:` (= リポジトリのコード) なので、
-    // setup-node は必ず最初のリポジトリのコードより前にある。
-    // 以前はここに `setupIndex > firstRepoCode` の分岐があったが、**構造上ぜったいに
-    // 成立しない条件**で、その文言は一度も出ない死んだコードだった (§6)。
-    // 実際の誤り (`run: npm ci` の後ろに setup-node) は、上の 2 つが
-    // 「実行時検証を実行していない」「実行時検証がリポジトリのコードより後ろにある」
-    // として必ず名指しする — 下のテーブル駆動テストがその文言まで固定している。
+    // ここまでのどの判定にも掛からなければ、置き方は満たされている
     return [];
   });
 }
@@ -1777,6 +1798,49 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
         "synthetic.yml:job": { runtimeVerifier: "corepack の有効化が検証より前に要る" },
       }),
     ).toEqual([]);
+    // **免除しても、setup-node を先に置く保証までは外れない。** runtimeVerifier は
+    // `verifierIndex <= firstRepoCode` を外すので、免除したジョブでは
+    // `setupIndex > firstRepoCode` が成立しうる — その形を名指ししないと
+    // `npm ci` がランナー既定の Node で走る (実測でこの形が空配列になっていた)
+    const setupAfterRepoCode = jobOf({
+      steps: [
+        { run: "npm ci" },
+        { uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } },
+        { run: "node scripts/verify-node-major.mjs" },
+        { run: "npm run test" },
+      ],
+    });
+    expect(
+      collectJobsMissingSetupNode([setupAfterRepoCode], new Set(), {
+        "synthetic.yml:job": { runtimeVerifier: "検証より前に run: が要る" },
+      }),
+    ).toEqual([
+      {
+        file: "synthetic.yml",
+        job: "job",
+        reason: "setup-node がリポジトリのコードより後ろにある (先に走る分はランナー既定の Node で動く)",
+      },
+    ]);
+    // **最後のリポジトリのコードがローカル action のときも、差し替えとして見る。**
+    // そのステップは「中身を読めない uses:」と「スイートの実行」を兼ねるので、
+    // 終端を除いていたときは action.yml の中で Node を入れ替える形が
+    // 両方の網から見えなかった (実測で空配列)
+    const localActionRunsSuite = jobOf({
+      steps: [
+        { uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } },
+        { run: "node scripts/verify-node-major.mjs" },
+        { uses: "./.github/actions/run-suite" },
+      ],
+    });
+    expect(collectJobsMissingSetupNode([localActionRunsSuite], new Set())).toEqual([
+      {
+        file: "synthetic.yml",
+        job: "job",
+        reason:
+          `${RUNTIME_VERIFIER} より後ろに uses: のステップがある ` +
+          "(./.github/actions/run-suite)。検証した Node のまま走る保証が無い",
+      },
+    ]);
     // **免除するのは「置き方」だけ。** 検証を 1 つも置いていないジョブは、鍵があっても
     // 名指しする (置き場所の事情と「そもそも検証していない」は別の話で、後者まで
     // 外せると担保の中心が鍵 1 つで空洞になる)
