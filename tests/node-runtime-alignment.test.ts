@@ -48,6 +48,9 @@
 //       **読めないワークフローが 1 本でもあれば、その時点で落とす。**
 //       ジョブ 0 件として黙って飛ばすと、他に正しい `ci.yml` があるかぎり検査は
 //       緑のまま通り、その 1 本だけが検査から外れる (実測。fail-open)。
+//       判定は `jobs` / ジョブ定義 / `steps` とその要素の**3 段すべて**に掛ける —
+//       どの段も「対応表でなければそこから先は読めない」ので、1 段でも緩いと
+//       そのジョブだけが 3 つの検査から静かに外れる (実測で 1 段ずつ見つかった)。
 //   (b) 読み取り不能 … 書式が変わってピンを読めない状態。判定の土台が崩れるので
 //       「たぶん合っている」ではなく落とす (fail-closed)。
 //   (c) 宣言のずれ … `engines.node` がピン留めした Node を許していない、
@@ -240,7 +243,9 @@ interface WorkflowListing {
 function listWorkflowFiles(): WorkflowListing {
   try {
     // 拡張子が .yml / .yaml のものだけを対象にする (README などを YAML として解釈しない)
-    const files = readdirSync(WORKFLOWS_DIR).filter((name) => /\.ya?ml$/i.test(name));
+    const files = readdirSync(WORKFLOWS_DIR).filter((name) =>
+      /\.ya?ml$/i.test(name),
+    );
     // 読めたので、原因は無しとして返す
     return { files, error: null };
   } catch (error) {
@@ -257,6 +262,35 @@ interface WorkflowJob {
   name: string;
   // そのジョブの定義 (steps / container などを読む)
   definition: Record<string, unknown>;
+}
+
+/**
+ * ジョブの `steps` が構造として読めるかを調べ、読めない理由を返す (読めれば null)。
+ *
+ * **`steps` を持たないジョブは正当**なので null を返す (再利用可能ワークフローの
+ * 呼び出しは `jobs.<id>.uses:` だけを持つ)。落とすのは「あるのに読めない」形だけ:
+ *   - `steps: "npm ci && npm run test"` … 配列でないので `Array.isArray` が偽になり、
+ *     ジョブは「steps を持たない」と同じ扱い = 3 つの検査すべてから外れる。
+ *   - `steps: ["npm ci && npm run test"]` … 要素が対応表でないので `asRecord` が
+ *     `{}` に潰し、`run:` も `uses:` も無いステップとして見える。
+ * どちらも実測で全件緑のまま通った (`jobs` とジョブ定義で塞いだ fail-open が
+ * 1 段下に残っていた形)。GitHub 側では構文エラーになる書き方なので、
+ * 「読めないなら落とす」で正当なワークフローを巻き添えにすることもない。
+ */
+function describeStepsProblem(steps: unknown): string | null {
+  // steps が無いジョブは正当 (再利用可能ワークフローの呼び出し)
+  if (steps === undefined) return null;
+  // あるのに配列でなければ、ステップを 1 つも読めない
+  if (!Array.isArray(steps))
+    return `steps が配列ではありません (${describeShape(steps)})`;
+  // 要素の位置を添えて、対応表でないものを探す
+  const badIndex = steps.findIndex((step) => !isPlainMapping(step));
+  // 1 つでもあれば、そのステップは run: も uses: も読めない
+  if (badIndex !== -1) {
+    return `steps[${badIndex}] が対応表ではありません (${describeShape(steps[badIndex])})`;
+  }
+  // すべて読める形
+  return null;
 }
 
 /** 置き場のワークフローを 1 本ずつ読んだ結果 (読めたジョブと、読めなかったファイル)。 */
@@ -311,7 +345,9 @@ function scanWorkflows(): WorkflowScan {
     // (トップレベルで塞いだのと同じ fail-open が 1 段下に残っていた。実測)
     const jobsValue = asRecord(read.value).jobs;
     if (!isPlainMapping(jobsValue)) {
-      unreadable.push(`${file}: jobs が対応表ではありません (${describeShape(jobsValue)})`);
+      unreadable.push(
+        `${file}: jobs が対応表ではありません (${describeShape(jobsValue)})`,
+      );
       continue;
     }
     // jobs 直下をジョブ名付きで平らに並べる
@@ -321,6 +357,15 @@ function scanWorkflows(): WorkflowScan {
         unreadable.push(
           `${file}: ジョブ ${name} の定義が対応表ではありません (${describeShape(definition)})`,
         );
+        continue;
+      }
+      // **`steps` の 1 段下も同じ扱いで見る。** `steps: "npm ci"` や
+      // `steps: ["npm ci"]` は例外にならず、配列判定 / `asRecord` が黙って潰すため、
+      // そのジョブが 3 つの検査すべてから外れる (`jobs` と ジョブ定義で塞いだのと
+      // 同じ fail-open が 1 段下に残っていた。実測で全件緑のまま通った)
+      const stepsProblem = describeStepsProblem(definition.steps);
+      if (stepsProblem !== null) {
+        unreadable.push(`${file}: ジョブ ${name} の ${stepsProblem}`);
         continue;
       }
       // 読めたジョブを、どのワークフローの何という名前かと一緒に控える
@@ -369,10 +414,24 @@ function stepRecordsOf(job: WorkflowJob): Record<string, unknown>[] | null {
   return steps.map((step) => asRecord(step));
 }
 
+/**
+ * ステップの `uses:` を文字列として読む (未指定なら空文字列)。
+ *
+ * **読み方をここ 1 か所に置く。** `uses:` は 3 つの検査が見る同じ 1 つの手掛かりで
+ * (setup-node かどうか / ローカル action の呼び出しか / `docker://` のイメージか)、
+ * 読み方を書き写すと、読み方を直したとき (前後の空白を落とす、`../` も数える 等) に
+ * 一部だけが直り、**同じステップ集合を見るはずの検査が黙って食い違う**
+ * (この差分自身が `stepRecordsOf` / `isPlainMapping` の docstring で警告している形)。
+ */
+function usesOf(step: Record<string, unknown>): string {
+  // uses が無いステップ (run: だけのステップ) は空文字列として扱う
+  return String(step.uses ?? "");
+}
+
 /** そのステップが `actions/setup-node` を呼んでいるか。 */
 function isSetupNodeStep(step: Record<string, unknown>): boolean {
   // uses を文字列として照合する (未指定なら空文字列 = 一致しない)
-  return SETUP_NODE_USES.test(String(step.uses ?? ""));
+  return SETUP_NODE_USES.test(usesOf(step));
 }
 
 /**
@@ -429,7 +488,11 @@ function collectSetupNodeSteps(jobs: readonly WorkflowJob[]): SetupNodeStep[] {
     // setup-node のステップに絞り、その with をファイル名・ジョブ名付きで返す
     return steps
       .filter(isSetupNodeStep)
-      .map((step) => ({ file: job.file, job: job.name, inputs: asRecord(step.with) }));
+      .map((step) => ({
+        file: job.file,
+        job: job.name,
+        inputs: asRecord(step.with),
+      }));
   });
 }
 
@@ -519,17 +582,44 @@ function runsRepositoryCode(step: Record<string, unknown>): boolean {
   // run: に中身があれば、リポジトリのコードを走らせている
   if (typeof step.run === "string" && step.run.trim() !== "") return true;
   // ローカルの composite action 呼び出しも同じ扱いにする
-  return String(step.uses ?? "").startsWith("./");
+  return usesOf(step).startsWith("./");
+}
+
+/**
+ * 失敗文言に出す、`with:` の指定内容の説明。
+ *
+ * **`JSON.stringify` を使わない。** YAML はアンカーで自己参照する値が書けるため
+ * (`with: &w { node-version: '20', self: *w }`)、循環参照になると
+ * `JSON.stringify` が例外を投げ、**丁寧に書いた失敗文言の代わりに素の TypeError**が
+ * 残る（実測。この差分が共有ライブラリの `describeShape` で避けている形そのもの）。
+ * そこで値は `String()` か `describeShape` で固定長の語句に落としてから並べる。
+ */
+function describeInputs(inputs: Record<string, unknown>): string {
+  // 指定が無ければその旨を出す (空の {} だけを見せても読み手に伝わらない)
+  if (Object.keys(inputs).length === 0) return "with: の指定なし";
+  // キーと値を 1 つずつ、安全に文字列化して並べる
+  return Object.entries(inputs)
+    .map(([key, value]) => {
+      // 入れ子の対応表・配列は中身を出さず「形」だけにする (循環参照でも安全)
+      const shown =
+        isPlainMapping(value) || Array.isArray(value)
+          ? describeShape(value)
+          : String(value);
+      // 「キー=値」の形にそろえる
+      return `${key}=${shown}`;
+    })
+    .join(", ");
 }
 
 /** 失敗文言に出す、ステップ 1 つの短い説明。 */
 function describeStep(step: Record<string, unknown>): string {
   // run: なら最初の 1 行だけを出す (複数行をそのまま出すと文言が読めなくなる)
-  const run = typeof step.run === "string" ? step.run.trim().split("\n")[0] : "";
+  const run =
+    typeof step.run === "string" ? step.run.trim().split("\n")[0] : "";
   // run: に中身があれば、その 1 行を説明として使う
   if (run !== "") return `run: ${run}`;
   // run: が無ければローカル action の呼び出し
-  return `uses: ${String(step.uses ?? "")}`;
+  return `uses: ${usesOf(step)}`;
 }
 
 /** `setup-node` の置き方が足りていないジョブ 1 つ分。 */
@@ -640,15 +730,22 @@ function collectNodeImageUses(jobs: readonly WorkflowJob[]): NodeImageUse[] {
     const container = job.definition.container;
     // 文字列ならそれ自体がイメージ名、マップなら image キーがイメージ名
     const containerImage =
-      typeof container === "string" ? container : String(asRecord(container).image ?? "");
+      typeof container === "string"
+        ? container
+        : String(asRecord(container).image ?? "");
     // node イメージなら控える (ubuntu 等の中で setup-node を使う形は上の検査が見る)
     if (isNodeImage(containerImage)) {
-      found.push({ file: job.file, job: job.name, image: containerImage, where: "container:" });
+      found.push({
+        file: job.file,
+        job: job.name,
+        image: containerImage,
+        where: "container:",
+      });
     }
     // 各ステップの uses: docker:// も同じ扱いで見る (steps が無いジョブは空で回す)
     for (const step of stepRecordsOf(job) ?? []) {
       // uses を文字列として取り出す
-      const uses = String(step.uses ?? "");
+      const uses = usesOf(step);
       // docker:// で始まらないステップはイメージを直接走らせていない
       if (!uses.startsWith(DOCKER_USES_PREFIX)) continue;
       // 接頭辞を落としてイメージ名だけにする
@@ -724,7 +821,10 @@ function collectPinnedSources(): PinnedSource[] {
   // 2 つの出どころをラベル付きで並べて返す
   return [
     { label: ".nvmrc", major: readNvmrcMajor() },
-    { label: "Dockerfile (FROM node:<major>)", major: readDockerfileNodeMajor() },
+    {
+      label: "Dockerfile (FROM node:<major>)",
+      major: readDockerfileNodeMajor(),
+    },
   ];
 }
 
@@ -751,11 +851,16 @@ function directDependencyNames(json: unknown): string[] {
  * 黙って対象から外れるので、「違反ゼロ＝緑」と見分けが付かない。全体が読めないときだけ
  * 落とす形にすると、15 件中 14 件が消えても緑のままになる (この検査の存在意義が薄れる)。
  */
-function unresolvedDependencies(lock: unknown, names: readonly string[]): string[] {
+function unresolvedDependencies(
+  lock: unknown,
+  names: readonly string[],
+): string[] {
   // ロックファイルの packages 枝を共有ヘルパーで取り出す
   const table = readLockPackages(lock);
   // 巻き上げ位置にメタデータが無い名前を集める
-  return names.filter((name) => Object.keys(asRecord(table[`node_modules/${name}`])).length === 0);
+  return names.filter(
+    (name) => Object.keys(asRecord(table[`node_modules/${name}`])).length === 0,
+  );
 }
 
 /**
@@ -765,7 +870,10 @@ function unresolvedDependencies(lock: unknown, names: readonly string[]): string
  * (npm 自体がそう扱うので、こちらで勝手に縛ると実在しない食い違いを報告する)。
  * 解決できなかった依存は unresolvedDependencies が別途落とすので、ここでは黙って外す。
  */
-function collectDependencyEngines(lock: unknown, names: readonly string[]): DependencyEngine[] {
+function collectDependencyEngines(
+  lock: unknown,
+  names: readonly string[],
+): DependencyEngine[] {
   // ロックファイルの packages 枝を共有ヘルパーで取り出す
   const table = readLockPackages(lock);
   // 名前ごとに、巻き上げ位置のメタデータから engines.node を引く
@@ -820,14 +928,20 @@ function allowsMajor(range: string, major: number): boolean {
 // 置き場の YAML を全部読み直すことになる (この節の方針と食い違う)
 const workflowScan = scanWorkflows();
 const dependabotRead = readParsed(DEPENDABOT_PATH, (text) => parseYaml(text));
-const packageJsonRead = readParsed(PACKAGE_JSON_PATH, (text) => JSON.parse(text));
-const packageLockRead = readParsed(PACKAGE_LOCK_PATH, (text) => JSON.parse(text));
+const packageJsonRead = readParsed(PACKAGE_JSON_PATH, (text) =>
+  JSON.parse(text),
+);
+const packageLockRead = readParsed(PACKAGE_LOCK_PATH, (text) =>
+  JSON.parse(text),
+);
 // ピン留めの読み取りも 1 度だけ行う
 const pinnedSources = collectPinnedSources();
 // 判定の基準になる実行時 major。ピンが揃っていない場合は null になり、
 // それ自体を最初のテストが落とす (後続は「基準が無い」ことを明示して落ちる)
 const runtimeMajor =
-  new Set(pinnedSources.map((source) => source.major)).size === 1 ? pinnedSources[0].major : null;
+  new Set(pinnedSources.map((source) => source.major)).size === 1
+    ? pinnedSources[0].major
+    : null;
 
 // 対象パッケージに当たる ignore エントリ (件数・中身は個別のテストで確かめる)
 const ignoreEntries = collectIgnoreEntries(
@@ -862,7 +976,10 @@ describe("実行する Node の major を宣言しているすべての場所の
           `${displayPath(input.path)}: ${describeReadError(input.read.error, REPO_ROOT)}`,
       );
     // 1 つでも読めなければ、以降の判定は意味を持たないので前提崩れとして落とす
-    expect(unreadable, `設定ファイルを読めない: ${unreadable.join(" / ")}`).toEqual([]);
+    expect(
+      unreadable,
+      `設定ファイルを読めない: ${unreadable.join(" / ")}`,
+    ).toEqual([]);
   });
 
   it("CI が Node の版を書き写さず、.nvmrc を参照して用意している", () => {
@@ -899,15 +1016,25 @@ describe("実行する Node の major を宣言しているすべての場所の
     // (失敗文言が実際の指定を出すため、直し方も迷わない)
     const misconfigured = setupSteps
       .filter(
-        (step) => step.inputs["node-version-file"] !== ".nvmrc" || "node-version" in step.inputs,
+        (step) =>
+          step.inputs["node-version-file"] !== ".nvmrc" ||
+          "node-version" in step.inputs,
       )
-      .map((step) => `${step.file}: ${step.job} (${JSON.stringify(step.inputs)})`);
-    expect(
-      misconfigured,
-      `actions/setup-node の版は node-version-file: '.nvmrc' で指定し、node-version は書かないこと` +
-        `(cache などの他の入力は付けてよい)。実際の指定: ${misconfigured.join(" / ")}。` +
-        "版を直書きすると .nvmrc とずれても CI は緑のまま通り、出荷する Node を検証していない状態に戻る。",
-    ).toEqual([]);
+      .map(
+        (step) => `${step.file}: ${step.job} (${describeInputs(step.inputs)})`,
+      );
+    // **3 つの口の判定は soft にする。** 通常の expect は最初の 1 件で中断するので、
+    // 2 つ以上の口が同時に開いていると、直して push するたびに次の 1 件が出る
+    // (CI の巡が増える)。加えて中断されると下の「container: で名指ししたジョブを
+    // 除く」重複除け自体が一度も効かない = docstring が書いている挙動が起きえない
+    expect
+      .soft(
+        misconfigured,
+        `actions/setup-node の版は node-version-file: '.nvmrc' で指定し、node-version は書かないこと` +
+          `(cache などの他の入力は付けてよい)。実際の指定: ${misconfigured.join(" / ")}。` +
+          "版を直書きすると .nvmrc とずれても CI は緑のまま通り、出荷する Node を検証していない状態に戻る。",
+      )
+      .toEqual([]);
     // **版が入り込む 2 つ目の口**も塞ぐ。`container: node:20` を据えたジョブは
     // setup-node を 1 本も置かずにそのイメージの Node で steps を回せるため、
     // 上の検査だけでは素通りする (実測で全件緑のまま通った)。
@@ -917,13 +1044,15 @@ describe("実行する Node の major を宣言しているすべての場所の
     const nodeImages = nodeImageUses.map(
       (use) => `${use.file}: ${use.job} (${use.where} ${use.image})`,
     );
-    expect(
-      nodeImages,
-      `node イメージを CI で走らせないこと (ジョブの container: / ステップの uses: docker://)。` +
-        `実際の指定: ${nodeImages.join(" / ")}。` +
-        "そのイメージの Node でステップが走るので、.nvmrc と別の major で検証している状態になる。" +
-        "Node は actions/setup-node に node-version-file: '.nvmrc' を渡して用意すること。",
-    ).toEqual([]);
+    expect
+      .soft(
+        nodeImages,
+        `node イメージを CI で走らせないこと (ジョブの container: / ステップの uses: docker://)。` +
+          `実際の指定: ${nodeImages.join(" / ")}。` +
+          "そのイメージの Node でステップが走るので、.nvmrc と別の major で検証している状態になる。" +
+          "Node は actions/setup-node に node-version-file: '.nvmrc' を渡して用意すること。",
+      )
+      .toEqual([]);
     // **版が入り込む 3 つ目の口**は「書き忘れ」で到達する。ランナーには Node が
     // 最初から入っているので、setup-node を置かないジョブで npm を叩くと
     // ランナー既定の major でスイートが丸ごと走る (上の 2 つは素通りする。実測)。
@@ -933,13 +1062,15 @@ describe("実行する Node の major を宣言しているすべての場所の
       workflows.jobs,
       new Set(nodeImageUses.map((use) => jobKey(use.file, use.job))),
     ).map((job) => `${job.file}: ${job.job} (${job.reason})`);
-    expect(
-      missingSetup,
-      `このリポジトリのコードを実行するジョブ (run: / ローカル action の呼び出し) には、` +
-        `無条件の actions/setup-node をそのコードより前に置くこと。足りていないジョブ: ${missingSetup.join(" / ")}。` +
-        "ランナーに最初から入っている Node でそのまま走るため、.nvmrc とは無関係な major で検証している状態になる。" +
-        "Node と無関係なジョブは NODE_UNRELATED_JOBS へ理由付きで登録すること。",
-    ).toEqual([]);
+    expect
+      .soft(
+        missingSetup,
+        `このリポジトリのコードを実行するジョブ (run: / ローカル action の呼び出し) には、` +
+          `無条件の actions/setup-node をそのコードより前に置くこと。足りていないジョブ: ${missingSetup.join(" / ")}。` +
+          "ランナーに最初から入っている Node でそのまま走るため、.nvmrc とは無関係な major で検証している状態になる。" +
+          "Node と無関係なジョブは NODE_UNRELATED_JOBS へ理由付きで登録すること。",
+      )
+      .toEqual([]);
   });
 
   it("Node と無関係なジョブの除外表が、実在するジョブだけを理由付きで挙げている", () => {
@@ -950,9 +1081,12 @@ describe("実行する Node の major を宣言しているすべての場所の
     // 読めなかったワークフローのジョブは `existing` に入らないので、正しい除外まで
     // 「実在しない」と報告してしまう — その指示に従って消すと、上の検査が
     // 本当に Node と無関係なジョブで落ち続ける。原因は姉妹の検査が名指しする
-    const inputsBroken = workflows.listError !== null || workflows.unreadable.length > 0;
+    const inputsBroken =
+      workflows.listError !== null || workflows.unreadable.length > 0;
     // いま実在するジョブのキー一覧
-    const existing = new Set(workflows.jobs.map((job) => jobKey(job.file, job.name)));
+    const existing = new Set(
+      workflows.jobs.map((job) => jobKey(job.file, job.name)),
+    );
     // **実在しないジョブの登録**を落とす。ジョブ名を変えた・消したあとも残っていると、
     // 将来その名前のジョブを足した人に黙って除外が効く (差分にも現れない)
     const stale = inputsBroken
@@ -988,7 +1122,9 @@ describe("実行する Node の major を宣言しているすべての場所の
       [...new Set(pinnedSources.map((source) => source.major))],
       `実行する Node の major が食い違っている: ${pinnedSources
         .map((source) => `${source.label}=${source.major}`)
-        .join(", ")}。Node を上げるときは 2 か所すべてを同じ major に揃えること。`,
+        .join(
+          ", ",
+        )}。Node を上げるときは 2 か所すべてを同じ major に揃えること。`,
     ).toHaveLength(1);
   });
 
@@ -1035,7 +1171,10 @@ describe("実行する Node の major を宣言しているすべての場所の
 
   it("package.json の @types/node が、実行する Node と同じ major を指している", () => {
     // package.json の devDependencies から宣言された範囲を取り出す
-    const declared = readDevDependencyRange(packageJsonRead.value, GUARDED_DEPENDENCY);
+    const declared = readDevDependencyRange(
+      packageJsonRead.value,
+      GUARDED_DEPENDENCY,
+    );
     // 範囲から許容 major を読み取る
     const declaredMajor = parseAllowedMajor(declared);
     // 読めない書き方なら落とす (読めない範囲を「たぶん合っている」と決めつけない)
@@ -1053,7 +1192,11 @@ describe("実行する Node の major を宣言しているすべての場所の
 
   it("ロックファイルの解決済み @types/node も、実行する Node と同じ major になっている", () => {
     // 巻き上げ位置の解決済みメタデータから version を引く
-    const meta = asRecord(readLockPackages(packageLockRead.value)[`node_modules/${GUARDED_DEPENDENCY}`]);
+    const meta = asRecord(
+      readLockPackages(packageLockRead.value)[
+        `node_modules/${GUARDED_DEPENDENCY}`
+      ],
+    );
     const locked = typeof meta.version === "string" ? meta.version : null;
     // 見つからなければ前提崩れとして落とす
     expect(
