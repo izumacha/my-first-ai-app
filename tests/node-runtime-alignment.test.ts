@@ -641,6 +641,10 @@ function isNodeImage(image: string): boolean {
  *     除外を外す必要がある** (外さないと setup-node も検証も無いまま走る)。
  *   - `image` … このジョブの `uses: docker://` はイメージに Node を持ち込まない
  *     (例: `docker://hadolint/hadolint`)。
+ *   - `runtimeVerifier` … 実行時検証の**置き方だけ**を免除する (検証より前にどうしても
+ *     `run:` が要る / 検証より後ろの `uses:` は Node を差し替えないと確認済み)。
+ *     **検証を置かないこと自体は免除しない** — 置き場所の事情と「そもそも検証していない」は
+ *     別の話で、後者まで外せると担保の中心が鍵 1 つで空洞になる。
  *
  * **範囲を分けているのが要点。** 1 つの理由で両方を免除する形にすると、
  * 「イメージは Node と無関係」と登録しただけで**同じジョブの `run: npm ci` に対する
@@ -877,7 +881,16 @@ function collectJobsMissingSetupNode(
     // どの Node で動いたかは分からない。`$GITHUB_PATH` などジョブ全体に効く入れ替えを
     // 挟む形が、後置だと素通りした (実測)。検証自身も `run:` なので、期待どおりの
     // 並びでは検証が「最初のリポジトリのコード」になる
-    if (verifierIndex > firstRepoCode) {
+    // **この位置の要求だけは `runtimeVerifier` の免除で外せる。** `JobExemption` の
+    // docstring が唯一の用途として挙げているのが「検証より前にどうしても `run:` が要る」
+    // (例: `run: corepack enable`) ジョブで、その形はまさにここへ落ちてくる。
+    // 免除を効かせないと逃げ道が `setupNode` (ジョブ全体) しか無くなり、
+    // **同じジョブの setup-node の要求まで黙って外れる** — 鍵を分けた理由そのものの事故を、
+    // 検出網が失敗文言で案内することになる (実測でこの形が名指しされ続けていた)。
+    // **免除するのは「置き方」だけで、`verifierIndex === -1` (検証が無い) は上で
+    // 既に名指ししてある** — 置き場所の事情と「そもそも検証していない」は別の話で、
+    // 後者まで外せると担保の中心が鍵 1 つで空洞になる。
+    if (verifierIndex > firstRepoCode && exemptions[key]?.runtimeVerifier === undefined) {
       return [
         {
           file: job.file,
@@ -1285,7 +1298,10 @@ describe("実行する Node の major を宣言しているすべての場所の
       `このリポジトリのコードを実行するジョブ (run: / ローカル action の呼び出し) には、` +
         `無条件の actions/setup-node をそのコードより前に置くこと。足りていないジョブ: ${missingSetup.join(" / ")}。` +
         "ランナーに最初から入っている Node でそのまま走るため、.nvmrc とは無関係な major で検証している状態になる。" +
-        "Node と無関係なジョブは NODE_GUARD_EXEMPTIONS の setupNode へ理由付きで登録すること。",
+        "Node と無関係なジョブは NODE_GUARD_EXEMPTIONS の setupNode へ、" +
+        `${RUNTIME_VERIFIER} の置き方だけに事情があるジョブは runtimeVerifier へ、それぞれ理由付きで登録すること。` +
+        "**置き方の事情で setupNode を選ばないこと** — あちらはジョブ全体の要求を外すので、" +
+        "同じジョブの setup-node の要求まで黙って落ちる。",
     ).toEqual([]);
   });
 
@@ -1314,7 +1330,7 @@ describe("実行する Node の major を宣言しているすべての場所の
     const withoutReason = exclusionsWithoutReason(NODE_GUARD_EXEMPTIONS);
     expect(
       withoutReason,
-      `NODE_GUARD_EXEMPTIONS の除外には、免除する検査 (setupNode / image) と理由を書くこと` +
+      `NODE_GUARD_EXEMPTIONS の除外には、免除する検査 (setupNode / image / runtimeVerifier) と理由を書くこと` +
         ` (空・空白・免除先なしは不可): ${withoutReason.join(" / ")}。`,
     ).toEqual([]);
   });
@@ -1734,6 +1750,47 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
         "synthetic.yml:job": { runtimeVerifier: "差し替えではないと確認済み" },
       }),
     ).toEqual([]);
+    // **検証より前にどうしても `run:` が要る形**。`JobExemption` の docstring が
+    // runtimeVerifier の用途として唯一挙げているのがこれ (例: `run: corepack enable`)。
+    // 免除が無ければ「リポジトリのコードより後ろ」として名指しする
+    const setupBeforeVerifier = jobOf({
+      steps: [
+        { uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } },
+        { run: "corepack enable" },
+        { run: "node scripts/verify-node-major.mjs" },
+        { run: "npm ci" },
+      ],
+    });
+    expect(collectJobsMissingSetupNode([setupBeforeVerifier], new Set())).toEqual([
+      {
+        file: "synthetic.yml",
+        job: "job",
+        reason: `${RUNTIME_VERIFIER} がリポジトリのコードより後ろにある (先に走った検証の Node が分からない)`,
+      },
+    ]);
+    // **その形は runtimeVerifier で免除できる。** ここが効かないと逃げ道が setupNode
+    // (ジョブ全体) しか無くなり、同じジョブの setup-node の要求まで黙って外れる —
+    // 鍵を分けた理由そのものの事故を、検出網が失敗文言で案内することになる (実測で
+    // この形は免除を登録しても名指しされ続けていた)
+    expect(
+      collectJobsMissingSetupNode([setupBeforeVerifier], new Set(), {
+        "synthetic.yml:job": { runtimeVerifier: "corepack の有効化が検証より前に要る" },
+      }),
+    ).toEqual([]);
+    // **免除するのは「置き方」だけ。** 検証を 1 つも置いていないジョブは、鍵があっても
+    // 名指しする (置き場所の事情と「そもそも検証していない」は別の話で、後者まで
+    // 外せると担保の中心が鍵 1 つで空洞になる)
+    expect(
+      collectJobsMissingSetupNode([noVerifier], new Set(), {
+        "synthetic.yml:job": { runtimeVerifier: "置き方の事情" },
+      }),
+    ).toEqual([
+      {
+        file: "synthetic.yml",
+        job: "job",
+        reason: `${RUNTIME_VERIFIER} を実行していない`,
+      },
+    ]);
     // 実行時検証が setup-node より前だと、ランナー既定の Node を見る空振りになる
     const verifierTooEarly = jobOf({
       steps: [
