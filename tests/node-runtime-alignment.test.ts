@@ -1397,7 +1397,7 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
           ? "setup-node に if: / continue-on-error が付いている (効かなくても後続が走る)"
           : "setup-node が無い",
       );
-    } else if (setupIndex > firstRepoCode && !invokesRuntimeVerifier(steps[firstRepoCode])) {
+    } else if (setupIndex > firstRepoCode && !isVerifierOnlyStep(steps[firstRepoCode])) {
       // **「setup-node より前にリポジトリのコードがある」ことを、検証の有無に関わらず
       // 名指しする。** これが根本原因 (`npm ci` がランナー既定の Node で走り、
       // そこで入る node_modules は検証していない Node のもの) なのに、以前は
@@ -1405,9 +1405,13 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
       // 1 巡目に「検証がリポジトリのコードより後ろ」、直すと 2 巡目に「検証が
       // setup-node より前」と出て、**3 巡かけても setup-node の位置は一度も
       // 名指しされない** (docstring は名指しすると書いているのに = 実測)。
-      // **先頭のリポジトリのコードが検証自身のときだけ出さない** — その形
+      // **先頭のリポジトリのコードが「検証だけのステップ」のときだけ出さない** — その形
       // (`[検証, setup-node, npm ci]`) は下の並び順の判定がより具体的な文言で
-      // 名指しするので、ここで出すと同じ誤りを 2 通りの言い方で報告することになる
+      // 名指しするので、ここで出すと同じ誤りを 2 通りの言い方で報告することになる。
+      // **`invokesRuntimeVerifier` で判定してはいけない** — 検証を他の処理と同じ
+      // `run:` にまとめた形 (`[run: npm ci + 検証, setup-node, npm test]`) まで
+      // 抑止され、根本原因 (`npm ci` がランナー既定の Node で走る) が名指しされない。
+      // まとめ書きを直して push した**次の巡**にようやく出る形になっていた (実測)
       reasons.push(
         "setup-node がリポジトリのコードより後ろにある (先に走る処理はランナー既定の Node で動く)",
       );
@@ -2616,6 +2620,26 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
       ),
     },
     {
+      // **まとめ書きの run: が先頭にあっても、根本原因を名指しする。**
+      // 抑止の判定を `invokesRuntimeVerifier` にしていたときは、この形で
+      // 「同じ run: にまとめられている」しか出ず、まとめ書きを直して push した
+      // 次の巡にようやく setup-node の位置が出る形になっていた (実測)
+      label: "検証を含むまとめ書きの run: が setup-node より前",
+      jobs: [
+        jobOf({
+          steps: [
+            { run: "npm ci\nnode scripts/verify-node-major.mjs" },
+            setupNodeStep,
+            { run: "npm run test" },
+          ],
+        }),
+      ],
+      expected: named(
+        "setup-node がリポジトリのコードより後ろにある (先に走る処理はランナー既定の Node で動く)" +
+          ` / ${RUNTIME_VERIFIER} が他の処理と同じ run: にまとめられている (先に走った処理の Node が分からない)`,
+      ),
+    },
+    {
       // 空行とシェルのコメントは「走る行」ではないので、検証だけのステップとして通す
       label: "検証の run: に空行とコメントだけが添えられている",
       jobs: [
@@ -3475,28 +3499,40 @@ describe("実行時検証スクリプトそのものの挙動", () => {
       const result = spawnSync(process.execPath, [join(sandbox, "scripts", "verify-node-major.mjs")], {
         // 出力を文字列として受け取る
         encoding: "utf8",
-        // **必ず時間で打ち切る。** このスクリプトは即座に終わる前提だが、`fail` の
-        // 書き込みループから抜ける条件を壊すと (`wrote <= 0` の break を消す等)
-        // 子プロセスが返らなくなり、spawnSync は**無期限に待つ**。そうなると
+        // **必ず時間で打ち切る。** このスクリプトは即座に終わる前提だが、返らなくなる
+        // 変更 (`.nvmrc` の読み取りを同期から待ちに変える、`fail` のあとに何かを
+        // 待ち合わせる、など) が入ると spawnSync は**無期限に待つ**。そうなると
         // `npm run test` ごと止まり、CI はジョブ側のタイムアウトに殺されて
         // **どのテストが原因かも診断も残らない**。打ち切れば「名前の付いた失敗」になる
         timeout: VERIFIER_TIMEOUT_MS,
       });
-      // 時間切れで殺された場合を、スクリプトの判定結果と取り違えない
-      // (`status` は null になるので、理由を添えないと「終了コードが 0 でない」と
-      //  読めてしまい、本当の原因であるぶら下がりが見えなくなる)
-      if (result.signal !== null) {
+      // **失敗の種類を取り違えない (§6 握り潰さない)。** `status` はどの失敗でも
+      // null になるので、理由を添えないと「終了コードが 0 でない」と読めてしまう。
+      // 時間切れは `error.code === "ETIMEDOUT"` で現れ (シグナルは SIGTERM)、
+      // **OS による外部からの kill (OOM killer 等) は `error` 無しの SIGKILL** になる。
+      // `signal` だけを見て「打ち切られた」と決めると、**起きていないぶら下がりを
+      // 指して**読み手を `verify-node-major.mjs` へ誘導することになる
+      const failure = result.error as NodeJS.ErrnoException | undefined;
+      // 時間切れ (この検査自身が打ち切った場合)
+      if (failure?.code === "ETIMEDOUT") {
         return {
           status: result.status,
-          output: `スクリプトが ${VERIFIER_TIMEOUT_MS}ms 以内に終わらず ${result.signal} で打ち切られた`,
+          output: `スクリプトが ${VERIFIER_TIMEOUT_MS}ms 以内に終わらず ${String(result.signal)} で打ち切られた`,
         };
       }
-      // **起動そのものに失敗した場合を握り潰さない (§6)。** spawnSync は EAGAIN /
+      // **起動そのものに失敗した場合を握り潰さない。** spawnSync は EAGAIN /
       // ENOMEM / EACCES のとき `{status: null, error, stdout: null}` を返すので、
       // そのまま返すと「出力が空のまま落ちた」= スクリプトの不具合という
       // 別の顔で報告され、本当の原因 (errno) が消える
-      if (result.error !== undefined) {
-        return { status: result.status, output: `スクリプトを起動できない: ${result.error.message}` };
+      if (failure !== undefined) {
+        return { status: result.status, output: `スクリプトを起動できない: ${failure.message}` };
+      }
+      // 外部から終了させられた場合 (OOM killer 等)。打ち切りとは別の原因として伝える
+      if (result.signal !== null) {
+        return {
+          status: result.status,
+          output: `スクリプトが外部から ${result.signal} で終了させられた (時間切れではない)`,
+        };
       }
       // 成否の理由は stdout / stderr のどちらにも出うるので、まとめて 1 つの文字列で見る
       return { status: result.status, output: `${result.stdout ?? ""}${result.stderr ?? ""}` };
