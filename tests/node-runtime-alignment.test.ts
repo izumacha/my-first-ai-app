@@ -1373,15 +1373,17 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
           ? "setup-node に if: / continue-on-error が付いている (効かなくても後続が走る)"
           : "setup-node が無い",
       );
-    } else if (verifierIndex === -1 && setupIndex > firstRepoCode) {
-      // **検証が無いジョブでも、setup-node の位置は名指しする。** 以前は「検証が無い」
-      // だけを返して打ち切っていたため、`[run: npm ci, setup-node]` のジョブは
-      // (a) 検証が無い → (b) 検証が後ろ → (c) 検証が setup-node より前、と
-      // **3 巡かけてようやく setup-node の位置にたどり着く**形になっていた
-      // (docstring は「run: npm ci の後ろに setup-node」を名指しすると書いているのに、
-      //  その文言が一度も出なかった)。
-      // **検証があるときはここで出さない** — そのときは下の並び順の判定がより具体的な
-      // 文言 (検証と setup-node のどちらが前か) で名指しするので、二重報告になる
+    } else if (setupIndex > firstRepoCode && !invokesRuntimeVerifier(steps[firstRepoCode])) {
+      // **「setup-node より前にリポジトリのコードがある」ことを、検証の有無に関わらず
+      // 名指しする。** これが根本原因 (`npm ci` がランナー既定の Node で走り、
+      // そこで入る node_modules は検証していない Node のもの) なのに、以前は
+      // 検証まわりの文言しか出なかった: `[npm ci, setup-node, 検証, npm test]` は
+      // 1 巡目に「検証がリポジトリのコードより後ろ」、直すと 2 巡目に「検証が
+      // setup-node より前」と出て、**3 巡かけても setup-node の位置は一度も
+      // 名指しされない** (docstring は名指しすると書いているのに = 実測)。
+      // **先頭のリポジトリのコードが検証自身のときだけ出さない** — その形
+      // (`[検証, setup-node, npm ci]`) は下の並び順の判定がより具体的な文言で
+      // 名指しするので、ここで出すと同じ誤りを 2 通りの言い方で報告することになる
       reasons.push(
         "setup-node がリポジトリのコードより後ろにある (先に走る処理はランナー既定の Node で動く)",
       );
@@ -1633,8 +1635,15 @@ function nodeMajorOfDockerfileText(text: string): number | null {
       const assignment = token.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
       // 代入でなければ次の語へ
       if (!assignment) continue;
-      // 値の前後の引用符を落として控える
-      argDefaults.set(assignment[1], assignment[2].replace(/^["']|["']$/g, ""));
+      // 値の前後の引用符を落とす
+      const value = assignment[2].replace(/^["']|["']$/g, "");
+      // **空の既定値は記録しない。** 記録すると `expandArgs` が `$BASE` を空文字へ
+      // 潰し、`FROM $BASE` が「イメージ名の無い段」として**黙って飛ばされる**
+      // (`?? whole` の目印は、空文字が nullish でないため働かない = 実測の fail-open)。
+      // 記録しなければ変数が残り、「どのイメージか決められない段」として落ちる
+      if (value === "") continue;
+      // 展開に使えるので控える
+      argDefaults.set(assignment[1], value);
     }
   }
   for (const line of lines) {
@@ -2027,6 +2036,13 @@ describe("実行する Node の major を宣言しているすべての場所の
     ).not.toBeNull();
     // engines.node は下限つきの範囲なので、パース済みの package.json から素直に引く
     const enginesNode = asRecord(asRecord(packageJsonRead.value).engines).node;
+    // 基準が決まっていなければ、その事実を明示して落とす
+    // (これが無いと `.nvmrc` が読めないだけで「README の案内が Node null と違う」と
+    //  報告され、**正しい README を直せ**という誤った案内になる。§6 握り潰さない)
+    expect(
+      runtimeMajor,
+      "ピン留め 2 か所が揃っていないため、README の案内と照合する基準が決まらない",
+    ).not.toBeNull();
     // 文字列で書かれていなければ読めなかった扱いとして落とす
     expect(
       typeof enginesNode,
@@ -2070,6 +2086,11 @@ describe("実行する Node の major を宣言しているすべての場所の
       declaredMajor,
       `package.json の ${GUARDED_DEPENDENCY} を、このテストが解釈できる形 (^26 など) で書くこと。実際の値: ${String(declared)}`,
     ).not.toBeNull();
+    // 基準が決まっていなければ、その事実を明示して落とす (上と同じ理由)
+    expect(
+      runtimeMajor,
+      `ピン留め 2 か所が揃っていないため、${GUARDED_DEPENDENCY} と照合する基準が決まらない`,
+    ).not.toBeNull();
     // 実行する Node の major と一致していることを確かめる
     expect(
       declaredMajor,
@@ -2086,6 +2107,11 @@ describe("実行する Node の major を宣言しているすべての場所の
     expect(
       locked,
       `package-lock.json に ${GUARDED_DEPENDENCY} の解決済み版が見つからない`,
+    ).not.toBeNull();
+    // 基準が決まっていなければ、その事実を明示して落とす (上と同じ理由)
+    expect(
+      runtimeMajor,
+      `ピン留め 2 か所が揃っていないため、解決済みの ${GUARDED_DEPENDENCY} と照合する基準が決まらない`,
     ).not.toBeNull();
     // 宣言が正しくても、overrides や巻き上げで解決だけがずれる場合を捕まえる
     expect(
@@ -2436,6 +2462,45 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
       label: "実行時検証を置いていない",
       jobs: [jobOf({ steps: [setupNodeStep, { run: "npm ci" }] })],
       expected: named(`${RUNTIME_VERIFIER} を実行していない`),
+    },
+    {
+      // **検証があっても、根本原因 (setup-node より前に npm ci がある) を名指しする。**
+      // 以前はこの形で「検証がリポジトリのコードより後ろ」しか出ず、直すと次は
+      // 「検証が setup-node より前」と出て、3 巡かけても setup-node の位置は
+      // 一度も名指しされなかった (実測)
+      label: "検証はあるが setup-node がリポジトリのコードより後ろ",
+      jobs: [
+        jobOf({
+          steps: [
+            { uses: "actions/checkout@v7" },
+            { run: "npm ci" },
+            setupNodeStep,
+            { run: "node scripts/verify-node-major.mjs" },
+            { run: "npm run test" },
+          ],
+        }),
+      ],
+      expected: named(
+        "setup-node がリポジトリのコードより後ろにある (先に走る処理はランナー既定の Node で動く)" +
+          ` / ${RUNTIME_VERIFIER} がリポジトリのコードより後ろにある (先に走った検証の Node が分からない)`,
+      ),
+    },
+    {
+      // 先頭のリポジトリのコードが検証自身のときは、並び順の判定に任せる
+      // (同じ誤りを 2 通りの言い方で報告しない)
+      label: "実行時検証が setup-node より前 (setup-node の位置は重ねて言わない)",
+      jobs: [
+        jobOf({
+          steps: [
+            { run: "node scripts/verify-node-major.mjs" },
+            setupNodeStep,
+            { run: "npm ci" },
+          ],
+        }),
+      ],
+      expected: named(
+        `${RUNTIME_VERIFIER} が setup-node より前にある (用意した Node を検証していない)`,
+      ),
     },
     {
       // **無条件であることまで見る。** `if:` 付きの検証はスキップされてもワークフローは
