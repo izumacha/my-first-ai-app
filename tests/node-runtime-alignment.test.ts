@@ -569,8 +569,14 @@ function stepRecordsOf(job: WorkflowJob): Record<string, unknown>[] | null {
  * (この差分自身が `stepRecordsOf` / `isPlainMapping` の docstring で警告している形)。
  */
 function usesOf(step: Record<string, unknown>): string {
-  // uses が無いステップ (run: だけのステップ) は空文字列として扱う
-  return String(step.uses ?? "");
+  // **前後の空白を落とす。** 落とさないと ` docker://node:20` の 1 文字で
+  // **3 つの判定が同時に外れる**: `SETUP_NODE_USES` は `^actions/` で始まる形しか
+  // 見ず、`docker://` の接頭辞判定も `./` のローカル action 判定も先頭一致なので、
+  // そのステップは「イメージで走らせる形」でも「リポジトリのコードを実行する形」でも
+  // 無いことになり、ジョブごと `firstRepoCode === -1` で対象外になる (実測で全件緑)。
+  // `uses:` の照合を大文字小文字を無視して行っている (SETUP_NODE_USES の `i`) のと
+  // 同じ理由 — 読み手 (GitHub) の寛容さに検出網の側をそろえる
+  return String(step.uses ?? "").trim();
 }
 
 /**
@@ -819,6 +825,32 @@ function invokesRuntimeVerifier(step: Record<string, unknown>): boolean {
     .split("\n")
     .map((line) => line.trim())
     .some((line) => RUNTIME_VERIFIER_LINE.test(line));
+}
+
+/**
+ * 実行時検証のステップが、**検証以外を何もしていない**か。
+ *
+ * **並び順の要求はステップの粒度でしか効かない。** `run: |` に
+ * `npm ci && npm run test` と `node scripts/verify-node-major.mjs` を
+ * **同じステップへまとめて書く**と、`runsRepositoryCode` も `invokesRuntimeVerifier` も
+ * その 1 つを指すため `firstRepoCode === verifierIndex` になり、
+ * 「検証がリポジトリのコードより後ろ」の判定が一度も発火しない。
+ * 差し替えの走査も `verifierIndex + 1` から始まるのでその中身を見ない。
+ * 結果、**スイートが先に別の Node で走り、あとから検証が「26 です」と申告して
+ * 終了コード 0 になる**のに全件緑で通った (実測)。
+ *
+ * `run:` の中身は解釈しない方針なので「何を先に走らせたか」は読めないが、
+ * **「検証以外も書かれている」ことだけは形で分かる**。直し方も 1 通り
+ * (「検証は独立したステップに置く」) しかなく、直しようの無い要求にはならない。
+ */
+function isVerifierOnlyStep(step: Record<string, unknown>): boolean {
+  // run: を行に割り、空行とシェルのコメントを除いた「実際に走る行」だけを見る
+  const lines = String(step.run ?? "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "" && !line.startsWith("#"));
+  // 走る行がすべて起動行なら、検証だけのステップ (行が 1 つも無ければ検証していない)
+  return lines.length > 0 && lines.every((line) => RUNTIME_VERIFIER_LINE.test(line));
 }
 
 /**
@@ -1084,6 +1116,18 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
         ? `${RUNTIME_VERIFIER} に if: / continue-on-error が付いている`
         : `${RUNTIME_VERIFIER} を実行していない`;
       return [{ file: job.file, job: job.name, reason }];
+    }
+    // **検証は、それだけのステップに置く。** スイートと同じ `run:` にまとめられると
+    // 並び順の要求 (下の 2 つ) がステップの粒度でしか効かず、一度も発火しないまま
+    // スイートが先に別の Node で走る (実測。理由は isVerifierOnlyStep の docstring)
+    if (!isVerifierOnlyStep(steps[verifierIndex])) {
+      return [
+        {
+          file: job.file,
+          job: job.name,
+          reason: `${RUNTIME_VERIFIER} が他の処理と同じ run: にまとめられている (先に走った処理の Node が分からない)`,
+        },
+      ];
     }
     // setup-node より前だと、用意した Node ではなくランナー既定の Node を見てしまう
     if (verifierIndex < setupIndex) {
@@ -1952,322 +1996,365 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
     { run: "npm ci" },
   ];
 
-  it("collectJobsMissingSetupNode が、置き方の誤りだけを名指しする", () => {
-    // 期待どおりの置き方は名指ししない
-    const compliant = jobOf({ steps: compliantSteps });
-    expect(collectJobsMissingSetupNode([compliant])).toEqual([]);
-    // setup-node がリポジトリのコードより後ろにある形は名指しする。
-    // **件数だけでなく理由まで固定する** — 件数だけだと、どの判定が拾ったのかが
-    // 分からず、「その形を名指しする」と読める一方で実際には別の理由 (この例なら
-    // 実行時検証が無いこと) で落ちている、という食い違いに気付けない
-    const tooLate = jobOf({ steps: [{ run: "npm ci" }, { uses: "actions/setup-node@v7" }] });
-    expect(collectJobsMissingSetupNode([tooLate])).toEqual([
-      { file: "synthetic.yml", job: "job", reason: `${RUNTIME_VERIFIER} を実行していない` },
-    ]);
-    // setup-node を前に出しても、実行時検証がリポジトリのコードより後ろなら名指しする
-    const setupBeforeButVerifierLate = jobOf({
-      steps: [
-        { uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } },
-        { run: "npm ci" },
-        { run: "node scripts/verify-node-major.mjs" },
+  // 合成ジョブの期待値を組み立てる小さなヘルパー (file / job は jobOf と同じ値)
+  const named = (reason: string, job = "job") => [{ file: "synthetic.yml", job, reason }];
+  // 差し替え検出の失敗文言のうち、直し方の案内を除いた共通部分
+  const swapperReason = (what: string, advice: string) =>
+    `${RUNTIME_VERIFIER} より後ろに Node を差し替えうるステップがある (${what})。` +
+    `検証した Node のまま走る保証が無い。${advice}`;
+  // 第三者アクション・env: PATH: 向けの案内 (位置を変えれば直せる)
+  const MOVE_ADVICE =
+    "Node と無関係なステップ (actions/cache 等) なら、検証より前か、" +
+    "最後にリポジトリのコードを実行するステップより後ろへ移すこと";
+  // ローカル action 向けの案内 (前にも後ろにも出せないので、別の直し方を示す)
+  const LOCAL_ACTION_ADVICE =
+    "ローカル action の中身は読めないので、Node を使う処理はジョブ側の run: で行うこと";
+  // 正しい setup-node のステップ (何度も出てくるので 1 か所に置く)
+  const setupNodeStep = { uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } };
+
+  // **1 シナリオ = 1 ケースにする。** 以前は 1 つの it に約 30 の場面を hard な expect で
+  // 並べていたため、(a) 最初の 1 件で中断して以降の場面が一度も走らず、
+  // (b) 失敗表示が `MissingSetupNodeJob[]` の差分だけで**どの場面が壊れたか分からない**
+  // という状態だった。このファイルの他の判定 (isUnconditionalSetupNode / isNodeImage /
+  // triggersOnEveryPullRequest …) はすべて `$label` 付きの it.each なので、そろえる
+  it.each([
+    // --- 期待どおりの置き方 (誤検知を出さないこと) ---
+    { label: "期待どおりの並び", jobs: [jobOf({ steps: compliantSteps })], expected: [] },
+    {
+      label: "第三者アクションだけのジョブ",
+      jobs: [jobOf({ steps: [{ uses: "actions/labeler@v5" }] })],
+      expected: [],
+    },
+    {
+      // 呼ばれる側はこの走査に含まれないので、条件を付けるなと求める筋が無い
+      label: "第三者の再利用可能ワークフロー呼び出し",
+      jobs: [jobOf({ uses: "other-org/repo/.github/workflows/x.yml@v1" })],
+      expected: [],
+    },
+    {
+      // 置き方は呼ばれる側で見る
+      label: "条件の無いローカル再利用可能ワークフロー呼び出し",
+      jobs: [jobOf({ uses: "./.github/workflows/suite.yml" })],
+      expected: [],
+    },
+    {
+      // 明示的な false は「効かなくても進む書き方」ではない
+      label: "ジョブの continue-on-error: false",
+      jobs: [jobOf({ "continue-on-error": false, steps: compliantSteps })],
+      expected: [],
+    },
+    {
+      // そこに置かれた成果物のアップロード等は、もう誰の Node にも影響しない
+      label: "最後のリポジトリのコードより後ろの uses:",
+      jobs: [jobOf({ steps: [...compliantSteps, { uses: "actions/upload-artifact@v4" }] })],
+      expected: [],
+    },
+
+    // --- setup-node の有無と位置 ---
+    { label: "setup-node が無い", jobs: [jobOf({ steps: [{ run: "npm ci" }] })], expected: named("setup-node が無い") },
+    {
+      // `npm ci` はランナー既定の Node で走り、そこで入る node_modules は検証していない
+      // Node のもの。**件数だけでなく理由まで固定する** — 件数だけだと、どの判定が
+      // 拾ったのかが分からず「その形を名指しする」と読めるのに実際は別の理由で
+      // 落ちている、という食い違いに気付けない
+      label: "setup-node がリポジトリのコードより後ろ",
+      jobs: [jobOf({ steps: [{ run: "npm ci" }, { uses: "actions/setup-node@v7" }] })],
+      expected: named(`${RUNTIME_VERIFIER} を実行していない`),
+    },
+
+    // --- 実行時検証の有無・位置・書き方 ---
+    {
+      label: "実行時検証を置いていない",
+      jobs: [jobOf({ steps: [setupNodeStep, { run: "npm ci" }] })],
+      expected: named(`${RUNTIME_VERIFIER} を実行していない`),
+    },
+    {
+      // ランナー既定の Node を検証するだけの空振りになる
+      label: "実行時検証が setup-node より前",
+      jobs: [
+        jobOf({ steps: [{ run: "node scripts/verify-node-major.mjs" }, setupNodeStep, { run: "npm ci" }] }),
       ],
-    });
-    expect(collectJobsMissingSetupNode([setupBeforeButVerifierLate])).toEqual([
-      {
-        file: "synthetic.yml",
-        job: "job",
-        reason: `${RUNTIME_VERIFIER} がリポジトリのコードより後ろにある (先に走った検証の Node が分からない)`,
-      },
-    ]);
-    // setup-node が無い形も名指しする
-    const missing = jobOf({ steps: [{ run: "npm ci" }] });
-    expect(collectJobsMissingSetupNode([missing])).toHaveLength(1);
-    // 第三者アクションだけのジョブは対象外 (誤検知を出さない)
-    const actionsOnly = jobOf({ steps: [{ uses: "actions/labeler@v5" }] });
-    expect(collectJobsMissingSetupNode([actionsOnly])).toEqual([]);
-    // steps を持たないジョブ (第三者の再利用可能ワークフローの呼び出し) も対象外 —
-    // 呼ばれる側はこの走査に含まれないので、条件を付けるなと求める筋が無い
-    const reusable = jobOf({ uses: "other-org/repo/.github/workflows/x.yml@v1" });
-    expect(collectJobsMissingSetupNode([reusable])).toEqual([]);
-    // **ローカルの再利用可能ワークフローを gate 付きで呼ぶ形は名指しする。**
-    // 呼ばれる側のジョブは別に検査されるが、呼び出し側がスキップされると
-    // その全部が走らないまま CI は緑になる (`needs:` で塞いだのと同じ結末)
-    const gatedLocalCall = jobOf({
-      if: "${{ false }}",
-      uses: "./.github/workflows/suite.yml",
-    });
-    expect(collectJobsMissingSetupNode([gatedLocalCall])).toEqual([
-      {
-        file: "synthetic.yml",
-        job: "job",
-        reason: "ジョブに if: が付いている (スキップされても CI は緑になる)",
-      },
-    ]);
-    // 条件の無いローカル呼び出しは通す (置き方は呼ばれる側で見る)
-    expect(
-      collectJobsMissingSetupNode([jobOf({ uses: "./.github/workflows/suite.yml" })]),
-    ).toEqual([]);
-    // ジョブ単位の continue-on-error は、失敗しても CI が緑になるので名指しする
-    const jobContinues = jobOf({ "continue-on-error": true, steps: compliantSteps });
-    expect(collectJobsMissingSetupNode([jobContinues])).toHaveLength(1);
-    // 明示的な false は「効かなくても進む書き方」ではないので通す
-    const jobStops = jobOf({ "continue-on-error": false, steps: compliantSteps });
-    expect(collectJobsMissingSetupNode([jobStops])).toEqual([]);
-    // **ジョブ単位の if: も同じ結末**（スキップされてもワークフローは成功で報告される）
-    const jobConditional = jobOf({ if: "github.event_name == 'push'", steps: compliantSteps });
-    expect(collectJobsMissingSetupNode([jobConditional])).toHaveLength(1);
-    // 実行時検証を置いていないジョブも名指しする (宣言として見えない形を何も検証していない)
-    const noVerifier = jobOf({
-      steps: [
-        { uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } },
-        { run: "npm ci" },
+      expected: named(`${RUNTIME_VERIFIER} が setup-node より前にある (用意した Node を検証していない)`),
+    },
+    {
+      label: "実行時検証がリポジトリのコードより後ろ",
+      jobs: [
+        jobOf({
+          steps: [setupNodeStep, { run: "npm ci" }, { run: "node scripts/verify-node-major.mjs" }],
+        }),
       ],
-    });
-    expect(collectJobsMissingSetupNode([noVerifier])).toHaveLength(1);
-    // **実行時検証より後ろで Node を差し替えうる uses: は名指しする。**
-    // 検証はもう終わっているので実行時には見えず、ここで落とさないと
-    // lint / test / e2e が別の Node で走ったまま CI が緑になる (実測)
-    const swappedAfterVerifier = jobOf({
-      steps: [
-        { uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } },
-        { run: "node scripts/verify-node-major.mjs" },
-        { uses: "volta-cli/action@v4", with: { "node-version": "20" } },
-        { run: "npm ci && npm run test" },
+      expected: named(
+        `${RUNTIME_VERIFIER} がリポジトリのコードより後ろにある (先に走った検証の Node が分からない)`,
+      ),
+    },
+    {
+      // 逃げ道 (除外表) は持たないので、この形が要るジョブが現れたらこの検査自体を
+      // 直す差分になる — 除外表を置いていた頃は、その鍵が別の検査まで一緒に外していた
+      label: "検証より前に別の run: がある",
+      jobs: [
+        jobOf({
+          steps: [
+            setupNodeStep,
+            { run: "corepack enable" },
+            { run: "node scripts/verify-node-major.mjs" },
+            { run: "npm ci" },
+          ],
+        }),
       ],
-    });
-    expect(collectJobsMissingSetupNode([swappedAfterVerifier])).toEqual([
-      {
-        file: "synthetic.yml",
-        job: "job",
-        reason:
-          `${RUNTIME_VERIFIER} より後ろに Node を差し替えうるステップがある ` +
-          "(volta-cli/action@v4)。検証した Node のまま走る保証が無い。" +
-          "Node と無関係なステップ (actions/cache 等) なら、検証より前か、" +
-          "最後にリポジトリのコードを実行するステップより後ろへ移すこと",
-      },
-    ]);
-    // **最後のリポジトリのコードより後ろの uses: は通す (誤検知を出さない)。**
-    // そこに置かれた成果物のアップロード等は、もう誰の Node にも影響しない
-    const uploadAfterSuite = jobOf({
-      steps: [...compliantSteps, { uses: "actions/upload-artifact@v4" }],
-    });
-    expect(collectJobsMissingSetupNode([uploadAfterSuite])).toEqual([]);
-    // **検証より前に `run:` を置いた形**は「リポジトリのコードより後ろ」として名指しする。
-    // 逃げ道 (除外表) は持たないので、この形が要るジョブが現れたらこの検査自体を
-    // 直す差分になる — 除外表を置いていた頃は、その鍵が別の検査まで一緒に外していた
-    const setupBeforeVerifier = jobOf({
-      steps: [
-        { uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } },
-        { run: "corepack enable" },
-        { run: "node scripts/verify-node-major.mjs" },
-        { run: "npm ci" },
+      expected: named(
+        `${RUNTIME_VERIFIER} がリポジトリのコードより後ろにある (先に走った検証の Node が分からない)`,
+      ),
+    },
+    {
+      // パスに触れているだけの行は「実行している」と認めない
+      label: "run: がパスに触れているだけ",
+      jobs: [
+        jobOf({
+          steps: [
+            setupNodeStep,
+            { run: "echo 'skipping scripts/verify-node-major.mjs for now'" },
+            { run: "npm ci" },
+          ],
+        }),
       ],
-    });
-    expect(collectJobsMissingSetupNode([setupBeforeVerifier])).toEqual([
-      {
-        file: "synthetic.yml",
-        job: "job",
-        reason: `${RUNTIME_VERIFIER} がリポジトリのコードより後ろにある (先に走った検証の Node が分からない)`,
-      },
-    ]);
-    // **最後のリポジトリのコードがローカル action のときも、差し替えとして見る。**
-    // そのステップは「中身を読めない uses:」と「スイートの実行」を兼ねるので、
-    // 走査の終端を除いていたときは action.yml の中で Node を入れ替える形が
-    // 両方の網から見えなかった (実測で空配列)
-    const localActionRunsSuite = jobOf({
-      steps: [
-        { uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } },
-        { run: "node scripts/verify-node-major.mjs" },
-        { uses: "./.github/actions/run-suite" },
+      expected: named(`${RUNTIME_VERIFIER} を実行していない`),
+    },
+    {
+      // **並び順の要求はステップの粒度でしか効かない。** 同じ run: にまとめられると
+      // firstRepoCode === verifierIndex になり、順序の判定が一度も発火しないまま
+      // スイートが先に別の Node で走る (実測で全件緑)
+      label: "検証とスイートが同じ run: にまとめられている",
+      jobs: [
+        jobOf({
+          steps: [
+            setupNodeStep,
+            { run: "PATH=/opt/node20/bin:$PATH npm ci && npm run test\nnode scripts/verify-node-major.mjs" },
+          ],
+        }),
       ],
-    });
-    expect(collectJobsMissingSetupNode([localActionRunsSuite])).toEqual([
-      {
-        file: "synthetic.yml",
-        job: "job",
-        reason:
-          `${RUNTIME_VERIFIER} より後ろに Node を差し替えうるステップがある ` +
-          "(./.github/actions/run-suite)。検証した Node のまま走る保証が無い。" +
-          "ローカル action の中身は読めないので、Node を使う処理はジョブ側の run: で行うこと",
-      },
-    ]);
-    // **`needs:` の先から伝播してくるスキップも名指しする。** ゲートジョブが
-    // `if:` でスキップされると依存先も連鎖でスキップされ、それでもワークフローは
-    // 成功として報告される — 隣の「ジョブ単位の if:」と同じ結末に、別のキーで届く
-    // (実測で全件緑のまま通った)
-    const gate = { file: "synthetic.yml", name: "gate", definition: { if: "${{ false }}" } };
-    const gated = {
-      file: "synthetic.yml",
-      name: "suite",
-      definition: { needs: "gate", steps: compliantSteps },
-    };
-    expect(collectJobsMissingSetupNode([gate, gated])).toEqual([
-      {
-        file: "synthetic.yml",
-        job: "suite",
-        reason:
-          "needs: の先に if: 付きのジョブ (gate) がある (そのジョブがスキップされると、このジョブも走らないまま CI は緑になる)",
-      },
-    ]);
-    // 連鎖でもたどる (gate → mid → suite)
-    const mid = { file: "synthetic.yml", name: "mid", definition: { needs: ["gate"] } };
-    const chained = {
-      file: "synthetic.yml",
-      name: "suite",
-      definition: { needs: ["mid"], steps: compliantSteps },
-    };
-    expect(collectJobsMissingSetupNode([gate, mid, chained])).toHaveLength(1);
-    // 条件の無いジョブへの needs: は伝播しないので通す (誤検知を出さない)
-    const plain = { file: "synthetic.yml", name: "build", definition: { steps: compliantSteps } };
-    const dependsOnPlain = {
-      file: "synthetic.yml",
-      name: "suite",
-      definition: { needs: "build", steps: compliantSteps },
-    };
-    expect(collectJobsMissingSetupNode([plain, dependsOnPlain])).toEqual([]);
-    // 別のワークフローに同名のジョブがあっても取り違えない
-    const otherFileGate = { file: "other.yml", name: "gate", definition: { if: "${{ false }}" } };
-    expect(collectJobsMissingSetupNode([otherFileGate, dependsOnPlain, plain])).toEqual(
-      [],
-    );
-    // **ジョブ単位 / ワークフロー単位の `env: PATH:` も名指しする。** そのジョブの
-    // 全ステップに効くので、実行時検証のステップだけ step 単位で正しい PATH に
-    // 戻す 2 段構えにすると、両方の網が緑のままスイートが別の Node で走る (実測)
-    const jobPathEnv = jobOf({ env: { PATH: "/opt/node20/bin:/usr/bin" }, steps: compliantSteps });
-    expect(collectJobsMissingSetupNode([jobPathEnv])).toEqual([
-      {
-        file: "synthetic.yml",
-        job: "job",
-        reason: "ジョブ単位の env: で PATH を宣言している (そのジョブの全ステップの探索パスが変わる)",
-      },
-    ]);
-    // ワークフロー全体の env: も同じ扱い
-    const workflowPathEnv = {
-      file: "synthetic.yml",
-      name: "job",
-      definition: { steps: compliantSteps },
-      workflowEnv: { PATH: "/opt/node20/bin:/usr/bin" },
-    };
-    expect(collectJobsMissingSetupNode([workflowPathEnv])).toEqual([
-      {
-        file: "synthetic.yml",
-        job: "job",
-        reason:
-          "ワークフロー単位の env: で PATH を宣言している (そのジョブの全ステップの探索パスが変わる)",
-      },
-    ]);
-    // PATH 以外の env: は通す (誤検知を出さない)
-    expect(
-      collectJobsMissingSetupNode([jobOf({ env: { CI: "true" }, steps: compliantSteps })]),
-    ).toEqual([]);
-    // **ステップの `env: PATH:` も差し替えとして名指しする。** `uses:` と同じく
-    // 宣言として YAML に現れるので静的に読める — 読まないと、正しい setup-node と
-    // 検証を置いたうえで `env:` を添えるだけでスイートが別の Node で走り、
-    // 両方の網が緑のままになる (実測)
-    const pathEnvAfterVerifier = jobOf({
-      steps: [
-        { uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } },
-        { run: "node scripts/verify-node-major.mjs" },
-        { run: "npm ci && npm run test", env: { PATH: "/opt/node20/bin:/usr/bin:/bin" } },
+      expected: named(
+        `${RUNTIME_VERIFIER} が他の処理と同じ run: にまとめられている (先に走った処理の Node が分からない)`,
+      ),
+    },
+    {
+      // 空行とシェルのコメントは「走る行」ではないので、検証だけのステップとして通す
+      label: "検証の run: に空行とコメントだけが添えられている",
+      jobs: [
+        jobOf({
+          steps: [
+            setupNodeStep,
+            { run: "# .nvmrc と同じ major かを確かめる\n\nnode scripts/verify-node-major.mjs\n" },
+            { run: "npm ci" },
+          ],
+        }),
       ],
-    });
-    expect(collectJobsMissingSetupNode([pathEnvAfterVerifier])).toEqual([
-      {
-        file: "synthetic.yml",
-        job: "job",
-        reason:
-          `${RUNTIME_VERIFIER} より後ろに Node を差し替えうるステップがある ` +
-          "(env: PATH: の指定)。検証した Node のまま走る保証が無い。" +
-          "Node と無関係なステップ (actions/cache 等) なら、検証より前か、" +
-          "最後にリポジトリのコードを実行するステップより後ろへ移すこと",
-      },
-    ]);
-    // PATH 以外の env: は差し替えではないので通す (誤検知を出さない)
-    const otherEnv = jobOf({
-      steps: [
-        { uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } },
-        { run: "node scripts/verify-node-major.mjs" },
-        { run: "npm ci", env: { CI: "true" } },
+      expected: [],
+    },
+
+    // --- そもそも走らない形 ---
+    {
+      label: "ジョブに if: が付いている",
+      jobs: [jobOf({ if: "github.event_name == 'push'", steps: compliantSteps })],
+      expected: named("ジョブに if: が付いている (スキップされても CI は緑になる)"),
+    },
+    {
+      label: "ジョブに continue-on-error が付いている",
+      jobs: [jobOf({ "continue-on-error": true, steps: compliantSteps })],
+      expected: named("ジョブに continue-on-error が付いている (失敗しても CI は緑になる)"),
+    },
+    {
+      // 呼ばれる側のジョブは別に検査されるが、呼び出し側がスキップされると
+      // その全部が走らないまま CI は緑になる (`needs:` で塞いだのと同じ結末)
+      label: "gate 付きのローカル再利用可能ワークフロー呼び出し",
+      jobs: [jobOf({ if: "${{ false }}", uses: "./.github/workflows/suite.yml" })],
+      expected: named("ジョブに if: が付いている (スキップされても CI は緑になる)"),
+    },
+    {
+      // ゲートジョブがスキップされると依存先も連鎖でスキップされ、それでも
+      // ワークフローは成功として報告される (実測で全件緑のまま通った)
+      label: "needs: の先が if: 付き",
+      jobs: [
+        { file: "synthetic.yml", name: "gate", definition: { if: "${{ false }}" } },
+        { file: "synthetic.yml", name: "suite", definition: { needs: "gate", steps: compliantSteps } },
       ],
-    });
-    expect(collectJobsMissingSetupNode([otherEnv])).toEqual([]);
-    // **実行時検証のステップ自身の `env: PATH:` も名指しする。** 差し替えの走査は
-    // `verifierIndex + 1` から始まるので、ここを別に見ないと**検証ステップに付けた
-    // `env: PATH:` だけがどちらの網からも見えない**。上の「ジョブ / ワークフロー単位」と
-    // 向きが逆なだけの同じ 2 段構え: 検証の手前で PATH の先頭を Node 20 にし、
-    // 検証ステップにだけ正しい Node を指し直すと、検証は「26 です」と申告して通り、
-    // 続く npm ci / lint / test は Node 20 で走る (実測で全件緑)
-    const verifierPathEnv = jobOf({
-      steps: [
-        { uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } },
-        { uses: "volta-cli/action@v4", with: { "node-version": "20" } },
+      expected: named(
+        "needs: の先に if: 付きのジョブ (gate) がある (そのジョブがスキップされると、このジョブも走らないまま CI は緑になる)",
+        "suite",
+      ),
+    },
+    {
+      label: "needs: の連鎖でも伝播する (gate → mid → suite)",
+      jobs: [
+        { file: "synthetic.yml", name: "gate", definition: { if: "${{ false }}" } },
+        { file: "synthetic.yml", name: "mid", definition: { needs: ["gate"] } },
+        { file: "synthetic.yml", name: "suite", definition: { needs: ["mid"], steps: compliantSteps } },
+      ],
+      expected: named(
+        "needs: の先に if: 付きのジョブ (gate) がある (そのジョブがスキップされると、このジョブも走らないまま CI は緑になる)",
+        "suite",
+      ),
+    },
+    {
+      // 条件の無いジョブへの needs: は伝播しない (誤検知を出さない)
+      label: "needs: の先が条件なし",
+      jobs: [
+        { file: "synthetic.yml", name: "build", definition: { steps: compliantSteps } },
+        { file: "synthetic.yml", name: "suite", definition: { needs: "build", steps: compliantSteps } },
+      ],
+      expected: [],
+    },
+    {
+      // ジョブ名はワークフローごとに独立しているので取り違えない
+      label: "別のワークフローに同名の gate ジョブがある",
+      jobs: [
+        { file: "other.yml", name: "gate", definition: { if: "${{ false }}" } },
+        { file: "synthetic.yml", name: "build", definition: { steps: compliantSteps } },
+        { file: "synthetic.yml", name: "suite", definition: { needs: "build", steps: compliantSteps } },
+      ],
+      expected: [],
+    },
+
+    // --- env: PATH: の 4 つのスコープ ---
+    {
+      // そのジョブの全ステップに効くので、実行時検証のステップだけ step 単位で
+      // 正しい PATH に戻す 2 段構えにすると、両方の網が緑のまま別の Node で走る (実測)
+      label: "ジョブ単位の env: PATH:",
+      jobs: [jobOf({ env: { PATH: "/opt/node20/bin:/usr/bin" }, steps: compliantSteps })],
+      expected: named("ジョブ単位の env: で PATH を宣言している (そのジョブの全ステップの探索パスが変わる)"),
+    },
+    {
+      label: "ワークフロー単位の env: PATH:",
+      jobs: [
         {
-          run: "node scripts/verify-node-major.mjs",
-          env: { PATH: "/opt/hostedtoolcache/node/26.0.0/x64/bin:/usr/bin:/bin" },
+          file: "synthetic.yml",
+          name: "job",
+          definition: { steps: compliantSteps },
+          workflowEnv: { PATH: "/opt/node20/bin:/usr/bin" },
         },
-        { run: "npm ci && npm run test" },
       ],
-    });
-    expect(collectJobsMissingSetupNode([verifierPathEnv])).toEqual([
-      {
-        file: "synthetic.yml",
-        job: "job",
-        reason: `${RUNTIME_VERIFIER} のステップに env: で PATH が宣言されている (検証だけ別の Node を指せる)`,
-      },
-    ]);
-    // 検証ステップの PATH 以外の env: は通す (誤検知を出さない)
-    const verifierOtherEnv = jobOf({
-      steps: [
-        { uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } },
-        { run: "node scripts/verify-node-major.mjs", env: { CI: "true" } },
-        { run: "npm ci" },
+      expected: named(
+        "ワークフロー単位の env: で PATH を宣言している (そのジョブの全ステップの探索パスが変わる)",
+      ),
+    },
+    {
+      // コンテナの中で走る全ステップに効くので、ジョブ / ワークフロー単位だけを
+      // 塞いでも同じ 2 段構えがこのキー経由でそのまま通る
+      label: "コンテナ単位の env: PATH:",
+      jobs: [
+        jobOf({
+          container: { image: "node:26-alpine", env: { PATH: "/opt/node20/bin:/usr/bin" } },
+          steps: compliantSteps,
+        }),
       ],
-    });
-    expect(collectJobsMissingSetupNode([verifierOtherEnv])).toEqual([]);
-    // **`container:` の `env: PATH:` も同じ扱い。** コンテナの中で走る全ステップに
-    // 効くので、ジョブ / ワークフロー単位だけを塞いでも、同じ 2 段構えが
-    // このキー経由でそのまま通る (塞いだつもりの穴が別のキーで開いたままになる)
-    const containerPathEnv = jobOf({
-      container: { image: "node:26-alpine", env: { PATH: "/opt/node20/bin:/usr/bin" } },
-      steps: compliantSteps,
-    });
-    expect(collectJobsMissingSetupNode([containerPathEnv])).toEqual([
-      {
-        file: "synthetic.yml",
-        job: "job",
-        reason: "コンテナ単位の env: で PATH を宣言している (そのジョブの全ステップの探索パスが変わる)",
-      },
-    ]);
-    // `container:` を文字列で書いた形 (`container: node:26-alpine`) は env: を持ちようが
-    // 無いので通す。**正しい setup-node と併せた形は正当**なので、ここで落とすと
-    // 直しようの無い要求になる (一度実測して取り下げた形)
-    expect(
-      collectJobsMissingSetupNode([jobOf({ container: "node:26-alpine", steps: compliantSteps })]),
-    ).toEqual([]);
-    // コンテナの PATH 以外の env: も通す (誤検知を出さない)
-    expect(
-      collectJobsMissingSetupNode([
+      expected: named("コンテナ単位の env: で PATH を宣言している (そのジョブの全ステップの探索パスが変わる)"),
+    },
+    {
+      // **正しい setup-node と併せた形は正当**なので、ここで落とすと直しようの無い
+      // 要求になる (一度実測して取り下げた形)
+      label: "container: を文字列で書いた形",
+      jobs: [jobOf({ container: "node:26-alpine", steps: compliantSteps })],
+      expected: [],
+    },
+    {
+      label: "PATH 以外のジョブ env:",
+      jobs: [jobOf({ env: { CI: "true" }, steps: compliantSteps })],
+      expected: [],
+    },
+    {
+      label: "PATH 以外のコンテナ env:",
+      jobs: [
         jobOf({ container: { image: "node:26-alpine", env: { CI: "true" } }, steps: compliantSteps }),
-      ]),
-    ).toEqual([]);
-    // 実行時検証が setup-node より前だと、ランナー既定の Node を見る空振りになる
-    const verifierTooEarly = jobOf({
-      steps: [
-        { run: "node scripts/verify-node-major.mjs" },
-        { uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } },
-        { run: "npm ci" },
       ],
-    });
-    expect(collectJobsMissingSetupNode([verifierTooEarly])).toHaveLength(1);
-    // パスに触れているだけの run: は「実行している」と認めない
-    const mentionsOnly = jobOf({
-      steps: [
-        { uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } },
-        { run: "echo 'skipping scripts/verify-node-major.mjs for now'" },
-        { run: "npm ci" },
+      expected: [],
+    },
+    {
+      // 差し替えの走査は verifierIndex + 1 から始まるので、ここを別に見ないと
+      // **検証ステップに付けた env: PATH: だけがどちらの網からも見えない** (実測)
+      label: "実行時検証のステップ自身の env: PATH:",
+      jobs: [
+        jobOf({
+          steps: [
+            setupNodeStep,
+            { uses: "volta-cli/action@v4", with: { "node-version": "20" } },
+            {
+              run: "node scripts/verify-node-major.mjs",
+              env: { PATH: "/opt/hostedtoolcache/node/26.0.0/x64/bin:/usr/bin:/bin" },
+            },
+            { run: "npm ci && npm run test" },
+          ],
+        }),
       ],
-    });
-    expect(collectJobsMissingSetupNode([mentionsOnly])).toHaveLength(1);
+      expected: named(
+        `${RUNTIME_VERIFIER} のステップに env: で PATH が宣言されている (検証だけ別の Node を指せる)`,
+      ),
+    },
+    {
+      label: "検証ステップの PATH 以外の env:",
+      jobs: [
+        jobOf({ steps: [setupNodeStep, { run: "node scripts/verify-node-major.mjs", env: { CI: "true" } }, { run: "npm ci" }] }),
+      ],
+      expected: [],
+    },
+
+    // --- 実行時検証より後ろの差し替え ---
+    {
+      // 検証はもう終わっているので実行時には見えず、ここで落とさないと
+      // lint / test / e2e が別の Node で走ったまま CI が緑になる (実測)
+      label: "検証より後ろの uses:",
+      jobs: [
+        jobOf({
+          steps: [
+            setupNodeStep,
+            { run: "node scripts/verify-node-major.mjs" },
+            { uses: "volta-cli/action@v4", with: { "node-version": "20" } },
+            { run: "npm ci && npm run test" },
+          ],
+        }),
+      ],
+      expected: named(swapperReason("volta-cli/action@v4", MOVE_ADVICE)),
+    },
+    {
+      // `uses:` と同じく宣言として YAML に現れるので静的に読める
+      label: "検証より後ろのステップ env: PATH:",
+      jobs: [
+        jobOf({
+          steps: [
+            setupNodeStep,
+            { run: "node scripts/verify-node-major.mjs" },
+            { run: "npm ci && npm run test", env: { PATH: "/opt/node20/bin:/usr/bin:/bin" } },
+          ],
+        }),
+      ],
+      expected: named(swapperReason("env: PATH: の指定", MOVE_ADVICE)),
+    },
+    {
+      label: "検証より後ろのステップの PATH 以外の env:",
+      jobs: [
+        jobOf({
+          steps: [setupNodeStep, { run: "node scripts/verify-node-major.mjs" }, { run: "npm ci", env: { CI: "true" } }],
+        }),
+      ],
+      expected: [],
+    },
+    {
+      // そのステップは「中身を読めない uses:」と「スイートの実行」を兼ねるので、
+      // 走査の終端を除いていたときは action.yml の中で Node を入れ替える形が
+      // 両方の網から見えなかった (実測で空配列)
+      label: "最後のリポジトリのコードがローカル action",
+      jobs: [
+        jobOf({
+          steps: [
+            setupNodeStep,
+            { run: "node scripts/verify-node-major.mjs" },
+            { uses: "./.github/actions/run-suite" },
+          ],
+        }),
+      ],
+      expected: named(swapperReason("./.github/actions/run-suite", LOCAL_ACTION_ADVICE)),
+    },
+  ])("collectJobsMissingSetupNode: $label", ({ jobs, expected }) => {
+    // 合成したジョブを判定へ渡し、名指しする内容 (件数と理由の両方) を固定する
+    expect(collectJobsMissingSetupNode(jobs)).toEqual(expected);
   });
 
   it("collectImageOnlySteps が、docker:// のステップだけをイメージ名を問わず拾う", () => {
@@ -2285,6 +2372,23 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
     expect(collectImageOnlySteps([jobOf({ steps: [{ uses: "actions/checkout@v7" }] })])).toEqual([]);
     // 文言に使う場所の文字列は、YAML に現れるとおりで空白を挟まない
     expect(collectImageOnlySteps([dockerStep])[0]?.location).toBe("docker://ghcr.io/acme/ci-node:20");
+    // **前後に空白のある uses: も拾う。** `usesOf` が trim しないと、この 1 文字で
+    // 3 つの判定 (setup-node の照合 / docker:// の接頭辞 / ./ のローカル action) が
+    // 同時に外れ、そのジョブは firstRepoCode === -1 で丸ごと対象外になった (実測で全件緑)
+    const padded = jobOf({ steps: [{ uses: " docker://node:20 " }] });
+    expect(collectImageOnlySteps([padded])).toHaveLength(1);
+    // 空白を落とした綴りで名指しする (読み手がワークフローを grep できるように)
+    expect(collectImageOnlySteps([padded])[0]?.location).toBe("docker://node:20");
+  });
+
+  it("usesOf が前後の空白を落とし、3 つの判定が同時に外れるのを防ぐ", () => {
+    // 空白付きでも setup-node として認める (GitHub は解決するため)
+    expect(isUnconditionalSetupNode({ uses: " actions/setup-node@v7 " })).toBe(true);
+    // 空白付きのローカル action も「リポジトリのコードを実行するステップ」として数える
+    expect(runsRepositoryCode({ uses: " ./.github/actions/run-suite" })).toBe(true);
+    // uses: が無いステップは空文字列のまま (誤検知を出さない)
+    expect(runsRepositoryCode({ run: "npm ci" })).toBe(true);
+    expect(runsRepositoryCode({ uses: "actions/checkout@v7" })).toBe(false);
   });
 
   it.each([
@@ -2459,6 +2563,10 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
 //
 // 判定は**本物のスクリプトを別プロセスで起動して**行う。中身を読んで真似ると、
 // 「テストの中の写し」が緑になるだけでスクリプト本体の退行を拾えない。
+// 実行時検証スクリプトを起動するときの打ち切り時間。即座に終わる処理なので
+// 十分に長く、それでいて「返らなくなった」ことが CI を止めずに分かる長さにする
+const VERIFIER_TIMEOUT_MS = 30_000;
+
 describe("実行時検証スクリプトそのものの挙動", () => {
   // スクリプト本体の絶対パス (起動するのは常にこの**実物**)
   const verifierPath = resolve(REPO_ROOT, RUNTIME_VERIFIER);
@@ -2503,7 +2611,22 @@ describe("実行時検証スクリプトそのものの挙動", () => {
       const result = spawnSync(process.execPath, [join(sandbox, "scripts", "verify-node-major.mjs")], {
         // 出力を文字列として受け取る
         encoding: "utf8",
+        // **必ず時間で打ち切る。** このスクリプトは即座に終わる前提だが、`fail` の
+        // 書き込みループから抜ける条件を壊すと (`wrote <= 0` の break を消す等)
+        // 子プロセスが返らなくなり、spawnSync は**無期限に待つ**。そうなると
+        // `npm run test` ごと止まり、CI はジョブ側のタイムアウトに殺されて
+        // **どのテストが原因かも診断も残らない**。打ち切れば「名前の付いた失敗」になる
+        timeout: VERIFIER_TIMEOUT_MS,
       });
+      // 時間切れで殺された場合を、スクリプトの判定結果と取り違えない
+      // (`status` は null になるので、理由を添えないと「終了コードが 0 でない」と
+      //  読めてしまい、本当の原因であるぶら下がりが見えなくなる)
+      if (result.signal !== null) {
+        return {
+          status: result.status,
+          output: `スクリプトが ${VERIFIER_TIMEOUT_MS}ms 以内に終わらず ${result.signal} で打ち切られた`,
+        };
+      }
       // **起動そのものに失敗した場合を握り潰さない (§6)。** spawnSync は EAGAIN /
       // ENOMEM / EACCES のとき `{status: null, error, stdout: null}` を返すので、
       // そのまま返すと「出力が空のまま落ちた」= スクリプトの不具合という
