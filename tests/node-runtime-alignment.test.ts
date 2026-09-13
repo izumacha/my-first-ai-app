@@ -350,6 +350,11 @@ interface WorkflowJob {
   // いちばん外側で、しかも他の 3 つと違って**ジョブ定義には現れない**。
   // 合成したジョブを渡すテストのために省略可
   workflowTriggers?: unknown;
+  // ワークフロー全体の `defaults:` (トップレベル)。`defaults.run.shell` は
+  // そのワークフローの全 `run:` ステップの**実行シェルそのもの**を差し替えるので、
+  // `env: PATH:` と同じく「宣言として YAML に現れる差し替え」になる。
+  // 合成したジョブを渡すテストのために省略可
+  workflowDefaults?: unknown;
 }
 
 /**
@@ -419,6 +424,8 @@ function jobsOfWorkflow(
   // 「`on:` が無い」と読まれる**のは避けたい。下の判定は fail-closed なので、
   // 取りこぼすと正当なワークフローが赤くなる = 見逃す側には倒れない)
   const workflowTriggers = asRecord(value).on ?? asRecord(value).true;
+  // **ワークフロー全体の `defaults:`** も運ぶ (defaults.run.shell の差し替えを見るため)
+  const workflowDefaults = asRecord(value).defaults;
   // **`jobs` が対応表になっていることまで確かめる。**
   // `readParsed` が見るのはトップレベルだけなので、`jobs: "extra"` のような形は
   // 例外にならず `asRecord` が `{}` に潰す = そのワークフローが黙って検査から外れる
@@ -446,7 +453,7 @@ function jobsOfWorkflow(
       continue;
     }
     // 読めたジョブを、どのワークフローの何という名前か・全体の env と一緒に控える
-    jobs.push({ file, name, definition, workflowEnv, workflowTriggers });
+    jobs.push({ file, name, definition, workflowEnv, workflowTriggers, workflowDefaults });
   }
   // 取り出せたジョブと、読めなかった箇所を返す
   return { jobs, problems };
@@ -600,6 +607,48 @@ function declaresPathEnv(step: Record<string, unknown>): boolean {
 }
 
 /**
+ * GitHub が**名前で解決する**シェルの一覧 (これ以外は独自のコマンドテンプレート)。
+ *
+ * 名前で指定する形 (`shell: bash`) はごく普通の書き方で、Node の探索パスを
+ * 変えないので落としてはいけない (落とすと直しようの無い要求になる)。
+ * 一方、独自のテンプレート (`shell: env PATH=/opt/node20/bin:$PATH bash -e {0}`) は
+ * **そのステップを別のインタプリタ・別の探索パスで走らせる**ので、
+ * `env: PATH:` とまったく同じ「宣言として YAML に現れる差し替え」になる。
+ */
+const NAMED_SHELLS = new Set(["bash", "pwsh", "python", "sh", "cmd", "powershell"]);
+
+/**
+ * そのステップが**独自のシェル (コマンドテンプレート)** を指定しているか。
+ *
+ * **`uses:` / `env: PATH:` と同じ class の差し替えなのに、以前は見ていなかった。**
+ * 実測で、正しい setup-node と実行時検証の後ろに
+ * `{ run: "npm ci && npm run test", shell: "env PATH=/opt/node20/bin:/usr/bin bash -e {0}" }`
+ * を置くと**どの検査も何も言わず**、検証は既定のシェルで走って「26 です」と申告する
+ * 一方でスイートは Node 20 で走った。
+ */
+function declaresCustomShell(step: Record<string, unknown>): boolean {
+  // shell: が文字列でなければ、宣言として読める差し替えは無い
+  if (typeof step.shell !== "string") return false;
+  // 名前で解決する形 (bash など) は普通の書き方なので落とさない
+  return !NAMED_SHELLS.has(step.shell.trim().toLowerCase());
+}
+
+/**
+ * ジョブ / ワークフロー単位の `defaults.run.shell` が独自のシェルを宣言しているか。
+ *
+ * **ステップ単位のものより広く効く。** その範囲の全 `run:` ステップに掛かるので、
+ * 広い側で独自シェル (Node 20 を先頭に置く) を宣言し、実行時検証のステップだけ
+ * `shell: bash` で戻す 2 段構えにすると、`env: PATH:` のときとまったく同じ形で
+ * 両方の網が緑のまま別の Node でスイートが走る (実測)。
+ */
+function declaresCustomDefaultShell(holder: Record<string, unknown>): boolean {
+  // defaults.run が対応表として読めなければ、宣言として読める shell: は無い
+  const run = asRecord(asRecord(holder.defaults).run);
+  // ステップ単位と同じ規則で判定する (書き写さない)
+  return declaresCustomShell(run);
+}
+
+/**
  * 差し替えうるステップを、失敗文言に出す 1 つの語句にする。
  *
  * `uses:` ならその参照を、`env: PATH:` ならその旨を出す (どちらを直せばよいか分かるように)。
@@ -607,8 +656,11 @@ function declaresPathEnv(step: Record<string, unknown>): boolean {
 function describeSwapper(step: Record<string, unknown>): string {
   // uses: があるならそれを見せる (ワークフローを grep して見つけられる綴りのまま)
   const uses = usesOf(step);
-  // 無ければ env: PATH: の指定であることを伝える
-  return uses !== "" ? uses : "env: PATH: の指定";
+  if (uses !== "") return uses;
+  // 独自のシェルなら、その旨を伝える (直す先が env: とは別のキーなので分ける)
+  if (declaresCustomShell(step)) return "独自の shell: の指定";
+  // 残るは env: PATH: の指定
+  return "env: PATH: の指定";
 }
 
 /** そのステップが `actions/setup-node` を呼んでいるか。 */
@@ -1112,6 +1164,19 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
         `${scopedPathEnv.join(" / ")}単位の env: で PATH を宣言している (そのジョブの全ステップの探索パスが変わる)`,
       );
     }
+    // **ステップより広い `defaults.run.shell` も同じ扱い。** その範囲の全 `run:` の
+    // 実行シェルそのものを差し替えるので、広い側で Node 20 を先頭に置く独自シェルを
+    // 宣言し、実行時検証のステップだけ `shell: bash` で戻す 2 段構えにすると、
+    // `env: PATH:` のときとまったく同じ形で両方の網が緑のままになる (実測)。
+    // `container:` には `defaults:` が無いので、ここは 2 つのスコープだけを見る
+    const scopedShell = ["ジョブ", "ワークフロー"].filter((_, index) =>
+      declaresCustomDefaultShell(index === 0 ? job.definition : { defaults: job.workflowDefaults }),
+    );
+    if (scopedShell.length > 0) {
+      reasons.push(
+        `${scopedShell.join(" / ")}単位の defaults: で独自の shell: を宣言している (そのジョブの全 run: の実行シェルが変わる)`,
+      );
+    }
     // 必ず効く setup-node の位置 (if: / continue-on-error 付きは数えない)
     const setupIndex = steps.findIndex(isUnconditionalSetupNode);
     // 無条件の setup-node が 1 つも無い場合は、条件付きの有無で文言を分ける
@@ -1139,33 +1204,34 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
           : `${RUNTIME_VERIFIER} を実行していない`,
       );
     }
-    // **ここまでの指摘は独立しているので、あればまとめて返す。**
-    // 以降の判定は setup-node と実行時検証の**位置**を見るので、どちらかが
-    // 見つかっていない状態では成り立たない (比べる土台が無い)
-    if (reasons.length > 0) {
+    // **位置の判定は、setup-node と実行時検証が両方見つかっているときだけ成り立つ**
+    // (比べる土台が無い)。見つかっていなければ、ここまでの独立した指摘を返して終える
+    if (setupIndex === -1 || verifierIndex === -1) {
       return [{ file: job.file, job: job.name, reason: reasons.join(" / ") }];
     }
+    // 位置の指摘を、**ここまでに溜めた独立した指摘と一緒に**返すための小さなヘルパー。
+    // 位置の指摘だけを単独で返していたときは、`env: PATH:` の宣言が
+    // 「検証より後ろの差し替え」を伏せてしまい、直して push するまで次の 1 件が
+    // 表に出なかった (独立した指摘をまとめた理由と同じ事情が、1 段下に残っていた)。
+    // **位置の指摘どうしはまとめない** — 「検証が setup-node より前」はその帰結として
+    // 「検証より後ろに差し替えうるステップがある」も成り立ち、束ねると原因ではない
+    // 派生の指摘が混ざって直す先が分かりにくくなる
+    const withReasons = (reason: string) => [
+      { file: job.file, job: job.name, reason: [...reasons, reason].join(" / ") },
+    ];
     // **検証は、それだけのステップに置く。** スイートと同じ `run:` にまとめられると
     // 並び順の要求 (下の 2 つ) がステップの粒度でしか効かず、一度も発火しないまま
     // スイートが先に別の Node で走る (実測。理由は isVerifierOnlyStep の docstring)
     if (!isVerifierOnlyStep(steps[verifierIndex])) {
-      return [
-        {
-          file: job.file,
-          job: job.name,
-          reason: `${RUNTIME_VERIFIER} が他の処理と同じ run: にまとめられている (先に走った処理の Node が分からない)`,
-        },
-      ];
+      return withReasons(
+        `${RUNTIME_VERIFIER} が他の処理と同じ run: にまとめられている (先に走った処理の Node が分からない)`,
+      );
     }
     // setup-node より前だと、用意した Node ではなくランナー既定の Node を見てしまう
     if (verifierIndex < setupIndex) {
-      return [
-        {
-          file: job.file,
-          job: job.name,
-          reason: `${RUNTIME_VERIFIER} が setup-node より前にある (用意した Node を検証していない)`,
-        },
-      ];
+      return withReasons(
+        `${RUNTIME_VERIFIER} が setup-node より前にある (用意した Node を検証していない)`,
+      );
     }
     // **リポジトリのコードより後ろでもいけない。** 先にスイートを走らせてから検証すると、
     // 検証は「そのステップの Node」を見るだけで、既に走り終えた検証 (lint / test / e2e) が
@@ -1173,13 +1239,9 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
     // 挟む形が、後置だと素通りした (実測)。検証自身も `run:` なので、期待どおりの
     // 並びでは検証が「最初のリポジトリのコード」になる
     if (verifierIndex > firstRepoCode) {
-      return [
-        {
-          file: job.file,
-          job: job.name,
-          reason: `${RUNTIME_VERIFIER} がリポジトリのコードより後ろにある (先に走った検証の Node が分からない)`,
-        },
-      ];
+      return withReasons(
+        `${RUNTIME_VERIFIER} がリポジトリのコードより後ろにある (先に走った検証の Node が分からない)`,
+      );
     }
     // **実行時検証のステップ自身の `env: PATH:` を落とす。** 下の「検証より後ろ」の走査は
     // `verifierIndex + 1` から始まるので、**検証ステップに付けた `env: PATH:` だけが
@@ -1192,13 +1254,17 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
     // 引き受けている最後の砦なので、**その砦自身の探索パスを別に向ける宣言**は
     // 値に関わらず落とす (直し方は「検証ステップに PATH を宣言しない」)
     if (declaresPathEnv(steps[verifierIndex])) {
-      return [
-        {
-          file: job.file,
-          job: job.name,
-          reason: `${RUNTIME_VERIFIER} のステップに env: で PATH が宣言されている (検証だけ別の Node を指せる)`,
-        },
-      ];
+      return withReasons(
+        `${RUNTIME_VERIFIER} のステップに env: で PATH が宣言されている (検証だけ別の Node を指せる)`,
+      );
+    }
+    // **独自の shell: も同じ口。** 広い側 (`defaults.run.shell`) で Node 20 を
+    // 先頭に置き、検証ステップだけ `shell:` で戻すと、`env: PATH:` とまったく
+    // 同じ 2 段構えになる (直す先がキーごとに違うので、文言を分ける)
+    if (declaresCustomShell(steps[verifierIndex])) {
+      return withReasons(
+        `${RUNTIME_VERIFIER} のステップに独自の shell: が指定されている (検証だけ別の Node を指せる)`,
+      );
     }
     // **「setup-node がリポジトリのコードより後ろ」を別途見る必要は無い。**
     // ここまでの判定で `setupIndex <= verifierIndex <= firstRepoCode` が確定しており、
@@ -1223,7 +1289,7 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
     // **`run:` による差し替え (`echo ... >> $GITHUB_PATH`) はここでも見えない** —
     // 中身を解釈しない限り区別できず、冒頭コメントに「残る境界」として書いてある。
     // 最後にリポジトリのコードを実行するステップの位置 (それより後ろは影響しない)
-    const lastRepoCode = steps.map(runsRepositoryCode).lastIndexOf(true);
+    const lastRepoCode = steps.findLastIndex(runsRepositoryCode);
     // 検証より後ろ・最後のリポジトリのコードまでにある uses: のステップを集める。
     // **終端を含める (`+ 1`)。** 最後のリポジトリのコードが `run:` なら `usesOf` が
     // 空文字列なので下の絞り込みで落ち、含めても何も変わらない。一方それが
@@ -1242,15 +1308,11 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
     // そちらは冒頭コメントに「残る境界」として書いてある。
     const swappers = steps
       .slice(verifierIndex + 1, lastRepoCode + 1)
-      .filter((step) => usesOf(step) !== "" || declaresPathEnv(step));
+      .filter((step) => usesOf(step) !== "" || declaresPathEnv(step) || declaresCustomShell(step));
     // 1 つでもあれば、検証済みの Node で残りが走る保証が無い
     if (swappers.length > 0) {
-      return [
-        {
-          file: job.file,
-          job: job.name,
-          reason:
-            `${RUNTIME_VERIFIER} より後ろに Node を差し替えうるステップがある ` +
+      return withReasons(
+        `${RUNTIME_VERIFIER} より後ろに Node を差し替えうるステップがある ` +
             `(${swappers.map(describeSwapper).join(" / ")})。検証した Node のまま走る保証が無い。` +
             // **直し方は 2 通りあり、ローカル action だけ別**。第三者アクションや
             // `env: PATH:` は位置を変えれば済むが、`uses: ./...` は**それ自身が
@@ -1262,11 +1324,13 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
               ? "ローカル action の中身は読めないので、Node を使う処理はジョブ側の run: で行うこと"
               : "Node と無関係なステップ (actions/cache 等) なら、検証より前か、" +
                 "最後にリポジトリのコードを実行するステップより後ろへ移すこと"),
-        },
-      ];
+      );
     }
-    // ここまでのどの判定にも掛からなければ、置き方は満たされている
-    return [];
+    // 位置の判定にはどれも掛からなかった。独立した指摘が残っていればそれを返す
+    // (何も無ければ空 = 置き方は満たされている)
+    return reasons.length > 0
+      ? [{ file: job.file, job: job.name, reason: reasons.join(" / ") }]
+      : [];
   });
 }
 
@@ -1296,8 +1360,13 @@ function collectImageOnlySteps(jobs: readonly WorkflowJob[]): ImageStepUse[] {
     for (const step of stepRecordsOf(job) ?? []) {
       // uses を文字列として取り出す
       const uses = usesOf(step);
-      // docker:// で始まらないステップはイメージを直接走らせていない
-      if (!uses.startsWith(DOCKER_USES_PREFIX)) continue;
+      // docker:// で始まらないステップはイメージを直接走らせていない。
+      // **綴りの大文字小文字は無視する** — URI のスキームは大文字小文字を区別せず、
+      // `DOCKER://node:20` は実際に動くのに、区別すると**この検査からも
+      // setup-node の検査からも同時に外れる** (`run:` でも `./` でもないので
+      // `firstRepoCode === -1` になり、ジョブごと素通りする＝実測で完全に無言)。
+      // `SETUP_NODE_USES` に `i` を付けているのとまったく同じ理由
+      if (!uses.toLowerCase().startsWith(DOCKER_USES_PREFIX)) continue;
       // どのワークフローのどのジョブが、どこでイメージを走らせているかを控える
       // (イメージ名は `location` にそのまま含まれるので、別フィールドは持たない —
       //  持つと文言を組み立て直す人が空白を挟む形へ戻しかねない)
@@ -1940,14 +2009,27 @@ describe("実行する Node の major を宣言しているすべての場所の
 //  同じ形)。そこで合成したジョブ・ステップを直接渡し、**落とす側と通す側の両方**を固定する。
 describe("CI の配線を見る検出網そのものの挙動", () => {
   // 合成した中身から、判定に渡せるジョブを組み立てる小さなヘルパー
-  const jobOf = (definition: Record<string, unknown>): WorkflowJob => ({
-    // 失敗文言に出るファイル名 (実在しなくてよい。判定は値だけを見る)
-    file: "synthetic.yml",
-    // ジョブ名
-    name: "job",
-    // 判定対象の中身
-    definition,
-  });
+  const jobOf = (definition: Record<string, unknown>): WorkflowJob => {
+    // **実際の走査が弾く形のまま判定へ入れない。** 本番では jobsOfWorkflow が
+    // `describeStepsProblem` で `steps: null` / `steps: "npm ci"` のような形を
+    // 「読めないワークフロー」として先に落とすが、この表は判定関数を直接呼ぶので
+    // その門番を通らない。素通りさせると、合成ケースが `expected: []` と書かれて
+    // **「検出網はこの形を正しく通した」と記録される**一方、実際には
+    // 「steps を持たないジョブ」と誤読されて一度も見られていない、という
+    // 食い違いになる (§11 境界値。門番の有無で表の意味が変わってしまう)
+    const problem = describeStepsProblem(definition.steps);
+    // 読めない形なら、その場で落として合成ケースの誤りとして知らせる
+    if (problem !== null) throw new Error(`合成ジョブの ${problem}`);
+    // 判定に渡せる形として組み立てる
+    return {
+      // 失敗文言に出るファイル名 (実在しなくてよい。判定は値だけを見る)
+      file: "synthetic.yml",
+      // ジョブ名
+      name: "job",
+      // 判定対象の中身
+      definition,
+    };
+  };
 
   it.each([
     // 素の setup-node は「必ず効く」
@@ -2343,6 +2425,105 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
       ),
     },
     {
+      // **`shell:` も `env: PATH:` と同じ class の差し替え。** ステップを別の
+      // インタプリタ・別の探索パスで走らせるので、読まないと検証は既定のシェルで
+      // 「26 です」と申告する一方、スイートだけ Node 20 で走る (実測で完全に無言)
+      label: "検証より後ろのステップの独自 shell:",
+      jobs: [
+        jobOf({
+          steps: [
+            setupNodeStep,
+            { run: "node scripts/verify-node-major.mjs" },
+            { run: "npm ci && npm run test", shell: "env PATH=/opt/node20/bin:/usr/bin bash -e {0}" },
+          ],
+        }),
+      ],
+      expected: named(swapperReason("独自の shell: の指定", MOVE_ADVICE)),
+    },
+    {
+      // 名前で解決する形 (`shell: bash`) はごく普通の書き方で探索パスを変えない。
+      // 落とすと直しようの無い要求になるので通す (誤検知を出さない)
+      label: "検証より後ろのステップの shell: bash",
+      jobs: [
+        jobOf({
+          steps: [
+            setupNodeStep,
+            { run: "node scripts/verify-node-major.mjs" },
+            { run: "npm ci", shell: "bash" },
+          ],
+        }),
+      ],
+      expected: [],
+    },
+    {
+      label: "実行時検証のステップ自身の独自 shell:",
+      jobs: [
+        jobOf({
+          steps: [
+            setupNodeStep,
+            { run: "node scripts/verify-node-major.mjs", shell: "env PATH=/opt/node26/bin:$PATH bash -e {0}" },
+            { run: "npm ci" },
+          ],
+        }),
+      ],
+      expected: named(
+        `${RUNTIME_VERIFIER} のステップに独自の shell: が指定されている (検証だけ別の Node を指せる)`,
+      ),
+    },
+    {
+      // ジョブ単位の defaults: は、そのジョブの全 run: の実行シェルを差し替える
+      label: "ジョブ単位の defaults.run.shell",
+      jobs: [
+        jobOf({
+          defaults: { run: { shell: "env PATH=/opt/node20/bin:$PATH bash -e {0}" } },
+          steps: compliantSteps,
+        }),
+      ],
+      expected: named(
+        "ジョブ単位の defaults: で独自の shell: を宣言している (そのジョブの全 run: の実行シェルが変わる)",
+      ),
+    },
+    {
+      label: "ワークフロー単位の defaults.run.shell",
+      jobs: [
+        {
+          file: "synthetic.yml",
+          name: "job",
+          definition: { steps: compliantSteps },
+          workflowDefaults: { run: { shell: "env PATH=/opt/node20/bin:$PATH bash -e {0}" } },
+        },
+      ],
+      expected: named(
+        "ワークフロー単位の defaults: で独自の shell: を宣言している (そのジョブの全 run: の実行シェルが変わる)",
+      ),
+    },
+    {
+      // 名前で解決する形の defaults: は普通の書き方なので通す (誤検知を出さない)
+      label: "defaults.run.shell が bash",
+      jobs: [jobOf({ defaults: { run: { shell: "bash" } }, steps: compliantSteps })],
+      expected: [],
+    },
+    {
+      // **独立した指摘と位置の指摘を一緒に出す。** 片方が片方を伏せていたときは、
+      // `env: PATH:` を消して push するまで volta のステップが表に出なかった (実測)
+      label: "ジョブ env: PATH: と検証より後ろの差し替えが同時に成り立つ",
+      jobs: [
+        jobOf({
+          env: { PATH: "/opt/node20/bin:/usr/bin" },
+          steps: [
+            setupNodeStep,
+            { run: "node scripts/verify-node-major.mjs" },
+            { uses: "volta-cli/action@v4", with: { "node-version": "20" } },
+            { run: "npm ci" },
+          ],
+        }),
+      ],
+      expected: named(
+        "ジョブ単位の env: で PATH を宣言している (そのジョブの全ステップの探索パスが変わる) / " +
+          swapperReason("volta-cli/action@v4", MOVE_ADVICE),
+      ),
+    },
+    {
       label: "検証ステップの PATH 以外の env:",
       jobs: [
         jobOf({ steps: [setupNodeStep, { run: "node scripts/verify-node-major.mjs", env: { CI: "true" } }, { run: "npm ci" }] }),
@@ -2433,6 +2614,24 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
     expect(collectImageOnlySteps([padded])).toHaveLength(1);
     // 空白を落とした綴りで名指しする (読み手がワークフローを grep できるように)
     expect(collectImageOnlySteps([padded])[0]?.location).toBe("docker://node:20");
+    // **綴りの大文字小文字も無視する。** URI のスキームは大文字小文字を区別せず、
+    // `DOCKER://node:20` は実際に動くのに、区別するとこの検査からも setup-node の
+    // 検査からも同時に外れ、ジョブごと完全に無言で素通りした (実測)
+    const upper = jobOf({ steps: [{ uses: "DOCKER://node:20" }] });
+    expect(collectImageOnlySteps([upper])).toHaveLength(1);
+    expect(collectJobsMissingSetupNode([upper])).toEqual([]);
+  });
+
+  it("合成ジョブのヘルパーが、実際の走査なら弾かれる steps を通さない", () => {
+    // **表の意味を守るための門番。** 本番では jobsOfWorkflow が先に落とす形を
+    // 素通りさせると、合成ケースが `expected: []` と書かれて「検出網はこの形を
+    // 正しく通した」と記録される一方、実際には「steps を持たないジョブ」と
+    // 誤読されて一度も見られていない、という食い違いになる
+    expect(() => jobOf({ steps: null })).toThrow(/合成ジョブの/);
+    expect(() => jobOf({ steps: "npm ci" })).toThrow(/合成ジョブの/);
+    expect(() => jobOf({ steps: ["npm ci"] })).toThrow(/合成ジョブの/);
+    // steps を持たないジョブ (再利用可能ワークフローの呼び出し) は正当なので通す
+    expect(() => jobOf({ uses: "./.github/workflows/suite.yml" })).not.toThrow();
   });
 
   it("usesOf が前後の空白を落とし、3 つの判定が同時に外れるのを防ぐ", () => {
