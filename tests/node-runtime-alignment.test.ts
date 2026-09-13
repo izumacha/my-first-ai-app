@@ -190,10 +190,28 @@ const NVMRC_PATH = resolve(REPO_ROOT, ".nvmrc");
 // **どのジョブからも呼ばれなくなったら、静的な網だけが残って性質の担保が消える**ので、
 // 少なくとも 1 つのワークフローが走らせていることを下の検査で固定する
 const RUNTIME_VERIFIER = "scripts/verify-node-major.mjs";
+
+/**
+ * 文字列を、正規表現の中で**そのままの綴りとして**扱えるようにエスケープする。
+ *
+ * **メタ文字をすべて逃がすこと。** `.` だけを逃がしていたときは、スクリプトのパスを
+ * `verify-node-major+runtime.mjs` のような名前へ変えるだけで `+` が量指定子として
+ * 解釈されて照合が外れ、**全ジョブが「検証を実行していない」と誤報告**される。
+ * `(` や `[` を含む名前なら `new RegExp` が読み込み時に投げ、このファイルごと
+ * 収集エラーになる。どちらも「定数を 1 つ書き換えただけ」で起きる。
+ *
+ * **現在の定数では `.` だけのエスケープと区別が付かない**ので、規則そのものを
+ * ここへ出してテーブル駆動で固定する (定数から組み立てた正規表現を試すだけでは、
+ * エスケープを狭める変異が全件緑で通る = 実測)。
+ */
+function escapeForRegExp(text: string): string {
+  // 正規表現のメタ文字の前に `\` を付ける
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 // 上のスクリプトを**実際に起動している** `run:` の 1 行。パスを含むだけの行
 // (`echo 'skipping scripts/verify-node-major.mjs'`) と区別するために形で照合する。
 // 組み立ては 1 度だけ (`SETUP_NODE_USES` と同じく module スコープの定数にそろえる)
-const RUNTIME_VERIFIER_LINE = new RegExp(`^node\\s+${RUNTIME_VERIFIER.replace(/[.]/g, "\\.")}$`);
+const RUNTIME_VERIFIER_LINE = new RegExp(`^node\\s+${escapeForRegExp(RUNTIME_VERIFIER)}$`);
 // ワークフローは**ファイル名を書き並べず、置き場ごと**見る。
 // 特定の 1 本 (ci.yml) だけを対象にすると、Node を用意する別のワークフローを足した瞬間に
 // その 1 本だけが黙って検査から外れる (痕跡はテスト件数すら変わらない)
@@ -220,6 +238,10 @@ interface PinnedSource {
   label: string;
   // 読み取れた major (読めなければ null)
   major: number | null;
+  // ファイルそのものを読めなかったときの原因 (読めたなら null)。
+  // **書式の問題と読み取りの事故を取り違えないために持つ** — 原因が無いと
+  // 「書式を直せ」という案内だけが出て、正しい書式のファイルを指すことになる
+  readError: string | null;
 }
 
 /** 直接依存 1 つ分の「サポートする Node の範囲」。 */
@@ -237,12 +259,35 @@ interface DependencyEngine {
  * (describe のトップレベルで例外を投げると、丁寧に書いた失敗文言が 1 つも出ない)。
  */
 function readTextOrNull(path: string): string | null {
+  // 原因の運搬は共有の読み手に任せ、中身だけを返す (呼び出し側は存在確認で落とす)
+  return readTextOrError(path).text;
+}
+
+/** テキストファイルを読んだ結果 (読めた中身と、読めなかったときの原因)。 */
+interface TextReadResult {
+  // 読めた中身 (読めなければ null)
+  text: string | null;
+  // 読めなかった原因 (読めたなら null)
+  error: string | null;
+}
+
+/**
+ * テキストファイルを読み、**例外を投げずに** 中身か原因のどちらかを返す。
+ *
+ * **原因 (errno) を握り潰さない (§6)。** 素の `catch { return null }` にすると、
+ * `.nvmrc` が権限や壊れたシンボリックリンクで読めない場合でも呼び出し側には
+ * 「major が読めない」としか伝わらず、失敗文言は**書式を直せ**と案内する —
+ * 正しい書式のファイルに対する誤った案内になる。同じ差分で足した
+ * `listWorkflowFiles` / `readParsed` が原因を持ち帰るのと扱いをそろえる
+ * (絶対パスは `describeReadError` が畳むので、CI と手元で文言がそろう)。
+ */
+function readTextOrError(path: string): TextReadResult {
   try {
     // UTF-8 のテキストとして読み込む
-    return readFileSync(path, "utf8");
-  } catch {
-    // 存在しない・読めない場合は null を返し、呼び出し側の存在確認で落とす
-    return null;
+    return { text: readFileSync(path, "utf8"), error: null };
+  } catch (error) {
+    // 読めなかった原因を、実行機の絶対パスを畳んだうえで運ぶ
+    return { text: null, error: describeReadError(error, REPO_ROOT) };
   }
 }
 
@@ -1789,8 +1834,12 @@ function parseReadmeNodeMajor(text: string): number | null {
 function collectPinnedSources(): PinnedSource[] {
   // 2 つの出どころをラベル付きで並べて返す
   return [
-    { label: ".nvmrc", major: readNvmrcMajor() },
-    { label: "Dockerfile (FROM node:<major>)", major: readDockerfileNodeMajor() },
+    { label: ".nvmrc", major: readNvmrcMajor(), readError: readTextOrError(NVMRC_PATH).error },
+    {
+      label: "Dockerfile (FROM node:<major>)",
+      major: readDockerfileNodeMajor(),
+      readError: readTextOrError(DOCKERFILE_PATH).error,
+    },
   ];
 }
 
@@ -2073,7 +2122,13 @@ describe("実行する Node の major を宣言しているすべての場所の
       .map((source) => source.label);
     expect(
       unreadable,
-      `実行する Node の major を読み取れない出どころがある: ${unreadable.join(", ")}。` +
+      `実行する Node の major を読み取れない出どころがある: ${pinnedSources
+        .filter((source) => source.major === null)
+        // **ファイルを読めなかった場合は原因 (errno) を添える** — 添えないと
+        // 権限やシンボリックリンクの事故が「書式を直せ」という案内になり、
+        // 正しい書式のファイルを指すことになる (§6 握り潰さない)
+        .map((source) => (source.readError === null ? source.label : `${source.label} (${source.readError})`))
+        .join(", ")}。` +
         "このテストは 2 か所の一致を前提にしているので、書式を変えた (多段ビルドで別 major を足した等) なら読み取りも合わせて直すこと。",
     ).toEqual([]);
     // 読み取れた major が全て同じであることを確かめる
@@ -3269,6 +3324,55 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
     // 実際の README は常に 1 件なので、**規則そのものは合成した本文でしか固定できない**
     // (「1 件のときだけ」を「1 件以上」へ緩める変異が全件緑で通っていた＝実測)
     expect(parseReadmeNodeMajor(text)).toBe(expected);
+  });
+
+  it("readTextOrError が、読めなかった原因を握り潰さずに運ぶ", () => {
+    // 実在するファイルは中身を返し、原因は持たない
+    const ok = readTextOrError(NVMRC_PATH);
+    expect(ok.text).not.toBeNull();
+    expect(ok.error).toBeNull();
+    // **読めないファイルは原因 (errno) を返す。** ここが null のままだと、
+    // 権限やシンボリックリンクの事故が「書式を直せ」という案内になり、
+    // 正しい書式のファイルを指すことになる
+    const missing = readTextOrError(resolve(REPO_ROOT, "この名前のファイルは存在しない"));
+    expect(missing.text).toBeNull();
+    expect(missing.error).toContain("ENOENT");
+    // **実行機の絶対パスは出さない** (CI と手元で文言をそろえる)
+    expect(missing.error).not.toContain(REPO_ROOT);
+  });
+
+  it.each([
+    // いま実際に使っているパス (ドットだけを含む)
+    { text: "scripts/verify-node-major.mjs", label: "現在のパス" },
+    // **量指定子として解釈されうる文字** — 逃がさないと照合が外れ、全ジョブが
+    // 「検証を実行していない」と誤報告される
+    { text: "scripts/verify-node-major+runtime.mjs", label: "+ を含む" },
+    { text: "scripts/verify*.mjs", label: "* を含む" },
+    { text: "scripts/verify?.mjs", label: "? を含む" },
+    // **逃がさないと `new RegExp` が読み込み時に投げ、ファイルごと収集エラーになる**
+    { text: "scripts/(verify).mjs", label: "括弧を含む" },
+    { text: "scripts/[verify].mjs", label: "角括弧を含む" },
+    { text: "scripts/a|b.mjs", label: "選択を含む" },
+    { text: "scripts/a{1}.mjs", label: "波括弧を含む" },
+    { text: "scripts/a^b$c.mjs", label: "アンカー文字を含む" },
+    { text: "scripts/a\\b.mjs", label: "バックスラッシュを含む" },
+  ])("escapeForRegExp: $label はそのままの綴りとして照合できる", ({ text }) => {
+    // 組み立てた正規表現が、その文字列**そのもの**にだけ一致することを確かめる
+    const pattern = new RegExp(`^node ${escapeForRegExp(text)}$`);
+    expect(pattern.test(`node ${text}`)).toBe(true);
+    // メタ文字が働いていれば、1 文字変えた綴りにも一致してしまう
+    expect(pattern.test(`node ${text}X`)).toBe(false);
+  });
+
+  it("RUNTIME_VERIFIER_LINE が、起動行の形だけに一致する", () => {
+    // 実際の起動行に一致すること
+    expect(RUNTIME_VERIFIER_LINE.test(`node ${RUNTIME_VERIFIER}`)).toBe(true);
+    // `.` が任意の 1 文字として働いていないこと
+    expect(RUNTIME_VERIFIER_LINE.test(`node ${RUNTIME_VERIFIER.replace(".mjs", "Xmjs")}`)).toBe(
+      false,
+    );
+    // パスを含むだけの行には一致しない (形で照合していること)
+    expect(RUNTIME_VERIFIER_LINE.test(`echo ${RUNTIME_VERIFIER}`)).toBe(false);
   });
 
   it("pullRequestReachableFiles が、ローカルの呼び出しをたどって PR に届く範囲を出す", () => {
