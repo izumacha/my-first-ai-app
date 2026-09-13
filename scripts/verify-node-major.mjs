@@ -100,7 +100,16 @@ function fail(message) {
     // 残る見込みがある (§6 エラーを握り潰さない)
     // 原因が分かっていれば errno を添える (EAGAIN と EPIPE で打つ手が違うため)
     const cause = writeError?.code !== undefined ? ` [stderr: ${writeError.code}]` : "";
-    console.error(payload.subarray(written).toString("utf8").trimEnd() + cause);
+    // **文字の途中で切れた分は捨ててから復号する。** writeSync が返すのは**バイト数**なので、
+    // この文言 (日本語は 1 文字 3 バイト) では `written` が文字の境目に来るとは限らない。
+    // そのまま `toString("utf8")` すると先頭に宙に浮いた継続バイトが残り、退避の 1 行が
+    // `\uFFFD\uFFFD…` で始まる — 「終了コード 1 だが理由が分からない」状態を避けるという
+    // この関数の目的を、いちばん出番のある経路で自分から損なうことになる。
+    // UTF-8 の継続バイト (0b10xxxxxx) を読み飛ばせば、次の文字の先頭から復号できる
+    let start = written;
+    // 継続バイトが続くあいだ、次の文字の先頭まで進める (先頭の壊れた 1 文字だけを捨てる)
+    while (start < payload.length && (payload[start] & 0xc0) === 0x80) start += 1;
+    console.error(payload.subarray(start).toString("utf8").trimEnd() + cause);
   }
   // 比較の土台が無い / 食い違っている状態で通さない
   process.exit(1);

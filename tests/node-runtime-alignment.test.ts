@@ -345,6 +345,11 @@ interface WorkflowJob {
   // **宣言として YAML に現れる差し替え**なので、PATH の宣言をここからも読む。
   // 合成したジョブを渡すテストのために省略可
   workflowEnv?: unknown;
+  // ワークフロー全体の `on:` (トップレベル)。**そのジョブがそもそも PR で走るか**を
+  // 見るために運ぶ。`if:` / `needs:` / `continue-on-error` と同じ「走らない形」の
+  // いちばん外側で、しかも他の 3 つと違って**ジョブ定義には現れない**。
+  // 合成したジョブを渡すテストのために省略可
+  workflowTriggers?: unknown;
 }
 
 /**
@@ -407,6 +412,13 @@ function jobsOfWorkflow(
   // **ワークフロー全体の `env:`** も一緒に運ぶ (ジョブ単位の env と同じく
   // そのジョブの全ステップに効くので、PATH の宣言をここからも読む)
   const workflowEnv = asRecord(value).env;
+  // **ワークフロー全体の `on:`** も運ぶ (PR で実際に起動するかを見るため)。
+  // **キーの綴りが 2 通りありうる。** YAML 1.1 のパーサは裸の `on` を真偽値として
+  // 読むためキーが `true` になる (この repo が使う yaml v2 は YAML 1.2 の core schema
+  // なので `"on"` のまま読めるが、パーサを差し替えたときに**黙って
+  // 「`on:` が無い」と読まれる**のは避けたい。下の判定は fail-closed なので、
+  // 取りこぼすと正当なワークフローが赤くなる = 見逃す側には倒れない)
+  const workflowTriggers = asRecord(value).on ?? asRecord(value).true;
   // **`jobs` が対応表になっていることまで確かめる。**
   // `readParsed` が見るのはトップレベルだけなので、`jobs: "extra"` のような形は
   // 例外にならず `asRecord` が `{}` に潰す = そのワークフローが黙って検査から外れる
@@ -434,7 +446,7 @@ function jobsOfWorkflow(
       continue;
     }
     // 読めたジョブを、どのワークフローの何という名前か・全体の env と一緒に控える
-    jobs.push({ file, name, definition, workflowEnv });
+    jobs.push({ file, name, definition, workflowEnv, workflowTriggers });
   }
   // 取り出せたジョブと、読めなかった箇所を返す
   return { jobs, problems };
@@ -664,15 +676,28 @@ function collectSetupNodeSteps(jobs: readonly WorkflowJob[]): SetupNodeStep[] {
   });
 }
 
-/** ワークフロー 1 本の中で、node イメージを据えている箇所 1 つ分。 */
-interface NodeImageUse {
+/**
+ * ステップを**丸ごとイメージの中で走らせている**箇所 1 つ分 (`uses: docker://<image>`)。
+ *
+ * **イメージ名は問わない。** 唯一の作り手である `collectImageOnlySteps` は
+ * `docker://` のステップをすべて集める (名前を `node` に絞ると
+ * `docker://ghcr.io/acme/ci-node:20` が素通りした = 実測)。
+ *
+ * **ジョブの `container:` はこの型に流れてこない。** その中でも `setup-node` は動くので
+ * `container: node:26-alpine` + 正しい `setup-node` は正当な形で、誤りは
+ * 「setup-node が無いこと」のほう = `collectJobsMissingSetupNode` が落とす。
+ * 型の名前と説明を作り手の実態に合わせておかないと、読み手が `container:` の値も
+ * ここを通ると誤解し、**一度実測して取り下げた**「正当な形に直しようの無い要求」を
+ * 復活させかねない (§6 設計判断を残す)。
+ */
+interface ImageStepUse {
   // 失敗メッセージに出す、どのワークフローのどのジョブかを示す名前
   file: string;
   // ジョブ名 (jobs 直下のキー)
   job: string;
   // 書かれていた場所を、YAML に現れるとおりの 1 つの文字列で持つ
-  // (`container: node:20` / `uses: docker://node:20`)。場所と値を別々に持って
-  // 文言側で連結すると `uses: docker:// node:20` のように実在しない空白が入り、
+  // (`uses: docker://node:20`)。場所と値を別々に持って文言側で連結すると
+  // `uses: docker:// node:20` のように実在しない空白が入り、
   // 読み手がワークフローを grep しても見つからなくなる (実測)
   location: string;
 }
@@ -794,6 +819,42 @@ function invokesRuntimeVerifier(step: Record<string, unknown>): boolean {
     .split("\n")
     .map((line) => line.trim())
     .some((line) => RUNTIME_VERIFIER_LINE.test(line));
+}
+
+/**
+ * そのワークフローが、**絞り込みの無い `pull_request`** で起動するか。
+ *
+ * **「そもそも走らない形」のいちばん外側。** ジョブ単位の `if:` / `continue-on-error` /
+ * `needs:` の連鎖は `jobNeverRunsReason` が落とすが、`on:` はそれらの外側にあって
+ * ジョブ定義には現れない。`on: { workflow_dispatch: }` に書き換えると、
+ * **lint / typecheck / test / e2e と実行時検証がまるごと PR で走らなくなる**のに、
+ * ジョブ側の検査はどれも「置き方は正しい」と言って全件緑になる (実測)。
+ * 塞いだ `needs:` gate とまったく同じ結末に、別のキーで届く形。
+ *
+ * **絞り込みも許さない。** `paths-ignore` や `types:` を足した瞬間、
+ * 「その条件に当たらない PR だけ検証されない」という、より見つけにくい同じ穴になる
+ * (ドキュメントだけを変える PR で Node の検証が走らない、など)。
+ * `pull_request` に値を書かない形だけを通す (= 現在の `ci.yml` の形)。
+ *
+ * **`on:` を読めない形は通さない (fail-closed)。** ここで拾いすぎても
+ * 「PR で走る保証が読み取れない」と赤くなるだけで、しかも直し方は
+ * 「`pull_request:` と書く」の 1 通りしかないので、**直しようの無い要求にはならない**。
+ * 逆に読めない形を通すと、`on:` の書き方を変えた 1 本だけが黙って検査から外れる。
+ */
+function triggersOnEveryPullRequest(triggers: unknown): boolean {
+  // `on: push` / `on: [push, pull_request]` のような形は、絞り込みの有無を
+  // 対応表として読めない。イベント名の配列は絞り込みを書けない形なので
+  // 本来は安全だが、**通すと「読めない形を通す」判断が 1 つ増える** — その緩みは
+  // 次に別の書き方が現れたときの前例になるので、対応表だけを認める
+  if (!isPlainMapping(triggers)) return false;
+  // `pull_request` が無ければ、PR では 1 度も走らない
+  if (!("pull_request" in triggers)) return false;
+  // 値を書かない形 (`pull_request:`) が「絞り込み無し」。YAML では null になる
+  const filter = triggers.pull_request;
+  if (filter === null || filter === undefined) return true;
+  // `pull_request: {}` と書いた形も同じ意味なので通す。
+  // キーが 1 つでもあれば絞り込みなので通さない
+  return isPlainMapping(filter) && Object.keys(filter).length === 0;
 }
 
 /**
@@ -971,15 +1032,25 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
     if (firstRepoCode === -1) return [];
     // 走らない形なら、置き方を見る前にそれを名指しする
     if (neverRuns !== null) return [{ file: job.file, job: job.name, reason: neverRuns }];
-    // **ジョブ / ワークフロー単位の `env: PATH:` は、そのジョブの全ステップに効く。**
+    // **ステップより広い場所で宣言された `env: PATH:` は、そのジョブの全ステップに効く。**
     // ステップ単位のものと同じく**宣言として YAML に現れる**のに読まないと、
-    // ジョブ単位で `/opt/node20/bin` を先頭に置き、実行時検証のステップだけ
+    // 広い側で `/opt/node20/bin` を先頭に置き、実行時検証のステップだけ
     // step 単位の `env:` で正しい PATH に戻す、という 2 段構えで
     // **両方の網が緑のまま**スイートが別の Node で走る (実測)。
     // 位置に関係なく効くので、宣言があること自体を落とす (直し方は「宣言しない」)。
-    const scopedPathEnv = ["ジョブ", "ワークフロー"].filter((_, index) =>
-      declaresPathEnv(index === 0 ? job.definition : { env: job.workflowEnv }),
-    );
+    // **`container:` の `env:` も同じ扱いにする** — これもコンテナの中で走る全ステップに
+    // 効くので、ジョブ / ワークフロー単位だけを塞いでも同じ 2 段構えが `container.env`
+    // 経由でそのまま通る (3 つのうち 1 つでも読み落とすと、その 1 つへ書き換えるだけで
+    // 迂回できる = 塞いだつもりの穴が別のキーで開いたままになる)。
+    // `container:` が文字列 (`container: node:20`) のときは `env:` を持ちようがなく、
+    // `asRecord` が空の対応表に潰すので何も宣言していない扱いになる
+    const scopedPathEnv = [
+      { label: "ジョブ", holder: job.definition },
+      { label: "ワークフロー", holder: { env: job.workflowEnv } },
+      { label: "コンテナ", holder: asRecord(job.definition.container) },
+    ]
+      .filter((scope) => declaresPathEnv(scope.holder))
+      .map((scope) => scope.label);
     if (scopedPathEnv.length > 0) {
       return [
         {
@@ -1035,6 +1106,25 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
           file: job.file,
           job: job.name,
           reason: `${RUNTIME_VERIFIER} がリポジトリのコードより後ろにある (先に走った検証の Node が分からない)`,
+        },
+      ];
+    }
+    // **実行時検証のステップ自身の `env: PATH:` を落とす。** 下の「検証より後ろ」の走査は
+    // `verifierIndex + 1` から始まるので、**検証ステップに付けた `env: PATH:` だけが
+    // どちらの網からも見えない**。これは上で塞いだ広い側の宣言と**対になる穴**で、
+    // 向きが逆なだけの同じ 2 段構えになる: `setup-node` の後ろに
+    // `volta-cli/action (node-version: '20')` を置いて PATH の先頭を Node 20 にし、
+    // **検証ステップにだけ** `env: { PATH: <Node 26 の bin>:... }` を添えると、
+    // 検証は「26 です」と申告して終了コード 0 で通り、続く `npm ci` / lint / test は
+    // Node 20 で走る (実測で全件緑)。実行時検証は「宣言として見えない入れ替え」を
+    // 引き受けている最後の砦なので、**その砦自身の探索パスを別に向ける宣言**は
+    // 値に関わらず落とす (直し方は「検証ステップに PATH を宣言しない」)
+    if (declaresPathEnv(steps[verifierIndex])) {
+      return [
+        {
+          file: job.file,
+          job: job.name,
+          reason: `${RUNTIME_VERIFIER} のステップに env: で PATH が宣言されている (検証だけ別の Node を指せる)`,
         },
       ];
     }
@@ -1125,11 +1215,11 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
  * ここで node イメージを一律に落としていたときは、`container: node:26-alpine` +
  * 正しい `setup-node` という**正当な形に直しようの無い要求**が出ていた (実測)。
  */
-function collectImageOnlySteps(jobs: readonly WorkflowJob[]): NodeImageUse[] {
+function collectImageOnlySteps(jobs: readonly WorkflowJob[]): ImageStepUse[] {
   // 共有の走査で平らに並べたジョブを受け取り、各ステップの uses: を見る
   return jobs.flatMap((job) => {
     // 見つけた箇所を溜める入れ物
-    const found: NodeImageUse[] = [];
+    const found: ImageStepUse[] = [];
     // 各ステップを順に見る (steps が無いジョブは空で回す)
     for (const step of stepRecordsOf(job) ?? []) {
       // uses を文字列として取り出す
@@ -1370,6 +1460,34 @@ const baseImageIgnoreEntries = collectIgnoreEntries(
   GUARDED_BASE_IMAGE,
 );
 
+/**
+ * 走査の**前提**を fail-closed で確かめる (置き場が読める / 読めない 1 本が無い)。
+ *
+ * **どの検査より先に掛ける。** 前提が崩れたまま個別の検査へ進むと、
+ * 置き場の改名・削除・権限や壊れた YAML という**入力側の事故**が、
+ * 「setup-node が 1 つも無い」「PR で走るジョブが無い」といった
+ * **ワークフローの書き方の問題**という別の顔で報告される (§6 握り潰さない)。
+ * とくに読めない 1 本をジョブ 0 件で済ませると、他に正しい `ci.yml` があるかぎり
+ * 以降の検査を通過し、**その 1 本だけが黙って検査から外れる** (fail-open)。
+ *
+ * 走査結果を見る `it` が複数あるので、判定はここ 1 か所に置く (§6 DRY) —
+ * 書き写すと、前提の扱いを直したときに片方だけ取り残される。
+ */
+function expectWorkflowScanUsable(workflows: WorkflowScan): void {
+  // 置き場そのものが読めないなら、原因 (errno) を添えて落とす
+  expect(
+    workflows.listError,
+    `${displayPath(WORKFLOWS_DIR)} を読めない: ${String(workflows.listError)}。` +
+      "置き場を改名・移動したなら、この検査の走査先も合わせて直すこと。",
+  ).toBeNull();
+  // 読めない・構造として解釈できないワークフローが 1 本でもあれば落とす
+  expect(
+    workflows.unreadable,
+    `.github/workflows/ に読めない・構造として解釈できないワークフローがある: ${workflows.unreadable.join(" / ")}。` +
+      "そのファイルは Node の版を直書きしていても検査をすり抜けるため、前提崩れとして落としている。",
+  ).toEqual([]);
+}
+
 describe("実行する Node の major を宣言しているすべての場所の整合", () => {
   it("検査に使う設定ファイルが読めて、構造として解釈できる", () => {
     // 3 つの入力のうち読めなかったものを、原因付きで並べる。
@@ -1394,21 +1512,8 @@ describe("実行する Node の major を宣言しているすべての場所の
   it("CI が Node の版を書き写さず、.nvmrc を参照して用意している", () => {
     // 置き場のワークフローの走査結果 (module スコープで 1 度だけ読んだもの)
     const workflows = workflowScan;
-    // **置き場ごと読めなかった場合は、その事実を原因付きで落とす。**
-    // 下の「setup-node が 1 つも無い」で落とすと、置き場の改名・削除・権限という
-    // 入力側の事故が「ワークフローの書き方の問題」として報告される (§6 握り潰さない)
-    expect(
-      workflows.listError,
-      `${displayPath(WORKFLOWS_DIR)} を読めない: ${String(workflows.listError)}。` +
-        "置き場を改名・移動したなら、この検査の走査先も合わせて直すこと。",
-    ).toBeNull();
-    // **読めない 1 本を先に落とす。** ジョブ 0 件で済ませると、他に正しい ci.yml が
-    // あるかぎり以降の検査を通過し、その 1 本だけが黙って検査から外れる (fail-open)
-    expect(
-      workflows.unreadable,
-      `.github/workflows/ に読めない・構造として解釈できないワークフローがある: ${workflows.unreadable.join(" / ")}。` +
-        "そのファイルは Node の版を直書きしていても検査をすり抜けるため、前提崩れとして落としている。",
-    ).toEqual([]);
+    // 走査の前提 (置き場が読める・読めない 1 本が無い) を先に確かめる
+    expectWorkflowScanUsable(workflows);
     // 読めたジョブから Node 準備ステップを集める
     const setupSteps = collectSetupNodeSteps(workflows.jobs);
     // 1 つも無ければ、CI が Node を用意していない (= 検証していない) ので落とす。
@@ -1440,8 +1545,12 @@ describe("実行する Node の major を宣言しているすべての場所の
       .map((step) => `${step.file}: ${step.job} (${describeInputs(step.inputs)})`);
     // **3 つの口の判定は soft にする。** 通常の expect は最初の 1 件で中断するので、
     // 2 つ以上の口が同時に開いていると、直して push するたびに次の 1 件が出る
-    // (CI の巡が増える)。加えて中断されると下の「node イメージで名指ししたジョブを
-    // 除く」重複除け自体が一度も効かない = docstring が書いている挙動が起きえない
+    // (CI の巡が増える)。とくに `uses: docker://` と setup-node の置き方は
+    // **同じジョブで同時に成り立つ** (`collectJobsMissingSetupNode` の docstring が
+    // 書いているとおり、`docker://hadolint` と `run: npm ci` を併せ持つジョブは
+    // 2 つの理由でそれぞれ名指しされる)。hard にすると片方を直すまでもう片方が
+    // 表に出ず、docstring が約束している「それぞれの理由で名指しする」挙動が
+    // 読み手には見えない
     expect.soft(
       misconfigured,
       `actions/setup-node の版は node-version-file: '${displayPath(NVMRC_PATH)}' で指定し、` +
@@ -1479,6 +1588,38 @@ describe("実行する Node の major を宣言しているすべての場所の
         "Node と無関係なジョブや、どうしても置き方に事情があるジョブが現れたら、" +
         "この検査自体を直すこと (除外表は置いていない — 空のまま fail-open を 4 つ抱えていたため外した)。",
     ).toEqual([]);
+  });
+
+  it("実行時検証が、絞り込みの無い pull_request で起動するワークフローで走る", () => {
+    // 置き場のワークフローの走査結果 (module スコープで 1 度だけ読んだもの)
+    const workflows = workflowScan;
+    // 走査の前提 (置き場が読める・読めない 1 本が無い) を先に確かめる
+    expectWorkflowScanUsable(workflows);
+    // 実行時検証を**無条件で**走らせ、かつ**絞り込み無しの pull_request** で
+    // 起動するワークフローにあるジョブを集める。
+    // ジョブ側の gate (`if:` / `needs:` / `continue-on-error`) は
+    // collectJobsMissingSetupNode が落とすので、ここでは見ない (§6 DRY)
+    const verifiedOnPullRequest = workflows.jobs
+      .filter(
+        (job) =>
+          triggersOnEveryPullRequest(job.workflowTriggers) &&
+          (stepRecordsOf(job) ?? []).some(
+            (step) => invokesRuntimeVerifier(step) && isUnconditionalStep(step),
+          ),
+      )
+      .map((job) => `${job.file}: ${job.name}`);
+    // 1 つも無ければ、綴りに依存しない最後の砦が**どの PR でも走らない**。
+    // ジョブ側の置き方をいくら検査しても、走らなければ何も担保しない
+    expect(
+      verifiedOnPullRequest,
+      `${RUNTIME_VERIFIER} を無条件で走らせるジョブが、絞り込みの無い on: pull_request で` +
+        "起動するワークフローに 1 つも無い。" +
+        "ジョブ単位の if: / needs: / continue-on-error は別の検査が落とすが、" +
+        "その外側にある on: を絞ると、置き方が正しいまま検証がどの PR でも走らなくなる " +
+        "(paths-ignore や types: を足した場合は「条件に当たらない PR だけ検証されない」" +
+        "という、より見つけにくい同じ穴になる)。" +
+        "検証を走らせるワークフローの on: には、値を書かない pull_request: を置くこと。",
+    ).not.toEqual([]);
   });
 
   it("実行する Node の major がピン留め 2 か所すべてから読み取れ、値も揃っている", () => {
@@ -2050,6 +2191,65 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
       ],
     });
     expect(collectJobsMissingSetupNode([otherEnv])).toEqual([]);
+    // **実行時検証のステップ自身の `env: PATH:` も名指しする。** 差し替えの走査は
+    // `verifierIndex + 1` から始まるので、ここを別に見ないと**検証ステップに付けた
+    // `env: PATH:` だけがどちらの網からも見えない**。上の「ジョブ / ワークフロー単位」と
+    // 向きが逆なだけの同じ 2 段構え: 検証の手前で PATH の先頭を Node 20 にし、
+    // 検証ステップにだけ正しい Node を指し直すと、検証は「26 です」と申告して通り、
+    // 続く npm ci / lint / test は Node 20 で走る (実測で全件緑)
+    const verifierPathEnv = jobOf({
+      steps: [
+        { uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } },
+        { uses: "volta-cli/action@v4", with: { "node-version": "20" } },
+        {
+          run: "node scripts/verify-node-major.mjs",
+          env: { PATH: "/opt/hostedtoolcache/node/26.0.0/x64/bin:/usr/bin:/bin" },
+        },
+        { run: "npm ci && npm run test" },
+      ],
+    });
+    expect(collectJobsMissingSetupNode([verifierPathEnv])).toEqual([
+      {
+        file: "synthetic.yml",
+        job: "job",
+        reason: `${RUNTIME_VERIFIER} のステップに env: で PATH が宣言されている (検証だけ別の Node を指せる)`,
+      },
+    ]);
+    // 検証ステップの PATH 以外の env: は通す (誤検知を出さない)
+    const verifierOtherEnv = jobOf({
+      steps: [
+        { uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } },
+        { run: "node scripts/verify-node-major.mjs", env: { CI: "true" } },
+        { run: "npm ci" },
+      ],
+    });
+    expect(collectJobsMissingSetupNode([verifierOtherEnv])).toEqual([]);
+    // **`container:` の `env: PATH:` も同じ扱い。** コンテナの中で走る全ステップに
+    // 効くので、ジョブ / ワークフロー単位だけを塞いでも、同じ 2 段構えが
+    // このキー経由でそのまま通る (塞いだつもりの穴が別のキーで開いたままになる)
+    const containerPathEnv = jobOf({
+      container: { image: "node:26-alpine", env: { PATH: "/opt/node20/bin:/usr/bin" } },
+      steps: compliantSteps,
+    });
+    expect(collectJobsMissingSetupNode([containerPathEnv])).toEqual([
+      {
+        file: "synthetic.yml",
+        job: "job",
+        reason: "コンテナ単位の env: で PATH を宣言している (そのジョブの全ステップの探索パスが変わる)",
+      },
+    ]);
+    // `container:` を文字列で書いた形 (`container: node:26-alpine`) は env: を持ちようが
+    // 無いので通す。**正しい setup-node と併せた形は正当**なので、ここで落とすと
+    // 直しようの無い要求になる (一度実測して取り下げた形)
+    expect(
+      collectJobsMissingSetupNode([jobOf({ container: "node:26-alpine", steps: compliantSteps })]),
+    ).toEqual([]);
+    // コンテナの PATH 以外の env: も通す (誤検知を出さない)
+    expect(
+      collectJobsMissingSetupNode([
+        jobOf({ container: { image: "node:26-alpine", env: { CI: "true" } }, steps: compliantSteps }),
+      ]),
+    ).toEqual([]);
     // 実行時検証が setup-node より前だと、ランナー既定の Node を見る空振りになる
     const verifierTooEarly = jobOf({
       steps: [
@@ -2160,6 +2360,42 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
     expect(nodeMajorOfDockerfileText("FROM golang:1.22 AS build\nFROM node:26-alpine\n")).toBe(26);
   });
 
+  it.each([
+    // 値を書かない `pull_request:` が「絞り込み無し」= 全 PR で走る
+    { triggers: { pull_request: null }, expected: true, label: "pull_request: (値なし)" },
+    // 空の対応表も同じ意味
+    { triggers: { pull_request: {} }, expected: true, label: "pull_request: {}" },
+    // push と併記していても、pull_request が絞り込み無しなら通す
+    {
+      triggers: { push: { branches: ["main"] }, pull_request: null },
+      expected: true,
+      label: "push と併記",
+    },
+    // pull_request が無ければ PR では 1 度も走らない
+    { triggers: { workflow_dispatch: null }, expected: false, label: "workflow_dispatch だけ" },
+    // paths-ignore は「その条件に当たらない PR だけ検証されない」という同じ穴になる
+    {
+      triggers: { pull_request: { "paths-ignore": ["**.md"] } },
+      expected: false,
+      label: "paths-ignore 付き",
+    },
+    // types: を絞ると、対象外のイベントで走らなくなる
+    { triggers: { pull_request: { types: ["opened"] } }, expected: false, label: "types: 付き" },
+    // branches で基底ブランチを絞る形も、外れた PR が検証されない
+    {
+      triggers: { pull_request: { branches: ["main"] } },
+      expected: false,
+      label: "branches 付き",
+    },
+    // 対応表として読めない形は通さない (fail-closed)
+    { triggers: ["pull_request"], expected: false, label: "イベント名の配列" },
+    { triggers: "pull_request", expected: false, label: "文字列" },
+    { triggers: undefined, expected: false, label: "on: が無い" },
+  ])("triggersOnEveryPullRequest: $label → $expected", ({ triggers, expected }) => {
+    // 合成した on: を判定へ渡し、期待どおりの真偽を返すことを固定する
+    expect(triggersOnEveryPullRequest(triggers)).toBe(expected);
+  });
+
   it("jobsOfWorkflow が、ワークフロー全体の env: をジョブへ運ぶ", () => {
     // **運ぶ配線そのものを固定する。** 運び先の判定にはテストがあるのに、
     // 運ぶ側が無検証だと「全体の env を読まない」変異が全件緑で通る (実測)
@@ -2175,6 +2411,20 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
     // 全体の env が無いワークフローでは undefined のまま (誤検知を出さない)
     const noEnv = jobsOfWorkflow("synthetic.yml", { jobs: { build: { steps: [] } } });
     expect(noEnv.jobs[0]?.workflowEnv).toBeUndefined();
+    // **`on:` も同じく運ぶ。** 運び先 (triggersOnEveryPullRequest) の判定には
+    // テストがあるが、運ぶ配線が無検証だと「on: を読まない」変異が全件緑で通る —
+    // env で実測した穴とまったく同じ形なので、同じ場所で固定する
+    const withTriggers = jobsOfWorkflow("synthetic.yml", {
+      on: { pull_request: null },
+      jobs: { build: { steps: [{ run: "npm ci" }] } },
+    });
+    expect(withTriggers.jobs[0]?.workflowTriggers).toEqual({ pull_request: null });
+    // YAML 1.1 のパーサが裸の `on` を真偽値として読んだ場合 (キーが `true`) も拾う
+    const booleanKey = jobsOfWorkflow("synthetic.yml", {
+      true: { pull_request: null },
+      jobs: { build: { steps: [{ run: "npm ci" }] } },
+    });
+    expect(booleanKey.jobs[0]?.workflowTriggers).toEqual({ pull_request: null });
     // 読めない形は 3 段それぞれで原因を返す
     expect(jobsOfWorkflow("x.yml", { jobs: "extra" }).problems).toHaveLength(1);
     expect(jobsOfWorkflow("x.yml", { jobs: { a: [] } }).problems).toHaveLength(1);
