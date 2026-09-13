@@ -422,21 +422,23 @@ function jobsOfWorkflow(
   const problems: string[] = [];
   // **ワークフロー全体の `env:`** も一緒に運ぶ (ジョブ単位の env と同じく
   // そのジョブの全ステップに効くので、PATH の宣言をここからも読む)
-  const workflowEnv = asRecord(value).env;
+  // トップレベルを 1 度だけ対応表として読む (走査が読むキーが 1 か所に並ぶ)
+  const document = asRecord(value);
+  const workflowEnv = document.env;
   // **ワークフロー全体の `on:`** も運ぶ (PR で実際に起動するかを見るため)。
   // **キーの綴りが 2 通りありうる。** YAML 1.1 のパーサは裸の `on` を真偽値として
   // 読むためキーが `true` になる (この repo が使う yaml v2 は YAML 1.2 の core schema
   // なので `"on"` のまま読めるが、パーサを差し替えたときに**黙って
   // 「`on:` が無い」と読まれる**のは避けたい。下の判定は fail-closed なので、
   // 取りこぼすと正当なワークフローが赤くなる = 見逃す側には倒れない)
-  const workflowTriggers = asRecord(value).on ?? asRecord(value).true;
+  const workflowTriggers = document.on ?? document.true;
   // **ワークフロー全体の `defaults:`** も運ぶ (defaults.run.shell の差し替えを見るため)
-  const workflowDefaults = asRecord(value).defaults;
+  const workflowDefaults = document.defaults;
   // **`jobs` が対応表になっていることまで確かめる。**
   // `readParsed` が見るのはトップレベルだけなので、`jobs: "extra"` のような形は
   // 例外にならず `asRecord` が `{}` に潰す = そのワークフローが黙って検査から外れる
   // (トップレベルで塞いだのと同じ fail-open が 1 段下に残っていた。実測)
-  const jobsValue = asRecord(value).jobs;
+  const jobsValue = document.jobs;
   if (!isPlainMapping(jobsValue)) {
     problems.push(`${file}: jobs が対応表ではありません (${describeShape(jobsValue)})`);
     return { jobs, problems };
@@ -517,7 +519,7 @@ function scanWorkflows(): WorkflowScan {
  * バージョン指定 (`actions/setup-node@v7` / `@<sha>`) を許しつつ、**名前はそこで終わる**
  * ことを求める。前方一致だけにすると `actions/setup-node-foo@v1` のような別アクションまで
  * 拾い、「`node-version-file: '.nvmrc'` を渡せ」という**直しようの無い要求**を出す
- * (`isNodeImage` が `myorg/node-tools` を巻き込まないのと同じ理由。
+ * (`parseImageReference` のリポジトリ名が `myorg/node-tools` を巻き込まないのと同じ理由。
  *  無関係なものを赤くする検出網はいずれ緩められる)。
  *
  * **大文字小文字は区別しない (`i`)。** GitHub は `uses:` の owner/repo を
@@ -846,31 +848,6 @@ interface ImageStepUse {
 const DOCKER_USES_PREFIX = "docker://";
 
 /**
- * イメージ名が Node の公式イメージを指しているかを判定する。
- *
- * レジストリ・名前空間の付いた書き方 (`docker.io/library/node:20`) でも拾えるよう、
- * **最後のパス区切り以降**をリポジトリ名として見る。タグ (`:20-alpine`) と
- * ダイジェスト (`@sha256:...`) は落としてから比べる。
- *
- * 判定を「名前が node と完全一致」に絞るのは、`myorg/node-tools` のような
- * 別物まで巻き込むと**直しようの無い要求**を出すことになるから
- * (この repo が繰り返し避けている形。無関係なものを赤くする検出網はいずれ緩められる)。
- *
- * **名前空間は問わない。** 社内ミラー (`registry.corp.example/node:22-alpine`、
- * `harbor.corp/node:22`) は現実的な形で、そこに別 major の段が足されるのは
- * まさにこの判定が検出したいドリフトそのもの。公式 (`library`) に絞っていたときは
- * ミラーの段が**素通り**した (実測で全件緑)。
- *
- * 唯一の利用側は `readDockerfileNodeMajor`。ここで拾いすぎても「ピンが 2 つある」と
- * 赤くなるだけで、**見逃す側には倒れない** (ジョブの `container:` を一律に落として
- * いたときは正当な形に直しようの無い要求を出していたが、その利用側はもう無い)。
- */
-function isNodeImage(image: string): boolean {
-  // 名前が node のものだけを node イメージとして扱う (node-tools 等は拾わない)
-  return parseImageReference(image).repository === "node";
-}
-
-/**
  * イメージ参照の中の `$NAME` / `${NAME}` を、集めた `ARG` の既定値で展開する。
  *
  * **展開しきれない変数はそのまま残す。** 呼び出し側はそれを「読めない段」の目印に
@@ -897,6 +874,14 @@ function expandArgs(image: string, argDefaults: ReadonlyMap<string, string>): st
  * **最後のパス要素だけを見るのが要点。** 参照全体を `:` で割ると
  * `registry.corp.example:5000/node:26` のポート番号 (5000) をタグと読み違える
  * (実測で「Dockerfile=5000」と報告された)。
+ *
+ * **リポジトリ名は名前空間を落とした完全一致で使う。** 利用側は
+ * `repository === "node"` で node の段を選ぶので、`docker.io/library/node:20` も
+ * 社内ミラー (`registry.corp.example/node:22-alpine`) も同じく拾える一方、
+ * `myorg/node-tools` のような**名前が前方一致するだけの別物**は巻き込まない
+ * (巻き込むと正当な段に直しようの無い要求を出すことになる)。社内ミラーを拾うのは、
+ * そこに別 major の段が足されるのがまさに検出したいドリフトだから
+ * (公式の `library` に絞っていたときはミラーの段が素通りした＝実測)。
  */
 function parseImageReference(image: string): { repository: string; tag: string } {
   // ダイジェスト指定 (`@sha256:...`) が付いていれば切り落とす
@@ -993,10 +978,57 @@ function invokesRuntimeVerifier(step: Record<string, unknown>): boolean {
 }
 
 /**
+ * **全 PR に届くワークフローのファイル名**を集める (ローカルの呼び出しをたどる)。
+ *
+ * **呼び出し経由をたどらないと、正当な分割が満たせない要求になる。** `pr.yml`
+ * (`on: pull_request:`) が 1 ジョブで `uses: ./.github/workflows/suite.yml` を呼び、
+ * `suite.yml` (`on: workflow_call:`) が checkout / setup-node / 検証 / スイートを
+ * 持つ形は、GitHub の標準的な CI の切り方。ところが呼び出し側は steps を持たず、
+ * 呼ばれる側は `pull_request` で起動しないので、**どちらのジョブも条件を満たさず**
+ * 検証は毎 PR 走っているのに検査だけが落ちる — この repo が繰り返し避けている
+ * 「直しようの無い要求」になる。
+ *
+ * **gate された呼び出しはたどらない。** `if:` / `continue-on-error` 付きの
+ * 呼び出しはスキップされても CI が緑になるので、その先を「PR に届く」と数えると
+ * `needs:` gate を塞いだ意味が無くなる。
+ */
+function pullRequestReachableFiles(jobs: readonly WorkflowJob[]): Set<string> {
+  // 直接 PR で起動するワークフローを種にする
+  const reachable = new Set(
+    jobs.filter((job) => triggersOnEveryPullRequest(job.workflowTriggers)).map((job) => job.file),
+  );
+  // 呼び出しをたどって増えなくなるまで繰り返す (呼び出しは何段でも連なりうる)
+  for (let grew = true; grew; ) {
+    // この巡で増えたかどうか
+    grew = false;
+    // 到達済みのワークフローにあるジョブの、ローカルな呼び出し先を拾う
+    for (const job of jobs) {
+      // 呼び出し元が PR に届いていなければ、その先もこの経路では届かない
+      if (!reachable.has(job.file)) continue;
+      // スキップされうる呼び出しは「必ず走る経路」ではないのでたどらない
+      if (!isUnconditionalStep(job.definition)) continue;
+      // ローカルの再利用可能ワークフロー呼び出しだけをたどる
+      const uses = usesOf(job.definition);
+      if (!uses.startsWith("./.github/workflows/")) continue;
+      // 呼び出し先のファイル名 (走査はファイル名で持っているので最後の要素にする)
+      const target = uses.split("@")[0].split("/").pop() ?? "";
+      // まだ数えていなければ足して、もう 1 巡する
+      if (target !== "" && !reachable.has(target)) {
+        reachable.add(target);
+        grew = true;
+      }
+    }
+  }
+  // 集まった一覧を返す
+  return reachable;
+}
+
+/**
  * そのジョブが、**全 PR で起動し、検証済みの Node で「検証以外の処理」も走らせる**か。
  *
  * 3 つを同時に満たすことを求める:
- *   1. ワークフローが絞り込み無しの `pull_request` で起動する。
+ *   1. ワークフローが全 PR に届く (絞り込み無しの `pull_request` で起動するか、
+ *      そこからローカルの再利用可能ワークフローとして呼ばれている)。
  *   2. 実行時検証を**無条件で**走らせている (`if:` / `continue-on-error` 付きは数えない)。
  *   3. 検証以外のリポジトリのコードも走らせている。
  *
@@ -1009,9 +1041,12 @@ function invokesRuntimeVerifier(step: Record<string, unknown>): boolean {
  * PR で走るジョブに `run: echo hi` を 1 つ足せばこの判定は満たせる
  * (`run:` の中身を解釈しない方針の帰結)。
  */
-function runsVerifiedWorkOnEveryPullRequest(job: WorkflowJob): boolean {
-  // まずワークフローが全 PR で起動すること
-  if (!triggersOnEveryPullRequest(job.workflowTriggers)) return false;
+function runsVerifiedWorkOnEveryPullRequest(
+  job: WorkflowJob,
+  pullRequestFiles: ReadonlySet<string>,
+): boolean {
+  // まずそのワークフローが、直接あるいは呼び出し経由で全 PR に届くこと
+  if (!pullRequestFiles.has(job.file)) return false;
   // steps を持たないジョブ (再利用可能ワークフローの呼び出し) は中身を読めない
   const steps = stepRecordsOf(job) ?? [];
   // 実行時検証を無条件で走らせていること
@@ -1323,6 +1358,13 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
     }
     // 必ず効く setup-node の位置 (if: / continue-on-error 付きは数えない)
     const setupIndex = steps.findIndex(isUnconditionalSetupNode);
+    // **実行時検証も同じジョブで、無条件・setup-node より後ろに置く。**
+    // 「どこかの 1 ジョブが走らせていればよい」にすると、スイートを走らせる 2 本目の
+    // ジョブで `run: nvm install 20` と書いても全件緑のまま通る (実測)。
+    // setup-node より前に置くと、ランナー既定の Node を検証するだけの空振りになる
+    const verifierIndex = steps.findIndex(
+      (step) => invokesRuntimeVerifier(step) && isUnconditionalStep(step),
+    );
     // 無条件の setup-node が 1 つも無い場合は、条件付きの有無で文言を分ける
     if (setupIndex === -1) {
       // setup-node 自体はあるなら、書き忘れではなく「効かない置き方」だと伝える
@@ -1331,14 +1373,19 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
           ? "setup-node に if: / continue-on-error が付いている (効かなくても後続が走る)"
           : "setup-node が無い",
       );
+    } else if (verifierIndex === -1 && setupIndex > firstRepoCode) {
+      // **検証が無いジョブでも、setup-node の位置は名指しする。** 以前は「検証が無い」
+      // だけを返して打ち切っていたため、`[run: npm ci, setup-node]` のジョブは
+      // (a) 検証が無い → (b) 検証が後ろ → (c) 検証が setup-node より前、と
+      // **3 巡かけてようやく setup-node の位置にたどり着く**形になっていた
+      // (docstring は「run: npm ci の後ろに setup-node」を名指しすると書いているのに、
+      //  その文言が一度も出なかった)。
+      // **検証があるときはここで出さない** — そのときは下の並び順の判定がより具体的な
+      // 文言 (検証と setup-node のどちらが前か) で名指しするので、二重報告になる
+      reasons.push(
+        "setup-node がリポジトリのコードより後ろにある (先に走る処理はランナー既定の Node で動く)",
+      );
     }
-    // **実行時検証も同じジョブで、無条件・setup-node より後ろに置く。**
-    // 「どこかの 1 ジョブが走らせていればよい」にすると、スイートを走らせる 2 本目の
-    // ジョブで `run: nvm install 20` と書いても全件緑のまま通る (実測)。
-    // setup-node より前に置くと、ランナー既定の Node を検証するだけの空振りになる
-    const verifierIndex = steps.findIndex(
-      (step) => invokesRuntimeVerifier(step) && isUnconditionalStep(step),
-    );
     // 1 つも無ければ、そのジョブは「宣言として見えない形」を何も検証していない
     if (verifierIndex === -1) {
       // 実体が無いのか、条件付きなのかを文言で分ける
@@ -1530,7 +1577,7 @@ function collectImageOnlySteps(jobs: readonly WorkflowJob[]): ImageStepUse[] {
  * まさに検出したいドリフトを見逃す。すべての `FROM` の node イメージを集め、
  * 揃っていなければ「読めなかった」として呼び出し側で落とす。
  *
- * **イメージ名は `isNodeImage` と同じ解析に通す。** 以前は `FROM node:(\d+)` という
+ * **イメージ名は `parseImageReference` に通す。** 以前は `FROM node:(\d+)` という
  * 狭い正規表現で、`FROM docker.io/library/node:22-alpine AS tools` や
  * `FROM --platform=linux/amd64 node:22` を**素通り**させていた (実測で全件緑。
  * まさに多段ビルドのドリフトを見逃す形)。ワークフロー側で同じ取りこぼしを塞いだ
@@ -1573,12 +1620,22 @@ function nodeMajorOfDockerfileText(text: string): number | null {
   for (const line of lines) {
     // 最初の FROM に当たったら、そこから先の ARG は FROM に使えないので打ち切る
     if (/^\s*FROM\s+/i.test(line)) break;
-    // `ARG NAME=値` の形だけを対象にする (既定値の無い ARG は展開しようがない)
-    const arg = line.match(/^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)=(.+)$/i);
+    // ARG 命令かどうかを見る
+    const arg = line.match(/^\s*ARG\s+(.+)$/i);
     // ARG でなければ次の行へ
     if (!arg) continue;
-    // 値の前後の空白と引用符を落として控える
-    argDefaults.set(arg[1], arg[2].trim().replace(/^["']|["']$/g, ""));
+    // **1 行に複数の代入を書ける** (`ARG A=1 B=2`)。1 つ目だけを見る形だと、
+    // 1 つ目の値が行末まで飲み込まれて `node:20-alpine TOOLS=alpine:3` のような
+    // 値になったり、2 つ目以降が記録されず `$BASE` が展開されないまま残ったりする。
+    // どちらも**正当な Dockerfile を「読めない」と報告する**向きの誤読 (実測)
+    for (const token of arg[1].trim().split(/\s+/)) {
+      // `NAME=値` の形の語だけを拾う (既定値の無い ARG は展開しようがない)
+      const assignment = token.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+      // 代入でなければ次の語へ
+      if (!assignment) continue;
+      // 値の前後の引用符を落として控える
+      argDefaults.set(assignment[1], assignment[2].replace(/^["']|["']$/g, ""));
+    }
   }
   for (const line of lines) {
     // 行頭の FROM 命令だけを対象にする (大文字小文字は Docker 側が区別しない)
@@ -1609,11 +1666,11 @@ function nodeMajorOfDockerfileText(text: string): number | null {
     // 赤くなるのは綴りだけで答えが変わる形。実測)
     if (reference.repository.includes("$")) return null;
     // 公式の node イメージでなければ対象外 (ビルドに使う別イメージの段は見ない)
-    if (!isNodeImage(resolved)) continue;
+    if (reference.repository !== "node") continue;
     // **node の段でタグが決められないなら、そこで落とす** (major を読めないので
     // 飛ばすと、まさに検出したい多段ビルドのドリフトが素通りする)
     if (reference.tag.includes("$")) return null;
-    // タグから major を取り出す。割り方は isNodeImage と同じ 1 か所に任せる
+    // タグから major を取り出す (リポジトリ名の判定と同じ 1 か所の解析結果を使う)
     // (書き写すと「node の段だと判定した参照から別の部分文字列をタグとして読む」
     //  という静かな食い違いになる。詳細は parseImageReference の docstring)
     const major = reference.tag.match(/^(\d+)/);
@@ -1643,9 +1700,14 @@ function readReadmeNodeMajor(): number | null {
   // **「26 以上」と書かない** — 実際に検証しているのはピン留めした系列だけで、
   // 「以上」は検査より緩い約束になる (読み手が 28 を入れると、`@types/node@^26` の
   // 型で 28 のランタイムを型チェックするという、この規約が防ぎたい形が裏返しで起きる)
-  const matched = text.match(/Node\.js\s+(\d+)\s*系/);
-  // 形が合わなければ読めなかった扱い
-  return matched ? Number(matched[1]) : null;
+  // **1 つだけ見つかったときに採用する (曖昧なら fail-closed)。** 先頭の 1 件を
+  // 黙って採ると、上に「Node.js 22 系から移行しました」のような過去の言及が
+  // 増えた瞬間にそちらを現在の要件として読む — 本当の要件行が古くなっていても
+  // 気付けない向きの誤読になる。このファイルの他の読み手 (ピン留め 2 か所 /
+  // Dockerfile の段) が曖昧さで落としているのと扱いをそろえる
+  const matches = [...text.matchAll(/Node\.js\s+(\d+)\s*系/g)];
+  // 2 件以上あればどれが要件か決められないので読めなかった扱い
+  return matches.length === 1 ? Number(matches[0][1]) : null;
 }
 
 /**
@@ -1916,8 +1978,10 @@ describe("実行する Node の major を宣言しているすべての場所の
     // **絞り込み無しの pull_request で起動し、検証済みの Node で実際の処理を走らせる**
     // ジョブを集める。ジョブ側の gate (`if:` / `needs:` / `continue-on-error`) や
     // setup-node の置き方は collectJobsMissingSetupNode が落とすので見ない (§6 DRY)
+    // 直接 PR で起動するワークフローと、そこから呼ばれるローカルのワークフロー
+    const pullRequestFiles = pullRequestReachableFiles(workflows.jobs);
     const verifiedOnPullRequest = workflows.jobs
-      .filter(runsVerifiedWorkOnEveryPullRequest)
+      .filter((job) => runsVerifiedWorkOnEveryPullRequest(job, pullRequestFiles))
       .map((job) => `${job.file}: ${job.name}`);
     // 1 つも無ければ、綴りに依存しない最後の砦が**どの PR でも走らない**。
     // ジョブ側の置き方をいくら検査しても、走らなければ何も担保しない
@@ -2165,7 +2229,7 @@ describe("実行する Node の major を宣言しているすべての場所の
 
 // この検出網は「実際の ci.yml が準拠している」ことしか確かめておらず、**判定そのものは
 // どのテストも通っていなかった**。実測では `isUnconditionalSetupNode` の中身を
-// `return true` に潰しても全件緑で、`isNodeImage` / `runsRepositoryCode` /
+// `return true` に潰しても全件緑で、`parseImageReference` / `runsRepositoryCode` /
 // `describeStepsProblem` / `SETUP_NODE_USES` の `i` も同じ。つまり「塞いだ」実測の証拠が
 // コミットメッセージにしか無く、後の整理で口が静かに開いても CI は何も言わない
 // (helpdesk-hub の Stripe ガードが「実行時チェックそのものの挙動」を固定している理由と
@@ -2224,21 +2288,34 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
 
   it.each([
     // タグ付きの公式イメージ
-    { image: "node:20", expected: true, label: "node:20" },
+    { image: "node:20", repository: "node", tag: "20", label: "node:20" },
     // レジストリ・名前空間を付けた書き方
-    { image: "docker.io/library/node:20", expected: true, label: "レジストリ付き" },
-    // ダイジェスト指定
-    { image: "node@sha256:abc", expected: true, label: "ダイジェスト" },
-    // 名前が node で始まるだけの別物は巻き込まない (Dockerfile の FROM を読むため)
-    { image: "myorg/node-tools:1", expected: false, label: "別イメージ" },
+    { image: "docker.io/library/node:20", repository: "node", tag: "20", label: "レジストリ付き" },
+    // ダイジェスト指定 (タグは無い)
+    { image: "node@sha256:abc", repository: "node", tag: "", label: "ダイジェスト" },
+    // 名前が node で始まるだけの別物は巻き込まない (利用側は完全一致で選ぶ)
+    { image: "myorg/node-tools:1", repository: "node-tools", tag: "1", label: "別イメージ" },
     // Node と無関係なイメージ
-    { image: "ubuntu:24.04", expected: false, label: "ubuntu" },
-    // 社内ミラー (名前空間付き) も node イメージとして拾う — Dockerfile の段に
-    // 別 major のミラーを足す形は、まさに検出したいドリフトそのもの
-    { image: "registry.corp.example/node:22-alpine", expected: true, label: "社内ミラー" },
-  ])("isNodeImage: $label → $expected", ({ image, expected }) => {
-    // イメージ名の判定が、公式の node イメージだけを拾うことを固定する
-    expect(isNodeImage(image)).toBe(expected);
+    { image: "ubuntu:24.04", repository: "ubuntu", tag: "24.04", label: "ubuntu" },
+    // 社内ミラー (名前空間付き) も node の段として拾える
+    {
+      image: "registry.corp.example/node:22-alpine",
+      repository: "node",
+      tag: "22-alpine",
+      label: "社内ミラー",
+    },
+    // **レジストリのポートをタグと読み違えない** (実測で「Dockerfile=5000」と報告された)
+    {
+      image: "registry.corp.example:5000/node:26",
+      repository: "node",
+      tag: "26",
+      label: "レジストリのポート付き",
+    },
+    // タグ無しの書き方 (major を読めないので、利用側が fail-closed に倒す目印になる)
+    { image: "node", repository: "node", tag: "", label: "タグ無し" },
+  ])("parseImageReference: $label → $repository / $tag", ({ image, repository, tag }) => {
+    // 参照の割り方を固定する (この 1 か所の答えで node の段の選別と major の抽出が決まる)
+    expect(parseImageReference(image)).toEqual({ repository, tag });
   });
 
   it.each([
@@ -2298,7 +2375,7 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
   // **1 シナリオ = 1 ケースにする。** 以前は 1 つの it に約 30 の場面を hard な expect で
   // 並べていたため、(a) 最初の 1 件で中断して以降の場面が一度も走らず、
   // (b) 失敗表示が `MissingSetupNodeJob[]` の差分だけで**どの場面が壊れたか分からない**
-  // という状態だった。このファイルの他の判定 (isUnconditionalSetupNode / isNodeImage /
+  // という状態だった。このファイルの他の判定 (isUnconditionalSetupNode / parseImageReference /
   // triggersOnEveryPullRequest …) はすべて `$label` 付きの it.each なので、そろえる
   it.each([
     // --- 期待どおりの置き方 (誤検知を出さないこと) ---
@@ -2348,7 +2425,10 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
       // 落ちている、という食い違いに気付けない
       label: "setup-node がリポジトリのコードより後ろ",
       jobs: [jobOf({ steps: [{ run: "npm ci" }, { uses: "actions/setup-node@v7" }] })],
-      expected: named(`${RUNTIME_VERIFIER} を実行していない`),
+      expected: named(
+        "setup-node がリポジトリのコードより後ろにある (先に走る処理はランナー既定の Node で動く)" +
+          ` / ${RUNTIME_VERIFIER} を実行していない`,
+      ),
     },
 
     // --- 実行時検証の有無・位置・書き方 ---
@@ -2949,8 +3029,50 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
     },
   ])("runsVerifiedWorkOnEveryPullRequest: $label → $expected", ({ job, expected }) => {
     // 3 つの条件それぞれを、合成したジョブで固定する (実測では、どの節を落としても
-    // 実際の ci.yml だけを見ているかぎり全件緑で通った)
-    expect(runsVerifiedWorkOnEveryPullRequest(job)).toBe(expected);
+    // 実際の ci.yml だけを見ているかぎり全件緑で通った)。
+    // 到達集合はその 1 本の起動条件から組み立てる (呼び出し経由は下の it が見る)
+    expect(runsVerifiedWorkOnEveryPullRequest(job, pullRequestReachableFiles([job]))).toBe(expected);
+  });
+
+  it("pullRequestReachableFiles が、ローカルの呼び出しをたどって PR に届く範囲を出す", () => {
+    // 呼び出し側 (PR で起動し、ローカルの再利用可能ワークフローを呼ぶだけ)
+    const caller = {
+      file: "pr.yml",
+      name: "call",
+      definition: { uses: "./.github/workflows/suite.yml" },
+      workflowTriggers: { pull_request: null },
+    };
+    // 呼ばれる側 (workflow_call で起動し、実際の検証とスイートを持つ)
+    const callee = {
+      file: "suite.yml",
+      name: "suite",
+      definition: { steps: compliantSteps },
+      workflowTriggers: { workflow_call: null },
+    };
+    // **正当な分割**なので、呼ばれる側も「PR に届く」と数える
+    const reachable = pullRequestReachableFiles([caller, callee]);
+    expect([...reachable].sort()).toEqual(["pr.yml", "suite.yml"]);
+    // 呼ばれる側のジョブが、検証もスイートも持っているので条件を満たす
+    expect(runsVerifiedWorkOnEveryPullRequest(callee, reachable)).toBe(true);
+    // **gate された呼び出しはたどらない** (スキップされても CI は緑になるので、
+    // その先を「PR に届く」と数えると needs: gate を塞いだ意味が無くなる)
+    const gatedCaller = { ...caller, definition: { ...caller.definition, if: "${{ false }}" } };
+    expect([...pullRequestReachableFiles([gatedCaller, callee])]).toEqual(["pr.yml"]);
+    // 呼び出しが無ければ、workflow_call のワークフローは届かない
+    expect([...pullRequestReachableFiles([callee])]).toEqual([]);
+    // 呼び出しは何段でも連なりうる (pr.yml → mid.yml → suite.yml)
+    const mid = {
+      file: "mid.yml",
+      name: "relay",
+      definition: { uses: "./.github/workflows/suite.yml" },
+      workflowTriggers: { workflow_call: null },
+    };
+    const toMid = { ...caller, definition: { uses: "./.github/workflows/mid.yml" } };
+    expect([...pullRequestReachableFiles([toMid, mid, callee])].sort()).toEqual([
+      "mid.yml",
+      "pr.yml",
+      "suite.yml",
+    ]);
   });
 
   it("expectWorkflowScanUsable が、前提の崩れを原因付きで落とす", () => {
