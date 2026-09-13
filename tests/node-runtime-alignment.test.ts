@@ -732,14 +732,30 @@ const DOCKER_USES_PREFIX = "docker://";
  * いたときは正当な形に直しようの無い要求を出していたが、その利用側はもう無い)。
  */
 function isNodeImage(image: string): boolean {
+  // 名前が node のものだけを node イメージとして扱う (node-tools 等は拾わない)
+  return parseImageReference(image).repository === "node";
+}
+
+/**
+ * コンテナイメージの参照を、**リポジトリ名とタグ**に割る。
+ *
+ * **割り方を 1 か所に置く。** 以前は `isNodeImage` と `nodeMajorOfDockerfileText` が
+ * 「ダイジェストを落とす → 最後のパス要素を取る」までをそれぞれ書き写しており、
+ * 片方だけ文法の解釈を直すと**「node の段だと判定した参照から、別の部分文字列を
+ * タグとして読む」**という静かな食い違いになる (このファイルが `usesOf` /
+ * `stepRecordsOf` / `isPlainMapping` について繰り返し書いている形そのもの)。
+ *
+ * **最後のパス要素だけを見るのが要点。** 参照全体を `:` で割ると
+ * `registry.corp.example:5000/node:26` のポート番号 (5000) をタグと読み違える
+ * (実測で「Dockerfile=5000」と報告された)。
+ */
+function parseImageReference(image: string): { repository: string; tag: string } {
   // ダイジェスト指定 (`@sha256:...`) が付いていれば切り落とす
   const withoutDigest = image.split("@")[0];
   // レジストリ・名前空間を落として、最後のパス要素だけを取り出す
   const lastSegment = withoutDigest.split("/").pop() ?? "";
-  // タグ (`:20-alpine`) を落として、リポジトリ名だけにする
-  const repository = lastSegment.split(":")[0];
-  // 名前が node のものだけを node イメージとして扱う (node-tools 等は拾わない)
-  return repository === "node";
+  // 最後のパス要素を `:` で割り、前半をリポジトリ名・後半をタグとして返す
+  return { repository: lastSegment.split(":")[0], tag: lastSegment.split(":")[1] ?? "" };
 }
 
 /**
@@ -1083,24 +1099,29 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
     ]
       .filter((scope) => declaresPathEnv(scope.holder))
       .map((scope) => scope.label);
+    // **独立した指摘は 1 度にまとめて出す。** 1 件ずつ早期 return すると、
+    // 「env: PATH: を宣言していて、かつ setup-node も無い」ジョブは直して push する
+    // たびに次の 1 件が出る = CI の巡が増える (上位の expect.soft を soft にしている
+    // 理由とまったく同じ事情が、1 段下に残っていた)。
+    // **一方、並び順の判定はまとめない** — 「検証が setup-node より前」のような形は
+    // その帰結として「検証より後ろに差し替えうるステップがある」も同時に成り立ち、
+    // 束ねると原因ではない派生の指摘が混ざって直す先が分かりにくくなる
+    const reasons: string[] = [];
     if (scopedPathEnv.length > 0) {
-      return [
-        {
-          file: job.file,
-          job: job.name,
-          reason: `${scopedPathEnv.join(" / ")}単位の env: で PATH を宣言している (そのジョブの全ステップの探索パスが変わる)`,
-        },
-      ];
+      reasons.push(
+        `${scopedPathEnv.join(" / ")}単位の env: で PATH を宣言している (そのジョブの全ステップの探索パスが変わる)`,
+      );
     }
     // 必ず効く setup-node の位置 (if: / continue-on-error 付きは数えない)
     const setupIndex = steps.findIndex(isUnconditionalSetupNode);
     // 無条件の setup-node が 1 つも無い場合は、条件付きの有無で文言を分ける
     if (setupIndex === -1) {
       // setup-node 自体はあるなら、書き忘れではなく「効かない置き方」だと伝える
-      const reason = steps.some(isSetupNodeStep)
-        ? "setup-node に if: / continue-on-error が付いている (効かなくても後続が走る)"
-        : "setup-node が無い";
-      return [{ file: job.file, job: job.name, reason }];
+      reasons.push(
+        steps.some(isSetupNodeStep)
+          ? "setup-node に if: / continue-on-error が付いている (効かなくても後続が走る)"
+          : "setup-node が無い",
+      );
     }
     // **実行時検証も同じジョブで、無条件・setup-node より後ろに置く。**
     // 「どこかの 1 ジョブが走らせていればよい」にすると、スイートを走らせる 2 本目の
@@ -1112,10 +1133,17 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
     // 1 つも無ければ、そのジョブは「宣言として見えない形」を何も検証していない
     if (verifierIndex === -1) {
       // 実体が無いのか、条件付きなのかを文言で分ける
-      const reason = steps.some(invokesRuntimeVerifier)
-        ? `${RUNTIME_VERIFIER} に if: / continue-on-error が付いている`
-        : `${RUNTIME_VERIFIER} を実行していない`;
-      return [{ file: job.file, job: job.name, reason }];
+      reasons.push(
+        steps.some(invokesRuntimeVerifier)
+          ? `${RUNTIME_VERIFIER} に if: / continue-on-error が付いている`
+          : `${RUNTIME_VERIFIER} を実行していない`,
+      );
+    }
+    // **ここまでの指摘は独立しているので、あればまとめて返す。**
+    // 以降の判定は setup-node と実行時検証の**位置**を見るので、どちらかが
+    // 見つかっていない状態では成り立たない (比べる土台が無い)
+    if (reasons.length > 0) {
+      return [{ file: job.file, job: job.name, reason: reasons.join(" / ") }];
     }
     // **検証は、それだけのステップに置く。** スイートと同じ `run:` にまとめられると
     // 並び順の要求 (下の 2 つ) がステップの粒度でしか効かず、一度も発火しないまま
@@ -1333,12 +1361,10 @@ function nodeMajorOfDockerfileText(text: string): number | null {
     if (image.includes("$")) return null;
     // 公式の node イメージでなければ対象外 (ビルドに使う別イメージの段は見ない)
     if (!isNodeImage(image)) continue;
-    // タグから major を取り出す。**最後のパス要素だけを見る** —
-    // 参照全体を `:` で割ると `registry.corp.example:5000/node:26` の
-    // ポート番号 (5000) を major と読み違える (実測で「Dockerfile=5000」と報告された)
-    const lastSegment = image.split("@")[0].split("/").pop() ?? "";
-    const tag = lastSegment.split(":")[1] ?? "";
-    const major = tag.match(/^(\d+)/);
+    // タグから major を取り出す。割り方は isNodeImage と同じ 1 か所に任せる
+    // (書き写すと「node の段だと判定した参照から別の部分文字列をタグとして読む」
+    //  という静かな食い違いになる。詳細は parseImageReference の docstring)
+    const major = parseImageReference(image).tag.match(/^(\d+)/);
     // **読めない段は黙って飛ばさない。** `node:lts-alpine` / `node@sha256:...` /
     // タグ無しの `FROM node` は major を取り出せないが、飛ばすと残りの段だけで
     // 「揃っている」ことになり、まさに検出したい多段ビルドのドリフトが素通りする
@@ -1639,30 +1665,42 @@ describe("実行する Node の major を宣言しているすべての場所の
     const workflows = workflowScan;
     // 走査の前提 (置き場が読める・読めない 1 本が無い) を先に確かめる
     expectWorkflowScanUsable(workflows);
-    // 実行時検証を**無条件で**走らせ、かつ**絞り込み無しの pull_request** で
-    // 起動するワークフローにあるジョブを集める。
-    // ジョブ側の gate (`if:` / `needs:` / `continue-on-error`) は
-    // collectJobsMissingSetupNode が落とすので、ここでは見ない (§6 DRY)
+    // **絞り込み無しの pull_request で起動し、検証済みの Node で実際の処理を走らせる**
+    // ジョブを集める。ジョブ側の gate (`if:` / `needs:` / `continue-on-error`) や
+    // setup-node の置き方は collectJobsMissingSetupNode が落とすので見ない (§6 DRY)
     const verifiedOnPullRequest = workflows.jobs
-      .filter(
-        (job) =>
-          triggersOnEveryPullRequest(job.workflowTriggers) &&
-          (stepRecordsOf(job) ?? []).some(
-            (step) => invokesRuntimeVerifier(step) && isUnconditionalStep(step),
-          ),
-      )
+      .filter((job) => {
+        // まずワークフローが全 PR で起動すること
+        if (!triggersOnEveryPullRequest(job.workflowTriggers)) return false;
+        // steps を持たないジョブ (再利用可能ワークフローの呼び出し) は中身を読めない
+        const steps = stepRecordsOf(job) ?? [];
+        // 実行時検証を無条件で走らせていること
+        if (!steps.some((step) => invokesRuntimeVerifier(step) && isUnconditionalStep(step))) {
+          return false;
+        }
+        // **検証だけのジョブでは足りない。** 「検証を走らせるジョブが PR にある」まで
+        // しか求めないと、`ci.yml` を [checkout, setup-node, 検証] だけに削り、
+        // lint / typecheck / test / e2e を `on: workflow_dispatch` の 2 本目へ移すと、
+        // 両方のジョブが個別の検査を満たすため**どの PR でも実際の検証が走らないのに
+        // 全件緑**になった (実測)。検証済みの Node で**検証以外の処理**も走ること
+        // まで求める
+        return steps.some((step) => runsRepositoryCode(step) && !invokesRuntimeVerifier(step));
+      })
       .map((job) => `${job.file}: ${job.name}`);
     // 1 つも無ければ、綴りに依存しない最後の砦が**どの PR でも走らない**。
     // ジョブ側の置き方をいくら検査しても、走らなければ何も担保しない
     expect(
       verifiedOnPullRequest,
-      `${RUNTIME_VERIFIER} を無条件で走らせるジョブが、絞り込みの無い on: pull_request で` +
-        "起動するワークフローに 1 つも無い。" +
+      `${RUNTIME_VERIFIER} を無条件で走らせ、検証済みの Node で検証以外の処理も走らせるジョブが、` +
+        "絞り込みの無い on: pull_request で起動するワークフローに 1 つも無い。" +
         "ジョブ単位の if: / needs: / continue-on-error は別の検査が落とすが、" +
         "その外側にある on: を絞ると、置き方が正しいまま検証がどの PR でも走らなくなる " +
         "(paths-ignore や types: を足した場合は「条件に当たらない PR だけ検証されない」" +
         "という、より見つけにくい同じ穴になる)。" +
-        "検証を走らせるワークフローの on: には、値を書かない pull_request: を置くこと。",
+        "検証を走らせるワークフローの on: には、値を書かない pull_request: を置くこと。" +
+        "**残る境界**: 「検証以外の処理」を構造から見分けることはできないので、" +
+        "PR で走るジョブに `run: echo hi` を 1 つ足せばこの検査は満たせる " +
+        "(run: の中身を解釈しない方針の帰結。増えたことに気付くための網であって証明ではない)。",
     ).not.toEqual([]);
   });
 
@@ -2051,7 +2089,13 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
     },
 
     // --- setup-node の有無と位置 ---
-    { label: "setup-node が無い", jobs: [jobOf({ steps: [{ run: "npm ci" }] })], expected: named("setup-node が無い") },
+    {
+      // **独立した指摘はまとめて 1 度に出す。** setup-node も実行時検証も無いジョブで
+      // 1 件ずつしか出さないと、直して push するたびに次の 1 件が出る (CI の巡が増える)
+      label: "setup-node も実行時検証も無い",
+      jobs: [jobOf({ steps: [{ run: "npm ci" }] })],
+      expected: named(`setup-node が無い / ${RUNTIME_VERIFIER} を実行していない`),
+    },
     {
       // `npm ci` はランナー既定の Node で走り、そこで入る node_modules は検証していない
       // Node のもの。**件数だけでなく理由まで固定する** — 件数だけだと、どの判定が
@@ -2256,6 +2300,16 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
       expected: [],
     },
     {
+      // **独立した指摘はまとめて 1 度に出す** (直して push するたびに次の 1 件が
+      // 出る = CI の巡が増える、という上位の expect.soft と同じ事情の 1 段下)
+      label: "ジョブ env: PATH: と setup-node 欠落が同時に成り立つ",
+      jobs: [jobOf({ env: { PATH: "/opt/node20/bin:/usr/bin" }, steps: [{ run: "npm ci" }] })],
+      expected: named(
+        "ジョブ単位の env: で PATH を宣言している (そのジョブの全ステップの探索パスが変わる)" +
+          ` / setup-node が無い / ${RUNTIME_VERIFIER} を実行していない`,
+      ),
+    },
+    {
       label: "PATH 以外のジョブ env:",
       jobs: [jobOf({ env: { CI: "true" }, steps: compliantSteps })],
       expected: [],
@@ -2415,8 +2469,13 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
       { file: "synthetic.yml", job: "job", location: "docker://hadolint/hadolint:latest" },
     ]);
     // setup-node 側も、重複除けを渡さなければ同じジョブを名指しする
+    // (独立した指摘なので setup-node と実行時検証はまとめて 1 件に出る)
     expect(collectJobsMissingSetupNode([mixed])).toEqual([
-      { file: "synthetic.yml", job: "job", reason: "setup-node が無い" },
+      {
+        file: "synthetic.yml",
+        job: "job",
+        reason: `setup-node が無い / ${RUNTIME_VERIFIER} を実行していない`,
+      },
     ]);
     // **イメージだけのジョブは、setup-node 側が二重に名指しすることはない。**
     // `run:` もローカル action も無いので `firstRepoCode === -1` で素通りする —
@@ -2563,9 +2622,17 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
 //
 // 判定は**本物のスクリプトを別プロセスで起動して**行う。中身を読んで真似ると、
 // 「テストの中の写し」が緑になるだけでスクリプト本体の退行を拾えない。
-// 実行時検証スクリプトを起動するときの打ち切り時間。即座に終わる処理なので
-// 十分に長く、それでいて「返らなくなった」ことが CI を止めずに分かる長さにする
-const VERIFIER_TIMEOUT_MS = 30_000;
+// 実行時検証スクリプトを起動するときの打ち切り時間。
+// **vitest の既定のテスト時間 (5s) より短くする。** 長くすると、約束した
+// 「スクリプトが … 以内に終わらず SIGTERM で打ち切られた」という名前付きの診断が
+// **原理的に出せない** — spawnSync はワーカーのスレッドを同期的に塞ぐので vitest は
+// 割り込めず、先にテスト側の時間切れ (「test timed out in 5000ms」) になってしまう。
+// スクリプトはミリ秒で終わる処理なので、この値でも十分に余裕がある
+const VERIFIER_TIMEOUT_MS = 3_000;
+// スクリプトを起動する it に与える時間。1 回の起動あたり VERIFIER_TIMEOUT_MS が
+// 上限で、いちばん多い it は 10 回まわすので、全部が時間切れになっても
+// 打ち切りの診断が出るだけの余裕を持たせる (既定の 5s では足りない)
+const VERIFIER_SUITE_TIMEOUT_MS = 60_000;
 
 describe("実行時検証スクリプトそのものの挙動", () => {
   // スクリプト本体の絶対パス (起動するのは常にこの**実物**)
@@ -2658,7 +2725,7 @@ describe("実行時検証スクリプトそのものの挙動", () => {
     expect(runVerifier(`v${runningMajor}`).status).toBe(0);
     // 前後の空白・末尾改行は落として読む (エディタが付けるため)
     expect(runVerifier(`  ${runningMajor}\n`).status).toBe(0);
-  });
+  }, VERIFIER_SUITE_TIMEOUT_MS);
 
   it("major が違えば落ち、どちらがどうずれているかを出す", () => {
     // 走っている Node とは違う major を書いた場合
@@ -2671,7 +2738,7 @@ describe("実行時検証スクリプトそのものの挙動", () => {
     // `.nvmrc` の値を文言から落とす退行が起きても両方の検査が通ってしまう
     expect(run.output).toContain(process.versions.node);
     expect(run.output).toContain(`.nvmrc (${otherMajor})`);
-  });
+  }, VERIFIER_SUITE_TIMEOUT_MS);
 
   it("`.nvmrc` の形が読めなければ、検証せずに落ちる (fail-closed)", () => {
     // 読めない書き方を並べる (小数点付き・コメント付き・空・数字でない)
@@ -2683,7 +2750,7 @@ describe("実行時検証スクリプトそのものの挙動", () => {
       // 何が入っていたかを添えているので、直す先が分かる
       expect(run.output).toContain(FORMAT_ERROR_MARKER);
     }
-  });
+  }, VERIFIER_SUITE_TIMEOUT_MS);
 
   it("`.nvmrc` が無ければ落ち、実行機の絶対パスを出さない", () => {
     // ファイルを置かずに起動する (削除・改名・権限の事故を再現)
@@ -2697,7 +2764,7 @@ describe("実行時検証スクリプトそのものの挙動", () => {
     expect(run.output, `実行機の絶対パスが出力に混ざっている: ${run.output}`).not.toContain(
       tmpdir(),
     );
-  });
+  }, VERIFIER_SUITE_TIMEOUT_MS);
 
   it("`.nvmrc` の書式解釈が、検査側と実行時検証で一致している", () => {
     // **同じ `.nvmrc` を読む手が 2 つある。** 検査側 (parseNvmrcMajor) と
@@ -2750,5 +2817,5 @@ describe("実行時検証スクリプトそのものの挙動", () => {
           `${run.status === 0 ? "成功" : "失敗"} した: ${run.output.trim()}`,
       ).toBe(shouldPass);
     }
-  });
+  }, VERIFIER_SUITE_TIMEOUT_MS);
 });
