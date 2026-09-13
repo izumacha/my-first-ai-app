@@ -1409,7 +1409,9 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
           ? "setup-node に if: / continue-on-error が付いている (効かなくても後続が走る)"
           : "setup-node が無い",
       );
-    } else if (setupIndex > firstRepoCode && !isVerifierOnlyStep(steps[firstRepoCode])) {
+    } else if (
+      steps.slice(0, setupIndex).some((step) => runsRepositoryCode(step) && !isVerifierOnlyStep(step))
+    ) {
       // **「setup-node より前にリポジトリのコードがある」ことを、検証の有無に関わらず
       // 名指しする。** これが根本原因 (`npm ci` がランナー既定の Node で走り、
       // そこで入る node_modules は検証していない Node のもの) なのに、以前は
@@ -1417,13 +1419,16 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
       // 1 巡目に「検証がリポジトリのコードより後ろ」、直すと 2 巡目に「検証が
       // setup-node より前」と出て、**3 巡かけても setup-node の位置は一度も
       // 名指しされない** (docstring は名指しすると書いているのに = 実測)。
-      // **先頭のリポジトリのコードが「検証だけのステップ」のときだけ出さない** — その形
-      // (`[検証, setup-node, npm ci]`) は下の並び順の判定がより具体的な文言で
-      // 名指しするので、ここで出すと同じ誤りを 2 通りの言い方で報告することになる。
-      // **`invokesRuntimeVerifier` で判定してはいけない** — 検証を他の処理と同じ
+      // **判定は「setup-node より前に、検証以外のリポジトリのコードがあるか」で行う。**
+      // 先頭 1 つ (`steps[firstRepoCode]`) だけを見る形だと、検証がたまたま先頭に
+      // 来ているだけで抑止され、`[検証, npm ci, setup-node, npm test]` の
+      // `npm ci` がランナー既定の Node で走ることを名指ししない (実測。しかも検証に
+      // `if:` が付くと、その巡は「検証に if: が付いている」しか出ずさらに 1 巡増える)。
+      // **`invokesRuntimeVerifier` で判定してもいけない** — 検証を他の処理と同じ
       // `run:` にまとめた形 (`[run: npm ci + 検証, setup-node, npm test]`) まで
-      // 抑止され、根本原因 (`npm ci` がランナー既定の Node で走る) が名指しされない。
-      // まとめ書きを直して push した**次の巡**にようやく出る形になっていた (実測)
+      // 抑止され、同じく根本原因が名指しされない (実測)。
+      // 抑止されるのは `[検証, setup-node, npm ci]` のように**検証だけのステップしか
+      // 前に無い**形で、そこは下の並び順の判定がより具体的な文言で名指しする
       reasons.push(
         "setup-node がリポジトリのコードより後ろにある (先に走る処理はランナー既定の Node で動く)",
       );
@@ -2217,24 +2222,27 @@ describe("実行する Node の major を宣言しているすべての場所の
     // 道連れになり、`@types/node` のエントリの隣に空要素 `-` が増えても
     // 件数が変わらないまま全検査が緑になる (実際にそうなる形を eslint 側のコメントが
     // fail-closed として扱っている)
-    // npm ブロックと docker ブロックの両方を数える (保留を置いているのはこの 2 つ)
-    const unreadableElementCount =
-      countUnreadableElements(
-        (dependabotRead.value ?? {}) as DependabotConfig,
-        NPM_ECOSYSTEM,
-        NPM_DIRECTORY,
-      ) +
-      countUnreadableElements(
-        (dependabotRead.value ?? {}) as DependabotConfig,
-        DOCKER_ECOSYSTEM,
-        DOCKER_DIRECTORY,
-      );
-    // 1 つでもあれば、意図して書いた形ではないので落とす (fail-closed)
-    expect(
-      unreadableElementCount,
-      "dependabot.yml に、この検査が黙って読み飛ばす形の要素がある (空のリスト要素 `-`、リストでない ignore / directories、文字列でない dependency-name など)。" +
-        "件数が変わらないまま設定だけが壊れるので、書いた形のまま読めるように直すこと。",
-    ).toBe(0);
+    // 保留を置いている 2 つのブロックを、**エコシステムごとに**数える。
+    // **合算しない** — この数え手は「`updates` がリストか」「リストの要素が対応表か」
+    // 「`package-ecosystem` が文字列か」というエコシステムに依らない節も含むので、
+    // 2 回呼んで足すと**同じ 1 件を 2 回数える**（無関係な github-actions ブロックの
+    // 壊れも両方に計上される）。`.toBe(0)` なので合否は変わらないが、数そのものが
+    // 意味を失い、数え手の docstring（「どう転んでも読まない場所は数えない」）とも
+    // 食い違う。ブロックごとに 0 を求めれば、どちらの数も素直に読める
+    const config = (dependabotRead.value ?? {}) as DependabotConfig;
+    // 落ちたときにどちらのブロックかが分かるよう、対象ごとに表明する
+    for (const [ecosystem, directory] of [
+      [NPM_ECOSYSTEM, NPM_DIRECTORY],
+      [DOCKER_ECOSYSTEM, DOCKER_DIRECTORY],
+    ] as const) {
+      // 1 つでもあれば、意図して書いた形ではないので落とす (fail-closed)
+      expect(
+        countUnreadableElements(config, ecosystem, directory),
+        `dependabot.yml の ${ecosystem} / ${directory} に、この検査が黙って読み飛ばす形の要素がある ` +
+          "(空のリスト要素 `-`、リストでない ignore / directories、文字列でない dependency-name など)。" +
+          "件数が変わらないまま設定だけが壊れるので、書いた形のまま読めるように直すこと。",
+      ).toBe(0);
+    }
   });
 
   it("@types/node の major 更新を止める ignore が、npm の対象ディレクトリに 1 件だけある", () => {
@@ -2645,6 +2653,45 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
       ],
       expected: named(
         `${RUNTIME_VERIFIER} が他の処理と同じ run: にまとめられている (先に走った処理の Node が分からない)`,
+      ),
+    },
+    {
+      // **検証がたまたま先頭でも、その後ろの `npm ci` は名指しする。**
+      // 先頭 1 つだけを見る形だと抑止され、`npm ci` がランナー既定の Node で
+      // 走ることを一度も言わないまま巡が増えていた (実測)
+      label: "検証の後ろ・setup-node の前に別の run: がある",
+      jobs: [
+        jobOf({
+          steps: [
+            { run: "node scripts/verify-node-major.mjs" },
+            { run: "npm ci" },
+            setupNodeStep,
+            { run: "npm run test" },
+          ],
+        }),
+      ],
+      expected: named(
+        "setup-node がリポジトリのコードより後ろにある (先に走る処理はランナー既定の Node で動く)" +
+          ` / ${RUNTIME_VERIFIER} が setup-node より前にある (用意した Node を検証していない)`,
+      ),
+    },
+    {
+      // 検証に条件が付いていても、setup-node の位置は同じ巡で名指しする
+      // (以前はこの形だと「検証に if: が付いている」しか出なかった＝実測)
+      label: "条件付きの検証の後ろ・setup-node の前に別の run: がある",
+      jobs: [
+        jobOf({
+          steps: [
+            { run: "node scripts/verify-node-major.mjs", if: "${{ false }}" },
+            { run: "npm ci" },
+            setupNodeStep,
+            { run: "npm run test" },
+          ],
+        }),
+      ],
+      expected: named(
+        "setup-node がリポジトリのコードより後ろにある (先に走る処理はランナー既定の Node で動く)" +
+          ` / ${RUNTIME_VERIFIER} に if: / continue-on-error が付いている`,
       ),
     },
     {
