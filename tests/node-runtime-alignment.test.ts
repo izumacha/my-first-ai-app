@@ -324,7 +324,13 @@ interface WorkflowListing {
 function listWorkflowFiles(): WorkflowListing {
   try {
     // 拡張子が .yml / .yaml のものだけを対象にする (README などを YAML として解釈しない)
-    const files = readdirSync(WORKFLOWS_DIR).filter((name) => /\.ya?ml$/i.test(name));
+    // **並べ替える。** readdirSync の順序はファイルシステム依存で、2 本目の
+    // ワークフローができた途端に失敗文言の中の名前の並びが CI と手元で食い違う。
+    // 貼り付けた失敗文言が手元の再現と文字どおり一致しなくなるのは、
+    // describeReadError / displayPath で潰したのと同じ種類の摩擦
+    const files = readdirSync(WORKFLOWS_DIR)
+      .filter((name) => /\.ya?ml$/i.test(name))
+      .sort();
     // 読めたので、原因は無しとして返す
     return { files, error: null };
   } catch (error) {
@@ -607,6 +613,25 @@ function declaresPathEnv(step: Record<string, unknown>): boolean {
 }
 
 /**
+ * ジョブの `container.options` が `--env PATH=…` で探索パスを宣言しているか。
+ *
+ * **`container.env` と同じ経路がもう 1 つある。** `options` はそのまま
+ * `docker create` へ渡されるので、`--env PATH=/opt/node20/bin:…` と書けば
+ * そのコンテナで走る**全ステップ**が同じ PATH を継ぐ — `container.env` を
+ * 塞いだ理由（「1 つでも読み落とすと、そこへ書き換えるだけで迂回できる」）が
+ * そのまま当てはまる。実測でも、これだけは全件緑のまま通っていた。
+ *
+ * 文字列をそのまま見るので網羅的な解析ではないが、**誤りは赤へ倒れる**側
+ * （拾いすぎても「宣言しない」で直せる）で、見逃す側には転ばない。
+ */
+function declaresPathInContainerOptions(container: Record<string, unknown>): boolean {
+  // options が文字列でなければ、宣言として読める PATH は無い
+  if (typeof container.options !== "string") return false;
+  // `--env PATH=` / `--env=PATH=` / `-e PATH=` / `-e=PATH=` のいずれかを探す
+  return /(^|\s)(--env|-e)[\s=]+PATH=/i.test(container.options);
+}
+
+/**
  * GitHub が**名前で解決する**シェルの一覧 (これ以外は独自のコマンドテンプレート)。
  *
  * 名前で指定する形 (`shell: bash`) はごく普通の書き方で、Node の探索パスを
@@ -649,18 +674,51 @@ function declaresCustomDefaultShell(holder: Record<string, unknown>): boolean {
 }
 
 /**
+ * 差し替えうるステップの一覧に対して、**当てはまる直し方をすべて**並べる。
+ *
+ * ローカル action (`uses: ./...`) は位置を変えて直せない (それ自身がリポジトリの
+ * コードなので、前へ出せば「検証より前」、後ろへ出そうにも自分が最後になる) ので、
+ * 別の案内が要る。第三者アクション・`env: PATH:`・独自の `shell:` は位置で直せる。
+ * 両方が混ざっているときに片方しか出さないと、直して push した次の巡ではじめて
+ * 残りの案内が出る (この差分がまさに減らそうとしている「CI の巡が増える」形)。
+ */
+function describeSwapperAdvice(swappers: readonly Record<string, unknown>[]): string {
+  // 当てはまる案内を溜める入れ物
+  const advice: string[] = [];
+  // ローカル action が混ざっているか
+  if (swappers.some((step) => usesOf(step).startsWith("./"))) {
+    advice.push("ローカル action の中身は読めないので、Node を使う処理はジョブ側の run: で行うこと");
+  }
+  // 位置を変えれば直せるものが混ざっているか
+  if (swappers.some((step) => !usesOf(step).startsWith("./"))) {
+    advice.push(
+      "Node と無関係なステップ (actions/cache 等) なら、検証より前か、" +
+        "最後にリポジトリのコードを実行するステップより後ろへ移すこと",
+    );
+  }
+  // 1 つの文字列にして返す (1 件だけなら従来どおりの文言になる)
+  return advice.join(" / ");
+}
+
+/**
  * 差し替えうるステップを、失敗文言に出す 1 つの語句にする。
  *
  * `uses:` ならその参照を、`env: PATH:` ならその旨を出す (どちらを直せばよいか分かるように)。
  */
 function describeSwapper(step: Record<string, unknown>): string {
+  // 当てはまる経路を溜める入れ物
+  const channels: string[] = [];
   // uses: があるならそれを見せる (ワークフローを grep して見つけられる綴りのまま)
   const uses = usesOf(step);
-  if (uses !== "") return uses;
-  // 独自のシェルなら、その旨を伝える (直す先が env: とは別のキーなので分ける)
-  if (declaresCustomShell(step)) return "独自の shell: の指定";
-  // 残るは env: PATH: の指定
-  return "env: PATH: の指定";
+  if (uses !== "") channels.push(uses);
+  // 独自のシェルなら、その旨も伝える (直す先が別のキーなので分ける)
+  if (declaresCustomShell(step)) channels.push("独自の shell: の指定");
+  // env: PATH: の指定も同様
+  if (declaresPathEnv(step)) channels.push("env: PATH: の指定");
+  // **最初の 1 つで打ち切らない。** `uses: ./local-action` と `env: PATH:` を
+  // 両方持つステップを `uses:` だけで説明すると、読み手は案内どおり `run:` へ
+  // 直したうえで `env:` を残し、**次の CI の巡で同じステップがまた名指しされる**
+  return channels.join(" + ");
 }
 
 /** そのステップが `actions/setup-node` を呼んでいるか。 */
@@ -786,6 +844,21 @@ const DOCKER_USES_PREFIX = "docker://";
 function isNodeImage(image: string): boolean {
   // 名前が node のものだけを node イメージとして扱う (node-tools 等は拾わない)
   return parseImageReference(image).repository === "node";
+}
+
+/**
+ * イメージ参照の中の `$NAME` / `${NAME}` を、集めた `ARG` の既定値で展開する。
+ *
+ * **展開しきれない変数はそのまま残す。** 呼び出し側はそれを「読めない段」の目印に
+ * 使うので、ここで勝手に空文字へ潰すと `FROM $BASE` が `FROM` に化けて
+ * 「イメージ名の無い壊れた行」として黙って飛ばされてしまう (fail-open)。
+ */
+function expandArgs(image: string, argDefaults: ReadonlyMap<string, string>): string {
+  // `${NAME}` と `$NAME` の両方の書き方を、既定値が分かっているものだけ置き換える
+  return image.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g, (whole, braced, bare) =>
+    // 既定値があればその値に、無ければ元の綴りのまま残す (読めない段の目印になる)
+    argDefaults.get(braced ?? bare) ?? whole,
+  );
 }
 
 /**
@@ -1144,12 +1217,14 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
     // 迂回できる = 塞いだつもりの穴が別のキーで開いたままになる)。
     // `container:` が文字列 (`container: node:20`) のときは `env:` を持ちようがなく、
     // `asRecord` が空の対応表に潰すので何も宣言していない扱いになる
+    // コンテナの定義 (文字列で書かれていれば空の対応表になる)
+    const container = asRecord(job.definition.container);
     const scopedPathEnv = [
-      { label: "ジョブ", holder: job.definition },
-      { label: "ワークフロー", holder: { env: job.workflowEnv } },
-      { label: "コンテナ", holder: asRecord(job.definition.container) },
+      { label: "ジョブ", declared: declaresPathEnv(job.definition) },
+      { label: "ワークフロー", declared: declaresPathEnv({ env: job.workflowEnv }) },
+      { label: "コンテナ", declared: declaresPathEnv(container) },
     ]
-      .filter((scope) => declaresPathEnv(scope.holder))
+      .filter((scope) => scope.declared)
       .map((scope) => scope.label);
     // **独立した指摘は 1 度にまとめて出す。** 1 件ずつ早期 return すると、
     // 「env: PATH: を宣言していて、かつ setup-node も無い」ジョブは直して push する
@@ -1164,14 +1239,31 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
         `${scopedPathEnv.join(" / ")}単位の env: で PATH を宣言している (そのジョブの全ステップの探索パスが変わる)`,
       );
     }
+    // **`container.options` も同じ経路。** `--env PATH=…` は `docker create` へ
+    // そのまま渡るので、そのコンテナで走る全ステップが継ぐ — `container.env` を
+    // 塞いだ理由 (「1 つでも読み落とすと、そこへ書き換えるだけで迂回できる」) が
+    // そのまま当てはまる (実測で全件緑だった)。**`env:` とは別の理由にする** —
+    // 直す先が別のキーなので、`env:` の文言に混ぜると直し方が伝わらない
+    if (declaresPathInContainerOptions(container)) {
+      reasons.push(
+        "container.options で PATH を宣言している (そのコンテナで走る全ステップの探索パスが変わる)",
+      );
+    }
     // **ステップより広い `defaults.run.shell` も同じ扱い。** その範囲の全 `run:` の
     // 実行シェルそのものを差し替えるので、広い側で Node 20 を先頭に置く独自シェルを
     // 宣言し、実行時検証のステップだけ `shell: bash` で戻す 2 段構えにすると、
     // `env: PATH:` のときとまったく同じ形で両方の網が緑のままになる (実測)。
     // `container:` には `defaults:` が無いので、ここは 2 つのスコープだけを見る
-    const scopedShell = ["ジョブ", "ワークフロー"].filter((_, index) =>
-      declaresCustomDefaultShell(index === 0 ? job.definition : { defaults: job.workflowDefaults }),
-    );
+    // **`scopedPathEnv` と同じ形にそろえる。** 添字で名前と対象を結ぶ書き方だと、
+    // スコープを 1 つ足すときに名前の一覧と `index === n` の分岐を別々に直すことになり、
+    // 食い違うと**別のスコープの名前で報告される**（`scopedPathEnv` は実際に
+    // この差分で 4 つ目のスコープが増えている）
+    const scopedShell = [
+      { label: "ジョブ", declared: declaresCustomDefaultShell(job.definition) },
+      { label: "ワークフロー", declared: declaresCustomDefaultShell({ defaults: job.workflowDefaults }) },
+    ]
+      .filter((scope) => scope.declared)
+      .map((scope) => scope.label);
     if (scopedShell.length > 0) {
       reasons.push(
         `${scopedShell.join(" / ")}単位の defaults: で独自の shell: を宣言している (そのジョブの全 run: の実行シェルが変わる)`,
@@ -1319,11 +1411,12 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
             // リポジトリのコード**なので、前へ出せば「検証より前」、後ろへ出そうにも
             // 自分が最後のリポジトリのコード — どちらの案内も成立しない。
             // 案内どおりに直せない要求は、いずれ検査ごと緩められる (この repo が
-            // 繰り返し避けている形) ので、取れる手段だけを書く
-            (swappers.some((step) => usesOf(step).startsWith("./"))
-              ? "ローカル action の中身は読めないので、Node を使う処理はジョブ側の run: で行うこと"
-              : "Node と無関係なステップ (actions/cache 等) なら、検証より前か、" +
-                "最後にリポジトリのコードを実行するステップより後ろへ移すこと"),
+            // 繰り返し避けている形) ので、取れる手段だけを書く。
+            // **当てはまるぶんは両方出す** — 片方だけにすると、ローカル action と
+            // `actions/cache` が混ざったときに後者へ案内が付かず、直して push した
+            // 次の巡ではじめて残りの案内が出る (この差分がまさに減らそうとしている
+            // 「CI の巡が増える」形)
+            describeSwapperAdvice(swappers),
       );
     }
     // 位置の判定にはどれも掛からなかった。独立した指摘が残っていればそれを返す
@@ -1409,6 +1502,22 @@ function readDockerfileNodeMajor(): number | null {
 function nodeMajorOfDockerfileText(text: string): number | null {
   // コメントを落としたうえで、すべての `FROM node:<major>` を集める
   const majors = new Set<number>();
+  // **`ARG NAME=既定値` を先に集めておく。** `FROM $BASE` の形を「読めない段」と
+  // 決めつけると、**node と無関係な段** (`ARG GO_VERSION=1.22` + `FROM golang:${GO_VERSION}`)
+  // まで Dockerfile ごと読めない扱いになり、しかも直し方が「無関係な段から ARG を
+  // 消す」しか無い = 直しようの無い要求になる (実測で 7 件が落ちた)。
+  // 既定値で展開してから判定すれば、元の意図 (`ARG BASE=node:20-alpine` +
+  // `FROM $BASE` のドリフト検出) は保ったまま、無関係な段を巻き込まずに済む
+  const argDefaults = new Map<string, string>();
+  // まず ARG の既定値を拾う (Docker では最初の FROM より前の ARG が FROM で使える)
+  for (const line of stripComments(text)) {
+    // `ARG NAME=値` の形だけを対象にする (既定値の無い ARG は展開しようがない)
+    const arg = line.match(/^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)=(.+)$/i);
+    // ARG でなければ次の行へ
+    if (!arg) continue;
+    // 値の前後の空白と引用符を落として控える
+    argDefaults.set(arg[1], arg[2].trim().replace(/^["']|["']$/g, ""));
+  }
   for (const line of stripComments(text)) {
     // 行頭の FROM 命令だけを対象にする (大文字小文字は Docker 側が区別しない)
     const matched = line.match(/^\s*FROM\s+(.+)$/i);
@@ -1421,19 +1530,22 @@ function nodeMajorOfDockerfileText(text: string): number | null {
       .find((word) => !word.startsWith("--"));
     // イメージ名が無い行 (壊れた FROM) は対象外
     if (image === undefined) continue;
-    // **変数で書いた段は「読めない段」として落とす。** `ARG BASE=node:20-alpine` +
-    // `FROM $BASE AS tools` は、名前が `node` と一致しないので「別イメージの段」に
-    // 見えて黙って飛ばされていた — 残りの段だけで「揃っている」ことになり、
-    // **まさに検出したい多段ビルドのドリフトが素通りする** (下の `node:lts-alpine` /
-    // ダイジェスト指定を fail-closed にしているのと同じ事情。同じ class の
-    // 「読めなさ」を、綴りが `node` で始まるかどうかで 2 通りに扱わない)
-    if (image.includes("$")) return null;
+    // **変数は ARG の既定値で展開してから判定する。** `ARG BASE=node:20-alpine` +
+    // `FROM $BASE AS tools` を「別イメージの段」として黙って飛ばすと、残りの段だけで
+    // 「揃っている」ことになり**まさに検出したい多段ビルドのドリフトが素通りする**。
+    // かといって `$` を含む段を一律に「読めない段」とすると、node と無関係な段まで
+    // 巻き込んで直しようの無い要求になる (実測)。展開すればどちらも避けられる
+    const resolved = expandArgs(image, argDefaults);
+    // **展開しきれない段だけを「読めない段」として落とす** (既定値の無い `ARG BASE` +
+    // `FROM $BASE` は `--build-arg` 次第で node にも別イメージにもなり、
+    // どちらか決められない。ここは fail-closed に倒す)
+    if (resolved.includes("$")) return null;
     // 公式の node イメージでなければ対象外 (ビルドに使う別イメージの段は見ない)
-    if (!isNodeImage(image)) continue;
+    if (!isNodeImage(resolved)) continue;
     // タグから major を取り出す。割り方は isNodeImage と同じ 1 か所に任せる
     // (書き写すと「node の段だと判定した参照から別の部分文字列をタグとして読む」
     //  という静かな食い違いになる。詳細は parseImageReference の docstring)
-    const major = parseImageReference(image).tag.match(/^(\d+)/);
+    const major = parseImageReference(resolved).tag.match(/^(\d+)/);
     // **読めない段は黙って飛ばさない。** `node:lts-alpine` / `node@sha256:...` /
     // タグ無しの `FROM node` は major を取り出せないが、飛ばすと残りの段だけで
     // 「揃っている」ことになり、まさに検出したい多段ビルドのドリフトが素通りする
@@ -2397,6 +2509,69 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
       expected: [],
     },
     {
+      // `options` は docker create へそのまま渡るので、そのコンテナで走る
+      // 全ステップが同じ PATH を継ぐ (container.env を塞いだ理由がそのまま当てはまる)
+      label: "コンテナの options に --env PATH=",
+      jobs: [
+        jobOf({
+          container: { image: "node:26-alpine", options: "--env PATH=/opt/node20/bin:/usr/bin" },
+          steps: compliantSteps,
+        }),
+      ],
+      expected: named(
+        "container.options で PATH を宣言している (そのコンテナで走る全ステップの探索パスが変わる)",
+      ),
+    },
+    {
+      // PATH と無関係な options は通す (誤検知を出さない)
+      label: "コンテナの options に PATH 以外",
+      jobs: [
+        jobOf({
+          container: { image: "node:26-alpine", options: "--cpus 2 --env CI=true" },
+          steps: compliantSteps,
+        }),
+      ],
+      expected: [],
+    },
+    {
+      // **当てはまる直し方をすべて出す。** 片方だけだと、直して push した次の巡で
+      // はじめて残りの案内が出る (この差分が減らそうとしている形そのもの)
+      label: "検証より後ろにローカル action と第三者アクションが混ざる",
+      jobs: [
+        jobOf({
+          steps: [
+            setupNodeStep,
+            { run: "node scripts/verify-node-major.mjs" },
+            { uses: "actions/cache@v4" },
+            { uses: "./.github/actions/run-suite" },
+          ],
+        }),
+      ],
+      expected: named(
+        swapperReason(
+          "actions/cache@v4 / ./.github/actions/run-suite",
+          `${LOCAL_ACTION_ADVICE} / ${MOVE_ADVICE}`,
+        ),
+      ),
+    },
+    {
+      // **1 つのステップが 2 つの経路を持つときは両方見せる。** `uses:` だけで
+      // 説明すると、案内どおり run: へ直したうえで env: を残し、次の巡で同じ
+      // ステップがまた名指しされる
+      label: "検証より後ろのステップが uses: と env: PATH: を両方持つ",
+      jobs: [
+        jobOf({
+          steps: [
+            setupNodeStep,
+            { run: "node scripts/verify-node-major.mjs" },
+            { uses: "actions/cache@v4", env: { PATH: "/opt/node20/bin:/usr/bin" } },
+            { run: "npm ci" },
+          ],
+        }),
+      ],
+      expected: named(swapperReason("actions/cache@v4 + env: PATH: の指定", MOVE_ADVICE)),
+    },
+    {
       label: "PATH 以外のコンテナ env:",
       jobs: [
         jobOf({ container: { image: "node:26-alpine", env: { CI: "true" } }, steps: compliantSteps }),
@@ -2706,6 +2881,35 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
       steps: [{ uses: "actions/setup-node@v7", with: { "node-version-file": ".nvmrc" } }],
     });
     expect(collectSetupNodeSteps([plain])[0]?.inputs).toEqual({ "node-version-file": ".nvmrc" });
+  });
+
+  it.each([
+    {
+      label: "ARG の既定値で node の段に解決する (ドリフトを検出する)",
+      text: "ARG BASE=node:20-alpine\nFROM $BASE AS tools\nFROM node:26-alpine AS runner\n",
+      expected: null,
+    },
+    {
+      label: "ARG の既定値で node 以外に解決する段は対象外 (巻き添えにしない)",
+      text: "ARG GO_VERSION=1.22\nFROM golang:${GO_VERSION} AS tools\nFROM node:26-alpine AS runner\n",
+      expected: 26,
+    },
+    {
+      label: "既定値の無い ARG は読めない段 (fail-closed)",
+      text: "ARG BASE\nFROM $BASE AS tools\nFROM node:26-alpine AS runner\n",
+      expected: null,
+    },
+    {
+      label: "ARG で解決した node の段だけでも major を読む",
+      text: "ARG BASE=node:26-alpine\nFROM $BASE AS runner\n",
+      expected: 26,
+    },
+  ])("nodeMajorOfDockerfileText: $label → $expected", ({ text, expected }) => {
+    // **`$` を含む段を一律に落とすと、node と無関係な段まで Dockerfile ごと
+    // 読めない扱いになり、直し方が「無関係な段から ARG を消す」しか無くなる**
+    // (実測で 7 件が落ちた)。ARG の既定値で展開してから判定すれば、元の意図
+    // (ARG 経由の node のドリフト検出) を保ったまま巻き添えを避けられる
+    expect(nodeMajorOfDockerfileText(text)).toBe(expected);
   });
 
   it("readDockerfileNodeMajor が、変数で書いた FROM を読めない段として落とす", () => {
