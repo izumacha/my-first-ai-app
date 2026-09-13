@@ -695,14 +695,26 @@ function describeSwapperAdvice(swappers: readonly Record<string, unknown>[]): st
   if (swappers.some((step) => usesOf(step).startsWith("./"))) {
     advice.push("ローカル action の中身は読めないので、Node を使う処理はジョブ側の run: で行うこと");
   }
-  // 位置を変えれば直せるものが混ざっているか
-  if (swappers.some((step) => !usesOf(step).startsWith("./"))) {
+  // **位置を変えて直せるのは `uses:` のステップだけ。** ローカルでない `uses:` は
+  // 検証より前か、最後のリポジトリのコードより後ろへ移せる
+  if (swappers.some((step) => usesOf(step) !== "" && !usesOf(step).startsWith("./"))) {
     advice.push(
       "Node と無関係なステップ (actions/cache 等) なら、検証より前か、" +
         "最後にリポジトリのコードを実行するステップより後ろへ移すこと",
     );
   }
-  // 1 つの文字列にして返す (1 件だけなら従来どおりの文言になる)
+  // **`env: PATH:` / 独自の `shell:` は「移す」では直せない。** それを載せている
+  // ステップ自身がスイートを走らせている (= 最後のリポジトリのコード) ことが多く、
+  // 前へ出せば検証が最初のリポジトリのコードでなくなり、後ろへ出す先も無い。
+  // 実際に取れる手段は宣言を消すことだけなので、それを案内する
+  // (案内どおりに直せない要求は、いずれ検査ごと緩められる)
+  if (swappers.some((step) => declaresPathEnv(step) || declaresCustomShell(step))) {
+    advice.push(
+      "env: PATH: / 独自の shell: は移しても直らないので、その宣言を消して" +
+        "検証済みの Node をそのまま使うこと",
+    );
+  }
+  // 1 つの文字列にして返す (1 件だけなら 1 文になる)
   return advice.join(" / ");
 }
 
@@ -1733,6 +1745,18 @@ function readReadmeNodeMajor(): number | null {
   // README を読む (読めなければ null)
   const text = readTextOrNull(README_PATH);
   if (text === null) return null;
+  // 中身の解釈は純粋関数へ (規則そのものをテーブル駆動で固定できるようにする)
+  return parseReadmeNodeMajor(text);
+}
+
+/**
+ * README の**中身**から必要環境の major を読み取る (ファイル入出力を伴わない純粋関数)。
+ *
+ * 読み取りから切り離してあるのは、**規則そのものを固定するため**。実際の README は
+ * 常に 1 件しか書いていないので、ファイル経由でしか呼べない形だと
+ * 「1 件のときだけ採用する」という肝心の節を潰しても全件緑で通る (実測)。
+ */
+function parseReadmeNodeMajor(text: string): number | null {
   // 「Node.js 26 系」の形から major を取り出す。
   // **「26 以上」と書かない** — 実際に検証しているのはピン留めした系列だけで、
   // 「以上」は検査より緩い約束になる (読み手が 28 を入れると、`@types/node@^26` の
@@ -2420,6 +2444,10 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
   const MOVE_ADVICE =
     "Node と無関係なステップ (actions/cache 等) なら、検証より前か、" +
     "最後にリポジトリのコードを実行するステップより後ろへ移すこと";
+  // `env: PATH:` / 独自の `shell:` 向けの案内 (移しても直らないので宣言を消す)
+  const DECLARATION_ADVICE =
+    "env: PATH: / 独自の shell: は移しても直らないので、その宣言を消して" +
+    "検証済みの Node をそのまま使うこと";
   // ローカル action 向けの案内 (前にも後ろにも出せないので、別の直し方を示す)
   const LOCAL_ACTION_ADVICE =
     "ローカル action の中身は読めないので、Node を使う処理はジョブ側の run: で行うこと";
@@ -2834,7 +2862,9 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
           ],
         }),
       ],
-      expected: named(swapperReason("actions/cache@v4 + env: PATH: の指定", MOVE_ADVICE)),
+      expected: named(
+        swapperReason("actions/cache@v4 + env: PATH: の指定", `${MOVE_ADVICE} / ${DECLARATION_ADVICE}`),
+      ),
     },
     {
       label: "PATH 以外のコンテナ env:",
@@ -2878,7 +2908,7 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
           ],
         }),
       ],
-      expected: named(swapperReason("独自の shell: の指定", MOVE_ADVICE)),
+      expected: named(swapperReason("独自の shell: の指定", DECLARATION_ADVICE)),
     },
     {
       // 名前で解決する形 (`shell: bash`) はごく普通の書き方で探索パスを変えない。
@@ -3000,7 +3030,7 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
           ],
         }),
       ],
-      expected: named(swapperReason("env: PATH: の指定", MOVE_ADVICE)),
+      expected: named(swapperReason("env: PATH: の指定", DECLARATION_ADVICE)),
     },
     {
       label: "検証より後ろのステップの PATH 以外の env:",
@@ -3138,6 +3168,60 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
     // 実際の ci.yml だけを見ているかぎり全件緑で通った)。
     // 到達集合はその 1 本の起動条件から組み立てる (呼び出し経由は下の it が見る)
     expect(runsVerifiedWorkOnEveryPullRequest(job, pullRequestReachableFiles([job]))).toBe(expected);
+  });
+
+  it.each([
+    // docker の綴り揺れをすべて拾う (同じ宣言が綴りだけで通ったり落ちたりしない)
+    { options: "--env PATH=/opt/node20/bin", expected: true, label: "--env PATH=" },
+    { options: "--env=PATH=/opt/node20/bin", expected: true, label: "--env=PATH=" },
+    { options: "-e PATH=/opt/node20/bin", expected: true, label: "-e PATH=" },
+    { options: "-ePATH=/opt/node20/bin", expected: true, label: "-ePATH= (値を続けて書く形)" },
+    { options: '-e "PATH=/opt/node20/bin:$PATH"', expected: true, label: '-e "PATH=…" (引用符付き)' },
+    { options: "--env 'PATH=/opt/node20/bin'", expected: true, label: "--env 'PATH=…'" },
+    { options: "--cpus 2 --env PATH=/x", expected: true, label: "他のフラグと並ぶ" },
+    // PATH と無関係な指定は拾わない (誤検知を出さない)
+    { options: "--cpus 2 --env CI=true", expected: false, label: "PATH 以外の env" },
+    { options: "--env PATHOLOGY=1", expected: false, label: "PATH で始まる別の名前" },
+    { options: "", expected: false, label: "空" },
+  ])("declaresPathInContainerOptions: $label → $expected", ({ options, expected }) => {
+    // **綴りごとに固定する。** 正規表現を `--env PATH=` だけへ狭める変異が
+    // 全件緑で通っていた (実測) — そのときコンテナ全体の PATH 差し替えが素通りする
+    expect(declaresPathInContainerOptions({ image: "node:26-alpine", options })).toBe(expected);
+  });
+
+  it.each([
+    // 大文字小文字を無視して PATH を見る (GitHub は名前をそのまま渡すので、
+    // Windows ランナーでは `Path` が探索パスとして効く)
+    { env: { PATH: "/x" }, expected: true, label: "PATH" },
+    { env: { Path: "/x" }, expected: true, label: "Path (大文字小文字違い)" },
+    { env: { path: "/x" }, expected: true, label: "path" },
+    // PATH 以外は拾わない
+    { env: { CI: "true" }, expected: false, label: "PATH 以外" },
+    { env: { PATHOLOGY: "1" }, expected: false, label: "PATH で始まる別の名前" },
+  ])("declaresPathEnv: $label → $expected", ({ env, expected }) => {
+    // **大文字小文字を無視する節を固定する。** 完全一致へ変える変異が全件緑で
+    // 通っていた (実測) — そのとき `Path:` の宣言がどの網からも見えなくなる
+    expect(declaresPathEnv({ env })).toBe(expected);
+  });
+
+  it.each([
+    // 1 件だけ書かれているときに採用する
+    { text: "必要環境: Node.js 26 系", expected: 26, label: "1 件だけ" },
+    // **2 件以上あればどれが要件か決められない (fail-closed)。** 先頭を黙って採ると、
+    // 上に過去の言及が増えた瞬間にそちらを現在の要件として読む
+    {
+      text: "Node.js 22 系から移行しました\n\n必要環境: Node.js 26 系",
+      expected: null,
+      label: "過去の言及が上にある",
+    },
+    // 「以上」の形は検査より緩い約束なので受け取らない
+    { text: "必要環境: Node.js 26 以上", expected: null, label: "「以上」の形" },
+    // 1 件も無ければ読めなかった扱い
+    { text: "必要環境: なし", expected: null, label: "書かれていない" },
+  ])("parseReadmeNodeMajor: $label → $expected", ({ text, expected }) => {
+    // 実際の README は常に 1 件なので、**規則そのものは合成した本文でしか固定できない**
+    // (「1 件のときだけ」を「1 件以上」へ緩める変異が全件緑で通っていた＝実測)
+    expect(parseReadmeNodeMajor(text)).toBe(expected);
   });
 
   it("pullRequestReachableFiles が、ローカルの呼び出しをたどって PR に届く範囲を出す", () => {
@@ -3308,6 +3392,23 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
       expected: null,
     },
     {
+      // **`FROM` に使える `ARG` は最初の `FROM` より前のものだけ** (Docker の規則)。
+      // ファイル全体から後勝ちで拾う変異が全件緑で通っていた (実測) — そのとき
+      // 段内の再宣言が最初の `FROM` を別イメージとして読ませ、一貫した Dockerfile を
+      // 「食い違っている」と報告する
+      label: "段の中の ARG 再宣言は、最初の FROM に影響しない",
+      text: "ARG IMG=node:26-alpine\nFROM $IMG AS base\nARG IMG=node:20\nFROM node:26-alpine AS runner\n",
+      expected: 26,
+    },
+    {
+      // **空の既定値は記録しない。** 記録する変異が全件緑で通っていた (実測) —
+      // そのとき `$BASE` が空文字へ潰れて「イメージ名の無い段」として黙って飛ばされ、
+      // --build-arg で node を渡す多段ビルドのドリフトが見えなくなる
+      label: "空の既定値 ARG は読めない段 (fail-closed)",
+      text: "ARG BASE=\nFROM $BASE AS tools\nFROM node:26-alpine AS runner\n",
+      expected: null,
+    },
+    {
       label: "ARG で解決した node の段だけでも major を読む",
       text: "ARG BASE=node:26-alpine\nFROM $BASE AS runner\n",
       expected: 26,
@@ -3444,10 +3545,14 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
 // 判定は**本物のスクリプトを別プロセスで起動して**行う。中身を読んで真似ると、
 // 「テストの中の写し」が緑になるだけでスクリプト本体の退行を拾えない。
 // 実行時検証スクリプトを起動するときの打ち切り時間。
-// **vitest の既定のテスト時間 (5s) より短くする。** 長くすると、約束した
-// 「スクリプトが … 以内に終わらず SIGTERM で打ち切られた」という名前付きの診断が
-// **原理的に出せない** — spawnSync はワーカーのスレッドを同期的に塞ぐので vitest は
-// 割り込めず、先にテスト側の時間切れ (「test timed out in 5000ms」) になってしまう。
+// **必ず「その it に与えた時間 ÷ 起動回数」より短くする。** spawnSync はワーカーの
+// スレッドを同期的に塞ぐので vitest は割り込めず、テスト側の時間切れが先に来ると
+// 約束した「スクリプトが … 以内に終わらず SIGTERM で打ち切られた」という
+// 名前付きの診断が**原理的に出せない**（「test timed out in …」だけが残る）。
+// いま起動する it には下の VERIFIER_SUITE_TIMEOUT_MS (60s) を与えており、
+// いちばん多い it は 10 回まわすので、3s なら全部が時間切れになっても収まる。
+// **どちらかを動かすときは、この関係が保たれているかを必ず確かめること**
+// (既定のまま 5s に戻すなら、この値もそれより短くする必要がある)。
 // スクリプトはミリ秒で終わる処理なので、この値でも十分に余裕がある
 const VERIFIER_TIMEOUT_MS = 3_000;
 // スクリプトを起動する it に与える時間。1 回の起動あたり VERIFIER_TIMEOUT_MS が
