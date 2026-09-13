@@ -978,6 +978,32 @@ function invokesRuntimeVerifier(step: Record<string, unknown>): boolean {
 }
 
 /**
+ * ジョブを**ワークフローごとの「ジョブ名 → 定義」の索引**にまとめる。
+ *
+ * `needs:` をたどる判定 (`jobNeverRunsReason`) は同じワークフローの兄弟ジョブしか
+ * 見てはいけない (ジョブ名はワークフローごとに独立しているので、別ファイルの
+ * 同名ジョブを引くと取り違える)。**利用側が 2 つになったので 1 か所に置く** —
+ * 書き写すと、索引の作り方を直したときに片方だけ取り残される (§6 DRY)。
+ */
+function indexJobsByFile(
+  jobs: readonly WorkflowJob[],
+): Map<string, Map<string, Record<string, unknown>>> {
+  // ファイル名で引ける索引
+  const byFile = new Map<string, Map<string, Record<string, unknown>>>();
+  // 全ジョブを 1 度なめて、ファイルごとの「名前 → 定義」を組み立てる
+  for (const job of jobs) {
+    // そのファイルの索引を用意する (無ければ作る)
+    const index = byFile.get(job.file) ?? new Map<string, Record<string, unknown>>();
+    // ジョブ名で引けるようにする
+    index.set(job.name, job.definition);
+    // 作ったばかりなら入れておく
+    byFile.set(job.file, index);
+  }
+  // 組み上がった索引を返す
+  return byFile;
+}
+
+/**
  * **全 PR に届くワークフローのファイル名**を集める (ローカルの呼び出しをたどる)。
  *
  * **呼び出し経由をたどらないと、正当な分割が満たせない要求になる。** `pr.yml`
@@ -988,15 +1014,20 @@ function invokesRuntimeVerifier(step: Record<string, unknown>): boolean {
  * 検証は毎 PR 走っているのに検査だけが落ちる — この repo が繰り返し避けている
  * 「直しようの無い要求」になる。
  *
- * **gate された呼び出しはたどらない。** `if:` / `continue-on-error` 付きの
- * 呼び出しはスキップされても CI が緑になるので、その先を「PR に届く」と数えると
- * `needs:` gate を塞いだ意味が無くなる。
+ * **gate された呼び出しはたどらない。** スキップされても CI が緑になるので、
+ * その先を「PR に届く」と数えると gate を塞いだ意味が無くなる。**判定は
+ * `jobNeverRunsReason` に任せる** — `if:` / `continue-on-error` だけを見ると
+ * **`needs:` の先が `if:` 付き**という形（別のキーで同じ結末に届く経路で、
+ * 置き方の検査では既に塞いである）だけがここをすり抜ける。実測でも、
+ * `needs: gate` にした呼び出しは「PR に届く」と数えられていた。
  */
 function pullRequestReachableFiles(jobs: readonly WorkflowJob[]): Set<string> {
   // 直接 PR で起動するワークフローを種にする
   const reachable = new Set(
     jobs.filter((job) => triggersOnEveryPullRequest(job.workflowTriggers)).map((job) => job.file),
   );
+  // `needs:` をたどるための、ワークフローごとの「ジョブ名 → 定義」の索引
+  const byFile = indexJobsByFile(jobs);
   // 呼び出しをたどって増えなくなるまで繰り返す (呼び出しは何段でも連なりうる)
   for (let grew = true; grew; ) {
     // この巡で増えたかどうか
@@ -1006,7 +1037,9 @@ function pullRequestReachableFiles(jobs: readonly WorkflowJob[]): Set<string> {
       // 呼び出し元が PR に届いていなければ、その先もこの経路では届かない
       if (!reachable.has(job.file)) continue;
       // スキップされうる呼び出しは「必ず走る経路」ではないのでたどらない
-      if (!isUnconditionalStep(job.definition)) continue;
+      // (`if:` / `continue-on-error` と `needs:` の連鎖を同じ 1 か所で見る)
+      const siblings = byFile.get(job.file) ?? new Map<string, Record<string, unknown>>();
+      if (jobNeverRunsReason(job.definition, siblings) !== null) continue;
       // ローカルの再利用可能ワークフロー呼び出しだけをたどる
       const uses = usesOf(job.definition);
       if (!uses.startsWith("./.github/workflows/")) continue;
@@ -1256,16 +1289,7 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
   // **ワークフローごとのジョブ索引は 1 度だけ作る。** `needs:` をたどるのに要るが、
   // 中身はジョブごとに変わらない (ループ不変) ので、各ジョブで作り直すと
   // ジョブ数の 2 乗の走査になる
-  const byFile = new Map<string, Map<string, Record<string, unknown>>>();
-  // 全ジョブを 1 度なめて、ファイルごとの「名前 → 定義」を組み立てる
-  for (const job of jobs) {
-    // そのファイルの索引を用意する (無ければ作る)
-    const index = byFile.get(job.file) ?? new Map<string, Record<string, unknown>>();
-    // ジョブ名で引けるようにする
-    index.set(job.name, job.definition);
-    // 作ったばかりなら入れておく
-    byFile.set(job.file, index);
-  }
+  const byFile = indexJobsByFile(jobs);
   // 平らに並べたジョブを 1 つずつ見る
   return jobs.flatMap((job) => {
     // 同じワークフローのジョブだけを引く — ジョブ名はワークフローごとに独立している
@@ -2036,13 +2060,6 @@ describe("実行する Node の major を宣言しているすべての場所の
     ).not.toBeNull();
     // engines.node は下限つきの範囲なので、パース済みの package.json から素直に引く
     const enginesNode = asRecord(asRecord(packageJsonRead.value).engines).node;
-    // 基準が決まっていなければ、その事実を明示して落とす
-    // (これが無いと `.nvmrc` が読めないだけで「README の案内が Node null と違う」と
-    //  報告され、**正しい README を直せ**という誤った案内になる。§6 握り潰さない)
-    expect(
-      runtimeMajor,
-      "ピン留め 2 か所が揃っていないため、README の案内と照合する基準が決まらない",
-    ).not.toBeNull();
     // 文字列で書かれていなければ読めなかった扱いとして落とす
     expect(
       typeof enginesNode,
@@ -2058,6 +2075,13 @@ describe("実行する Node の major を宣言しているすべての場所の
   });
 
   it("README の必要環境が、ピン留めした major と同じ Node を案内している", () => {
+    // 基準が決まっていなければ、その事実を明示して落とす。
+    // これが無いと `.nvmrc` が読めないだけで「README の案内が Node null と違う」と
+    // 報告され、**正しい README を直せ**という誤った案内になる (§6 握り潰さない)
+    expect(
+      runtimeMajor,
+      "ピン留め 2 か所が揃っていないため、README の案内と照合する基準が決まらない",
+    ).not.toBeNull();
     // README から「Node.js <major> 系」を読み取る
     const readmeMajor = readReadmeNodeMajor();
     // 書式ごと変わって読めない場合は、案内が消えたのと同じなので落とす。
@@ -2486,8 +2510,9 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
       ),
     },
     {
-      // 先頭のリポジトリのコードが検証自身のときは、並び順の判定に任せる
-      // (同じ誤りを 2 通りの言い方で報告しない)
+      // ランナー既定の Node を検証するだけの空振りになる。
+      // **先頭のリポジトリのコードが検証自身のときは、setup-node の位置を重ねて
+      // 言わない** — 同じ誤りを 2 通りの言い方で報告することになるため
       label: "実行時検証が setup-node より前 (setup-node の位置は重ねて言わない)",
       jobs: [
         jobOf({
@@ -2529,14 +2554,6 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
         }),
       ],
       expected: named(`${RUNTIME_VERIFIER} に if: / continue-on-error が付いている`),
-    },
-    {
-      // ランナー既定の Node を検証するだけの空振りになる
-      label: "実行時検証が setup-node より前",
-      jobs: [
-        jobOf({ steps: [{ run: "node scripts/verify-node-major.mjs" }, setupNodeStep, { run: "npm ci" }] }),
-      ],
-      expected: named(`${RUNTIME_VERIFIER} が setup-node より前にある (用意した Node を検証していない)`),
     },
     {
       label: "実行時検証がリポジトリのコードより後ろ",
@@ -3120,9 +3137,15 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
     // 呼ばれる側のジョブが、検証もスイートも持っているので条件を満たす
     expect(runsVerifiedWorkOnEveryPullRequest(callee, reachable)).toBe(true);
     // **gate された呼び出しはたどらない** (スキップされても CI は緑になるので、
-    // その先を「PR に届く」と数えると needs: gate を塞いだ意味が無くなる)
+    // その先を「PR に届く」と数えると gate を塞いだ意味が無くなる)
     const gatedCaller = { ...caller, definition: { ...caller.definition, if: "${{ false }}" } };
     expect([...pullRequestReachableFiles([gatedCaller, callee])]).toEqual(["pr.yml"]);
+    // **`needs:` の先が gate されている形も同じ扱い。** `if:` だけを見ていたときは
+    // この経路だけがすり抜け、スキップされる呼び出しの先を「PR に届く」と
+    // 数えていた (別のキーで同じ結末に届く形＝実測)
+    const gate = { file: "pr.yml", name: "gate", definition: { if: "${{ false }}" } };
+    const neededCaller = { ...caller, definition: { ...caller.definition, needs: "gate" } };
+    expect([...pullRequestReachableFiles([gate, neededCaller, callee])]).toEqual(["pr.yml"]);
     // 呼び出しが無ければ、workflow_call のワークフローは届かない
     expect([...pullRequestReachableFiles([callee])]).toEqual([]);
     // 呼び出しは何段でも連なりうる (pr.yml → mid.yml → suite.yml)
@@ -3173,7 +3196,9 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
     expect(isUnconditionalSetupNode({ uses: " actions/setup-node@v7 " })).toBe(true);
     // 空白付きのローカル action も「リポジトリのコードを実行するステップ」として数える
     expect(runsRepositoryCode({ uses: " ./.github/actions/run-suite" })).toBe(true);
-    // uses: が無いステップは空文字列のまま (誤検知を出さない)
+    // uses: が無いステップでは空文字列を返す (`?? ""` の既定値をここで固定する)
+    expect(usesOf({ run: "npm ci" })).toBe("");
+    // run: だけのステップは「リポジトリのコードを実行する」と数える
     expect(runsRepositoryCode({ run: "npm ci" })).toBe(true);
     expect(runsRepositoryCode({ uses: "actions/checkout@v7" })).toBe(false);
   });
