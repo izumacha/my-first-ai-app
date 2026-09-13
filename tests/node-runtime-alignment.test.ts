@@ -627,8 +627,12 @@ function declaresPathEnv(step: Record<string, unknown>): boolean {
 function declaresPathInContainerOptions(container: Record<string, unknown>): boolean {
   // options が文字列でなければ、宣言として読める PATH は無い
   if (typeof container.options !== "string") return false;
-  // `--env PATH=` / `--env=PATH=` / `-e PATH=` / `-e=PATH=` のいずれかを探す
-  return /(^|\s)(--env|-e)[\s=]+PATH=/i.test(container.options);
+  // **docker の綴り揺れをまとめて拾う。** `--env PATH=` / `--env=PATH=` /
+  // `-e PATH=` / `-ePATH=` (短縮形は値を続けて書ける) / 引用符付き
+  // (`-e "PATH=/opt/node20/bin:$PATH"`。`$PATH` を含む値では引用が普通の書き方)。
+  // **綴りで答えが変わる形にしない** — 同じ宣言を `--env` で書けば落ちるのに
+  // `-e "…"` なら通る、というのはこの検出網が繰り返し塞いでいる失敗そのもの
+  return /(^|\s)(--env[\s=]+|-e[\s=]*)["']?PATH=/i.test(container.options);
 }
 
 /**
@@ -790,6 +794,26 @@ function collectSetupNodeSteps(jobs: readonly WorkflowJob[]): SetupNodeStep[] {
       .filter(isSetupNodeStep)
       .map((step) => ({ file: job.file, job: job.name, inputs: normalizeInputs(step.with) }));
   });
+}
+
+/**
+ * `actions/setup-node` の `with:` が、**`.nvmrc` を参照する配線**になっているか。
+ *
+ * **`node-version` は値が合っていても許さない。** `actions/setup-node` は
+ * `node-version` が空のときだけ `node-version-file` を読むので、両方書くと
+ * **ファイルは無視されて直書きの版が入る** — `.nvmrc` を正本にするというこの
+ * 配線の目的そのものが静かに外れる (しかも合っているかどうかはその瞬間の話で、
+ * 片方だけ書き換えれば黙ってずれる)。
+ *
+ * **綴りは素の `.nvmrc` だけを認める (意図的)。** `'./.nvmrc'` は setup-node では
+ * 同じファイルを指すがここでは落ちる。許す綴りを増やすと「同じものを指す書き方」の
+ * 一覧を抱え込むことになり、しかも誤りは**赤へ倒れる**ので見逃す側には転ばない。
+ */
+function isNvmrcWiredSetupNode(inputs: Record<string, unknown>): boolean {
+  // node-version-file が `.nvmrc` を指していること
+  if (inputs["node-version-file"] !== displayPath(NVMRC_PATH)) return false;
+  // かつ node-version が書かれていないこと (書かれていると file 側が無視される)
+  return !("node-version" in inputs);
 }
 
 /**
@@ -966,6 +990,34 @@ function invokesRuntimeVerifier(step: Record<string, unknown>): boolean {
     .split("\n")
     .map((line) => line.trim())
     .some((line) => RUNTIME_VERIFIER_LINE.test(line));
+}
+
+/**
+ * そのジョブが、**全 PR で起動し、検証済みの Node で「検証以外の処理」も走らせる**か。
+ *
+ * 3 つを同時に満たすことを求める:
+ *   1. ワークフローが絞り込み無しの `pull_request` で起動する。
+ *   2. 実行時検証を**無条件で**走らせている (`if:` / `continue-on-error` 付きは数えない)。
+ *   3. 検証以外のリポジトリのコードも走らせている。
+ *
+ * **3 が要る。** 「検証を走らせるジョブが PR にある」までしか求めないと、
+ * `ci.yml` を `[checkout, setup-node, 検証]` だけに削り、lint / typecheck / test /
+ * e2e を `on: workflow_dispatch` の 2 本目へ移す形で、両方のジョブが個別の検査を
+ * 満たすため**どの PR でも実際の検証が走らないのに全件緑**になった (実測)。
+ *
+ * **残る境界**: 「検証以外の処理」を構造から見分けることはできないので、
+ * PR で走るジョブに `run: echo hi` を 1 つ足せばこの判定は満たせる
+ * (`run:` の中身を解釈しない方針の帰結)。
+ */
+function runsVerifiedWorkOnEveryPullRequest(job: WorkflowJob): boolean {
+  // まずワークフローが全 PR で起動すること
+  if (!triggersOnEveryPullRequest(job.workflowTriggers)) return false;
+  // steps を持たないジョブ (再利用可能ワークフローの呼び出し) は中身を読めない
+  const steps = stepRecordsOf(job) ?? [];
+  // 実行時検証を無条件で走らせていること
+  if (!steps.some((step) => invokesRuntimeVerifier(step) && isUnconditionalStep(step))) return false;
+  // 検証済みの Node で、検証以外のリポジトリのコードも走ること
+  return steps.some((step) => runsRepositoryCode(step) && !invokesRuntimeVerifier(step));
 }
 
 /**
@@ -1509,8 +1561,18 @@ function nodeMajorOfDockerfileText(text: string): number | null {
   // 既定値で展開してから判定すれば、元の意図 (`ARG BASE=node:20-alpine` +
   // `FROM $BASE` のドリフト検出) は保ったまま、無関係な段を巻き込まずに済む
   const argDefaults = new Map<string, string>();
-  // まず ARG の既定値を拾う (Docker では最初の FROM より前の ARG が FROM で使える)
-  for (const line of stripComments(text)) {
+  // **コメントの除去は 1 度だけ行う。** 2 度なめると同じ行を 2 回トークン化するうえ、
+  // 片方のコメント解釈だけを直したときに 2 つのループが「どの行が存在するか」で
+  // 食い違いうる (この repo が写しを嫌う理由そのもの)
+  const lines = stripComments(text);
+  // **`FROM` で使える `ARG` は、最初の `FROM` より前に宣言されたものだけ** (Docker の規則)。
+  // ファイル全体から拾って後勝ちにすると、段の中で同じ名前を再宣言する
+  // (`ARG IMG=node:26` … `FROM $IMG` … 段の中で `ARG IMG=node:20`) 正当な形で、
+  // **最初の `FROM` が別のイメージとして読まれる**。実測でも、この誤読は
+  // 一貫した Dockerfile を「食い違っている」と報告した
+  for (const line of lines) {
+    // 最初の FROM に当たったら、そこから先の ARG は FROM に使えないので打ち切る
+    if (/^\s*FROM\s+/i.test(line)) break;
     // `ARG NAME=値` の形だけを対象にする (既定値の無い ARG は展開しようがない)
     const arg = line.match(/^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)=(.+)$/i);
     // ARG でなければ次の行へ
@@ -1518,7 +1580,7 @@ function nodeMajorOfDockerfileText(text: string): number | null {
     // 値の前後の空白と引用符を落として控える
     argDefaults.set(arg[1], arg[2].trim().replace(/^["']|["']$/g, ""));
   }
-  for (const line of stripComments(text)) {
+  for (const line of lines) {
     // 行頭の FROM 命令だけを対象にする (大文字小文字は Docker 側が区別しない)
     const matched = line.match(/^\s*FROM\s+(.+)$/i);
     // FROM でなければ次の行へ
@@ -1536,16 +1598,25 @@ function nodeMajorOfDockerfileText(text: string): number | null {
     // かといって `$` を含む段を一律に「読めない段」とすると、node と無関係な段まで
     // 巻き込んで直しようの無い要求になる (実測)。展開すればどちらも避けられる
     const resolved = expandArgs(image, argDefaults);
-    // **展開しきれない段だけを「読めない段」として落とす** (既定値の無い `ARG BASE` +
-    // `FROM $BASE` は `--build-arg` 次第で node にも別イメージにもなり、
-    // どちらか決められない。ここは fail-closed に倒す)
-    if (resolved.includes("$")) return null;
+    // 展開後の参照を、リポジトリ名とタグに割る
+    const reference = parseImageReference(resolved);
+    // **「どのイメージか決められない」段だけを読めない段として落とす** (既定値の無い
+    // `ARG BASE` + `FROM $BASE` は `--build-arg` 次第で node にも別イメージにもなる)。
+    // **タグだけが変数の段は、ここでは落とさない** — `ARG PYTHON_VERSION` +
+    // `FROM python:${PYTHON_VERSION}-slim` のような**node と無関係な段**まで
+    // Dockerfile ごと読めない扱いにすると、直し方が「無関係な ARG を消す」しか
+    // 無くなる (リテラルの `golang:1.22` は素通りするのに、変数を使った途端に
+    // 赤くなるのは綴りだけで答えが変わる形。実測)
+    if (reference.repository.includes("$")) return null;
     // 公式の node イメージでなければ対象外 (ビルドに使う別イメージの段は見ない)
     if (!isNodeImage(resolved)) continue;
+    // **node の段でタグが決められないなら、そこで落とす** (major を読めないので
+    // 飛ばすと、まさに検出したい多段ビルドのドリフトが素通りする)
+    if (reference.tag.includes("$")) return null;
     // タグから major を取り出す。割り方は isNodeImage と同じ 1 か所に任せる
     // (書き写すと「node の段だと判定した参照から別の部分文字列をタグとして読む」
     //  という静かな食い違いになる。詳細は parseImageReference の docstring)
-    const major = parseImageReference(resolved).tag.match(/^(\d+)/);
+    const major = reference.tag.match(/^(\d+)/);
     // **読めない段は黙って飛ばさない。** `node:lts-alpine` / `node@sha256:...` /
     // タグ無しの `FROM node` は major を取り出せないが、飛ばすと残りの段だけで
     // 「揃っている」ことになり、まさに検出したい多段ビルドのドリフトが素通りする
@@ -1788,11 +1859,7 @@ describe("実行する Node の major を宣言しているすべての場所の
     // 一覧を抱え込むことになり、しかも誤りは**赤へ倒れる**ので見逃す側には転ばない
     // (失敗文言が実際の指定を出すため、直し方も迷わない)
     const misconfigured = setupSteps
-      .filter(
-        (step) =>
-          step.inputs["node-version-file"] !== displayPath(NVMRC_PATH) ||
-          "node-version" in step.inputs,
-      )
+      .filter((step) => !isNvmrcWiredSetupNode(step.inputs))
       .map((step) => `${step.file}: ${step.job} (${describeInputs(step.inputs)})`);
     // **3 つの口の判定は soft にする。** 通常の expect は最初の 1 件で中断するので、
     // 2 つ以上の口が同時に開いていると、直して push するたびに次の 1 件が出る
@@ -1850,23 +1917,7 @@ describe("実行する Node の major を宣言しているすべての場所の
     // ジョブを集める。ジョブ側の gate (`if:` / `needs:` / `continue-on-error`) や
     // setup-node の置き方は collectJobsMissingSetupNode が落とすので見ない (§6 DRY)
     const verifiedOnPullRequest = workflows.jobs
-      .filter((job) => {
-        // まずワークフローが全 PR で起動すること
-        if (!triggersOnEveryPullRequest(job.workflowTriggers)) return false;
-        // steps を持たないジョブ (再利用可能ワークフローの呼び出し) は中身を読めない
-        const steps = stepRecordsOf(job) ?? [];
-        // 実行時検証を無条件で走らせていること
-        if (!steps.some((step) => invokesRuntimeVerifier(step) && isUnconditionalStep(step))) {
-          return false;
-        }
-        // **検証だけのジョブでは足りない。** 「検証を走らせるジョブが PR にある」まで
-        // しか求めないと、`ci.yml` を [checkout, setup-node, 検証] だけに削り、
-        // lint / typecheck / test / e2e を `on: workflow_dispatch` の 2 本目へ移すと、
-        // 両方のジョブが個別の検査を満たすため**どの PR でも実際の検証が走らないのに
-        // 全件緑**になった (実測)。検証済みの Node で**検証以外の処理**も走ること
-        // まで求める
-        return steps.some((step) => runsRepositoryCode(step) && !invokesRuntimeVerifier(step));
-      })
+      .filter(runsVerifiedWorkOnEveryPullRequest)
       .map((job) => `${job.file}: ${job.name}`);
     // 1 つも無ければ、綴りに依存しない最後の砦が**どの PR でも走らない**。
     // ジョブ側の置き方をいくら検査しても、走らなければ何も担保しない
@@ -2305,6 +2356,34 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
       label: "実行時検証を置いていない",
       jobs: [jobOf({ steps: [setupNodeStep, { run: "npm ci" }] })],
       expected: named(`${RUNTIME_VERIFIER} を実行していない`),
+    },
+    {
+      // **無条件であることまで見る。** `if:` 付きの検証はスキップされてもワークフローは
+      // 成功として報告されるので、置いてあるだけでは何も担保しない
+      label: "実行時検証に if: が付いている",
+      jobs: [
+        jobOf({
+          steps: [
+            setupNodeStep,
+            { run: "node scripts/verify-node-major.mjs", if: "github.event_name == 'push'" },
+            { run: "npm ci" },
+          ],
+        }),
+      ],
+      expected: named(`${RUNTIME_VERIFIER} に if: / continue-on-error が付いている`),
+    },
+    {
+      label: "実行時検証に continue-on-error が付いている",
+      jobs: [
+        jobOf({
+          steps: [
+            setupNodeStep,
+            { run: "node scripts/verify-node-major.mjs", "continue-on-error": true },
+            { run: "npm ci" },
+          ],
+        }),
+      ],
+      expected: named(`${RUNTIME_VERIFIER} に if: / continue-on-error が付いている`),
     },
     {
       // ランナー既定の Node を検証するだけの空振りになる
@@ -2797,6 +2876,99 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
     expect(collectJobsMissingSetupNode([upper])).toEqual([]);
   });
 
+  it.each([
+    // `.nvmrc` を参照していて、版の直書きが無い形だけが正しい配線
+    { label: "node-version-file だけ", inputs: { "node-version-file": ".nvmrc" }, expected: true },
+    // cache などの他の入力は付けてよい
+    {
+      label: "node-version-file + cache",
+      inputs: { "node-version-file": ".nvmrc", cache: "npm" },
+      expected: true,
+    },
+    // **値が合っていても node-version は許さない** — setup-node は node-version が
+    // 空のときだけ node-version-file を読むので、両方書くとファイルが無視される
+    {
+      label: "node-version-file + node-version (値は一致)",
+      inputs: { "node-version-file": ".nvmrc", "node-version": "26" },
+      expected: false,
+    },
+    {
+      label: "node-version だけ",
+      inputs: { "node-version": "20" },
+      expected: false,
+    },
+    // 参照先が違う綴り (`./.nvmrc`) は落とす。誤りは赤へ倒れるので見逃さない
+    { label: "./.nvmrc という綴り", inputs: { "node-version-file": "./.nvmrc" }, expected: false },
+    // 何も指定しない形も落とす (ランナー既定の Node で走る)
+    { label: "with: が空", inputs: {}, expected: false },
+  ])("isNvmrcWiredSetupNode: $label → $expected", ({ inputs, expected }) => {
+    // **この PR の中心の規則なので、判定そのものを固定する。** 実測では
+    // `"node-version" in inputs` の節を落としても全件緑で通った (実際の ci.yml が
+    // 準拠しているだけでは、判定を潰しても気付けない)
+    expect(isNvmrcWiredSetupNode(inputs)).toBe(expected);
+  });
+
+  it.each([
+    {
+      label: "全 PR で起動し、検証と検証以外の処理を走らせる",
+      job: { ...jobOf({ steps: compliantSteps }), workflowTriggers: { pull_request: null } },
+      expected: true,
+    },
+    {
+      // 起動条件が絞られていれば、置き方が正しくても PR では走らない
+      label: "workflow_dispatch だけ",
+      job: { ...jobOf({ steps: compliantSteps }), workflowTriggers: { workflow_dispatch: null } },
+      expected: false,
+    },
+    {
+      // **検証だけのジョブでは足りない** (スイートを別ワークフローへ退避する形が
+      // 個別の検査をすべて満たしたまま通っていた＝実測)
+      label: "検証だけのジョブ",
+      job: {
+        ...jobOf({
+          steps: [setupNodeStep, { run: "node scripts/verify-node-major.mjs" }],
+        }),
+        workflowTriggers: { pull_request: null },
+      },
+      expected: false,
+    },
+    {
+      // 検証が条件付きなら、走らないまま CI は緑になる
+      label: "検証に if: が付いている",
+      job: {
+        ...jobOf({
+          steps: [
+            setupNodeStep,
+            { run: "node scripts/verify-node-major.mjs", if: "${{ false }}" },
+            { run: "npm ci" },
+          ],
+        }),
+        workflowTriggers: { pull_request: null },
+      },
+      expected: false,
+    },
+  ])("runsVerifiedWorkOnEveryPullRequest: $label → $expected", ({ job, expected }) => {
+    // 3 つの条件それぞれを、合成したジョブで固定する (実測では、どの節を落としても
+    // 実際の ci.yml だけを見ているかぎり全件緑で通った)
+    expect(runsVerifiedWorkOnEveryPullRequest(job)).toBe(expected);
+  });
+
+  it("expectWorkflowScanUsable が、前提の崩れを原因付きで落とす", () => {
+    // 置き場ごと読めない場合
+    expect(() =>
+      expectWorkflowScanUsable({ jobs: [], unreadable: [], listError: "ENOENT" }),
+    ).toThrow();
+    // **読めないワークフローが 1 本でもあれば落とす。** ジョブ 0 件で済ませると、
+    // 他に正しい ci.yml があるかぎり以降の検査を通過し、その 1 本だけが黙って
+    // 検査から外れる (実測の fail-open)。実際の置き場は常に読めるので、
+    // この節は合成した走査結果でしか固定できない
+    expect(() =>
+      expectWorkflowScanUsable({ jobs: [], unreadable: ["broken.yml: jobs が対応表ではありません"], listError: null }),
+    ).toThrow();
+    // どちらも無ければ通す (誤検知を出さない)
+    expect(() => expectWorkflowScanUsable({ jobs: [], unreadable: [], listError: null })).not.toThrow();
+  });
+
   it("合成ジョブのヘルパーが、実際の走査なら弾かれる steps を通さない", () => {
     // **表の意味を守るための門番。** 本番では jobsOfWorkflow が先に落とす形を
     // 素通りさせると、合成ケースが `expected: []` と書かれて「検出網はこの形を
@@ -2991,6 +3163,16 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
       jobs: { build: { steps: [{ run: "npm ci" }] } },
     });
     expect(booleanKey.jobs[0]?.workflowTriggers).toEqual({ pull_request: null });
+    // **`defaults:` も同じく運ぶ。** 運び先 (declaresCustomDefaultShell) の判定には
+    // テストがあるが、運ぶ配線だけが無検証だと「defaults を読まない」変異が
+    // **全件緑のまま通る** (実測。env / triggers は落ちるのにこれだけ落ちなかった)
+    const withDefaults = jobsOfWorkflow("synthetic.yml", {
+      defaults: { run: { shell: "env PATH=/opt/node20/bin:$PATH bash -e {0}" } },
+      jobs: { build: { steps: [{ run: "npm ci" }] } },
+    });
+    expect(withDefaults.jobs[0]?.workflowDefaults).toEqual({
+      run: { shell: "env PATH=/opt/node20/bin:$PATH bash -e {0}" },
+    });
     // 読めない形は 3 段それぞれで原因を返す
     expect(jobsOfWorkflow("x.yml", { jobs: "extra" }).problems).toHaveLength(1);
     expect(jobsOfWorkflow("x.yml", { jobs: { a: [] } }).problems).toHaveLength(1);
