@@ -252,17 +252,6 @@ interface DependencyEngine {
   range: string;
 }
 
-/**
- * ファイルを文字列として読む。存在しなければ null を返す。
- *
- * 読めないこと自体を「前提崩れ」として呼び出し側で落とすため、ここでは例外にしない
- * (describe のトップレベルで例外を投げると、丁寧に書いた失敗文言が 1 つも出ない)。
- */
-function readTextOrNull(path: string): string | null {
-  // 原因の運搬は共有の読み手に任せ、中身だけを返す (呼び出し側は存在確認で落とす)
-  return readTextOrError(path).text;
-}
-
 /** テキストファイルを読んだ結果 (読めた中身と、読めなかったときの原因)。 */
 interface TextReadResult {
   // 読めた中身 (読めなければ null)
@@ -291,6 +280,35 @@ function readTextOrError(path: string): TextReadResult {
   }
 }
 
+/** ファイル 1 つから major を読み取った結果 (読めた値と、読めなかったときの原因)。 */
+interface MajorReadResult {
+  // 読み取れた major (ファイルが読めない / 書式が合わなければ null)
+  major: number | null;
+  // ファイルそのものを読めなかったときの原因 (読めたなら null)
+  readError: string | null;
+}
+
+/**
+ * ファイルを **1 回だけ**読み、その中身から major を取り出す。
+ *
+ * **値と原因を同じ 1 回の読み取りから導く。** 以前は「値」を返す関数と
+ * `readTextOrError(path).error` を別々に呼んでいたため、同じファイルを 2 回読んだうえ、
+ * **2 回の結果が食い違いうる**形になっていた: 1 回目が読めて 2 回目が読めない
+ * (壊れたシンボリックリンクの復旧・入れ替え) と、`major` は値を持つのに `readError` は
+ * null、逆なら `major` が null なのに原因が消える。後者はまさに `readTextOrError` が
+ * 防ぐために作られた状態そのもので、失敗文言が errno を失って「書式を直せ」という
+ * **正しい書式のファイルに対する誤った案内**へ退行する。
+ *
+ * あわせて「読んで解釈する」の写しも消える — 同じ形が `.nvmrc` / Dockerfile / README の
+ * 3 か所にあり、読めなかったときの扱いを直すときに一部だけ取り残される形だった (§6 DRY)。
+ */
+function readMajorFrom(path: string, parse: (text: string) => number | null): MajorReadResult {
+  // ファイルを 1 回だけ読む (中身と原因の両方がここで確定する)
+  const read = readTextOrError(path);
+  // 読めていれば中身を解釈し、読めていなければ値は無い
+  return { major: read.text === null ? null : parse(read.text), readError: read.error };
+}
+
 /**
  * `#` から行末までのコメントを落とした行の配列を返す。
  *
@@ -303,26 +321,6 @@ function stripComments(text: string): string[] {
 }
 
 /**
- * `.nvmrc` に書かれた major を読み取る。
- *
- * major だけを書く運用で、先頭の `v` だけを許す。
- *
- * **コメントを許さないのは、実際に読む側が許さないから。** `.nvmrc` を読むのは
- * `actions/setup-node` (`node-version-file`) と `nvm` で、どちらもファイルの中身を
- * trim するだけで `#` 以降を落とさない。ここだけ寛容にすると、`26 # LTS` のような
- * 内容を**この検査は「26」と読んで緑にするのに CI の Node 準備は壊れる**という、
- * 一番たちの悪い食い違いになる (同じ `.nvmrc` を読む
- * `scripts/verify-node-major.mjs` とも解釈が割れる。実測)。
- */
-function readNvmrcMajor(): number | null {
-  // ファイルを読む (読めなければ null)
-  const text = readTextOrNull(NVMRC_PATH);
-  if (text === null) return null;
-  // 中身の解釈は純粋関数へ (同じ規則をスクリプト側と突き合わせるため)
-  return parseNvmrcMajor(text);
-}
-
-/**
  * `.nvmrc` の**中身**から major を読み取る (ファイル入出力を伴わない純粋関数)。
  *
  * **読み取りから切り離してあるのは、同じ規則を守る読み手がもう 1 つあるから。**
@@ -332,8 +330,13 @@ function readNvmrcMajor(): number | null {
  * そのために「同じ文字列を両方へ食わせて答え合わせをする」検査が中身だけを渡せる形を要る
  * (下の「`.nvmrc` の書式解釈が、検査側と実行時検証で一致している」)。
  *
- * 規則そのものの根拠は `readNvmrcMajor` の docstring を参照 (実際に読む
- * `actions/setup-node` / `nvm` が trim しかしないので、コメントも小数点も許さない)。
+ * **major だけを書く運用で、先頭の `v` だけを許す。コメントも小数点も許さないのは、
+ * 実際に読む側が許さないから。** `.nvmrc` を読むのは `actions/setup-node`
+ * (`node-version-file`) と `nvm` で、どちらもファイルの中身を trim するだけで
+ * `#` 以降を落とさない。ここだけ寛容にすると、`26 # LTS` のような内容を
+ * **この検査は「26」と読んで緑にするのに CI の Node 準備は壊れる**という、
+ * 一番たちの悪い食い違いになる (同じ `.nvmrc` を読む
+ * `scripts/verify-node-major.mjs` とも解釈が割れる。実測)。
  */
 function parseNvmrcMajor(text: string): number | null {
   // 前後の空白だけを落として、先頭の `v` 付きの数字だけを受け取る。
@@ -620,15 +623,23 @@ function stepRecordsOf(job: WorkflowJob): Record<string, unknown>[] | null {
 }
 
 /**
- * ステップの `uses:` を文字列として読む (未指定なら空文字列)。
+ * `uses:` を文字列として読む (未指定なら空文字列)。
  *
- * **読み方をここ 1 か所に置く。** `uses:` は 3 つの検査が見る同じ 1 つの手掛かりで
- * (setup-node かどうか / ローカル action の呼び出しか / `docker://` のイメージか)、
+ * **受け取るのはステップとは限らない。** `jobs.<id>.uses:` (再利用可能ワークフローの
+ * 呼び出し) も同じキーなので、ジョブ定義もそのまま渡せる形にしてある。
+ *
+ * **読み方をここ 1 か所に置く。** `uses:` は複数の判定が見る同じ 1 つの手掛かりで、
  * 読み方を書き写すと、読み方を直したとき (前後の空白を落とす、`../` も数える 等) に
- * 一部だけが直り、**同じステップ集合を見るはずの検査が黙って食い違う**
+ * 一部だけが直り、**同じ集合を見るはずの判定が黙って食い違う**
  * (この差分自身が `stepRecordsOf` / `isPlainMapping` の docstring で警告している形)。
+ *
+ * **利用側をここに書き並べない (意図的)。** 以前は「3 つの検査」と数え切っていたが、
+ * その後ジョブ単位の呼び出し解決 (`pullRequestReachableFiles` の gate 追跡や、
+ * steps を持たないジョブの判定) が増えて**一覧だけが古くなった**。読み方を直す人が
+ * 一覧から影響範囲を見積もると、実際より狭く数える側へ必ずずれる —
+ * `isPlainMapping` が同じ理由で一覧を外したのと同じ。`usesOf` を grep すること。
  */
-function usesOf(step: Record<string, unknown>): string {
+function usesOf(holder: Record<string, unknown>): string {
   // **前後の空白を落とす。** 落とさないと ` docker://node:20` の 1 文字で
   // **3 つの判定が同時に外れる**: `SETUP_NODE_USES` は `^actions/` で始まる形しか
   // 見ず、`docker://` の接頭辞判定も `./` のローカル action 判定も先頭一致なので、
@@ -636,7 +647,7 @@ function usesOf(step: Record<string, unknown>): string {
   // 無いことになり、ジョブごと `firstRepoCode === -1` で対象外になる (実測で全件緑)。
   // `uses:` の照合を大文字小文字を無視して行っている (SETUP_NODE_USES の `i`) のと
   // 同じ理由 — 読み手 (GitHub) の寛容さに検出網の側をそろえる
-  return String(step.uses ?? "").trim();
+  return String(holder.uses ?? "").trim();
 }
 
 /**
@@ -1676,12 +1687,10 @@ function collectImageOnlySteps(jobs: readonly WorkflowJob[]): ImageStepUse[] {
  * 判定があるので、そこへ寄せて書き写しも増やさない (§6 DRY)。
  */
 function readDockerfileNodeMajor(): number | null {
-  // Dockerfile を読む (読めなければ null)
-  const text = readTextOrNull(DOCKERFILE_PATH);
-  if (text === null) return null;
-  // 中身の解釈は純粋関数へ (合成した Dockerfile で挙動を固定できるようにするため。
-  // ファイル入出力と混ぜたままだと、読めない段の扱いを変える変異が拾えない)
-  return nodeMajorOfDockerfileText(text);
+  // 読み取りと解釈は共有の手に任せ、値だけを返す (読めなければ null)。
+  // 中身の解釈を純粋関数に分けてあるのは、合成した Dockerfile で挙動を固定するため —
+  // ファイル入出力と混ぜたままだと、読めない段の扱いを変える変異が拾えない
+  return readMajorFrom(DOCKERFILE_PATH, nodeMajorOfDockerfileText).major;
 }
 
 /**
@@ -1792,11 +1801,9 @@ function nodeMajorOfDockerfileText(text: string): number | null {
  * (「20 でいい」と思って動かない環境を作らせる)。書式は 1 行だけなので素直に拾う。
  */
 function readReadmeNodeMajor(): number | null {
-  // README を読む (読めなければ null)
-  const text = readTextOrNull(README_PATH);
-  if (text === null) return null;
-  // 中身の解釈は純粋関数へ (規則そのものをテーブル駆動で固定できるようにする)
-  return parseReadmeNodeMajor(text);
+  // 読み取りと解釈は共有の手に任せ、値だけを返す (読めなければ null)。
+  // 中身の解釈を純粋関数に分けてあるのは、規則そのものをテーブル駆動で固定するため
+  return readMajorFrom(README_PATH, parseReadmeNodeMajor).major;
 }
 
 /**
@@ -1832,13 +1839,15 @@ function parseReadmeNodeMajor(text: string): number | null {
  * 代わりに「その配線が保たれているか」を専用のテストで見る。
  */
 function collectPinnedSources(): PinnedSource[] {
-  // 2 つの出どころをラベル付きで並べて返す
+  // 2 つの出どころをラベル付きで並べて返す。
+  // **値と原因は同じ 1 回の読み取りから導く** (readMajorFrom の docstring 参照) —
+  // 別々に読むと 2 回の結果が食い違い、原因を失った失敗文言が
+  // 「書式を直せ」と誤った案内をしうる
   return [
-    { label: ".nvmrc", major: readNvmrcMajor(), readError: readTextOrError(NVMRC_PATH).error },
+    { label: ".nvmrc", ...readMajorFrom(NVMRC_PATH, parseNvmrcMajor) },
     {
       label: "Dockerfile (FROM node:<major>)",
-      major: readDockerfileNodeMajor(),
-      readError: readTextOrError(DOCKERFILE_PATH).error,
+      ...readMajorFrom(DOCKERFILE_PATH, nodeMajorOfDockerfileText),
     },
   ];
 }
@@ -2116,14 +2125,15 @@ describe("実行する Node の major を宣言しているすべての場所の
   });
 
   it("実行する Node の major がピン留め 2 か所すべてから読み取れ、値も揃っている", () => {
-    // 1 つでも読めなければ前提崩れ (fail-closed)。どこが読めなかったかを名指しする
-    const unreadable = pinnedSources
-      .filter((source) => source.major === null)
-      .map((source) => source.label);
+    // 1 つでも読めなければ前提崩れ (fail-closed)。どこが読めなかったかを名指しする。
+    // **判定した集合そのものから文言を導く。** 以前は同じ述語を文言の側でもう一度
+    // 書いていたため、「読めない」の定義を片方だけ広げると**落ちた集合と名指しする
+    // 集合が食い違い**、読み手は原因ではないファイルを指されることになる (§6 DRY)
+    const unreadableSources = pinnedSources.filter((source) => source.major === null);
+    const unreadable = unreadableSources.map((source) => source.label);
     expect(
       unreadable,
-      `実行する Node の major を読み取れない出どころがある: ${pinnedSources
-        .filter((source) => source.major === null)
+      `実行する Node の major を読み取れない出どころがある: ${unreadableSources
         // **ファイルを読めなかった場合は原因 (errno) を添える** — 添えないと
         // 権限やシンボリックリンクの事故が「書式を直せ」という案内になり、
         // 正しい書式のファイルを指すことになる (§6 握り潰さない)
