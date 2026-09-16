@@ -1908,6 +1908,22 @@ function collectPinnedSources(): PinnedSource[] {
 }
 
 /**
+ * ピン留めの出どころのうち、**major を取り出せなかったもの**だけを残す。
+ *
+ * **述語をここに 1 つだけ置く。** 「読めない」の判定は、失敗文言を組み立てる
+ * describeMissingRuntimeMajor と、「ピン留めが読めて値も揃っている」ことを見るテストの
+ * 両方が使う。書き写すと**落ちた集合と名指しする集合が食い違い**、読み手は原因では
+ * ないファイルを指される (この形は前巡で 1 度直している。§6 DRY)。
+ *
+ * 利用側をここに書き並べないのは isPlainMapping と同じ理由 — 列挙そのものが写しで、
+ * 必ず実態より短くなる側へずれる。条件を直す人は関数名を grep して確かめること。
+ */
+function unreadablePinnedSources(sources: readonly PinnedSource[]): PinnedSource[] {
+  // major を取り出せなかった出どころだけを残す
+  return sources.filter((source) => source.major === null);
+}
+
+/**
  * 基準となる major が決まらなかったときに、**その本当の原因**を 1 文で述べる。
  *
  * **「揃っていない」と決め打ちしてはいけない。** ピンが 2 か所とも読めないと major は
@@ -1924,24 +1940,10 @@ function collectPinnedSources(): PinnedSource[] {
  * **純粋関数として切り出すのは、実際のピンが揃っているかぎり分岐の片方しか通らないから** —
  * 呼び出し側の値だけで確かめると、「読めない」側の文言を潰しても全件緑のままになる
  * (このファイルが判定を合成入力で固定しているのと同じ理由)。
- *
- * **「読めない」の判定そのものは `unreadablePinnedSources` から受け取る。** 同じ述語は
- * 「ピン留めが読めて値も揃っている」テストも使っており、書き写すと**落ちた集合と
- * 名指しする集合が食い違う** — そのテストの直前のコメントが、まさにこの形を前回
- * 直したことを書いている。3 つ目の写しをここで作り直さない (§6 DRY)。
- */
-function unreadablePinnedSources(sources: readonly PinnedSource[]): PinnedSource[] {
-  // major を取り出せなかった出どころだけを残す
-  return sources.filter((source) => source.major === null);
-}
-
-/**
- * 基準となる major が決まらなかったときに、**その本当の原因**を 1 文で述べる。
- * (docstring の続きは下の関数。ここは「読めない」の判定を共有するための入口)
  */
 function describeMissingRuntimeMajor(sources: readonly PinnedSource[]): string {
   // 読み取れなかった出どころ (あれば、そちらが原因)
-  // 「読めない」の判定は共有の手から受け取る (述語を書き写さない。理由は下記)
+  // 「読めない」の判定は共有の述語から受け取る (書き写さない。理由は同関数の docstring)
   const unreadable = unreadablePinnedSources(sources);
   // 1 つでも読めていなければ、直す先が分かるようラベルを添えて述べる
   if (unreadable.length > 0) {
