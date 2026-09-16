@@ -212,6 +212,11 @@ function escapeForRegExp(text: string): string {
 // (`echo 'skipping scripts/verify-node-major.mjs'`) と区別するために形で照合する。
 // 組み立ては 1 度だけ (`SETUP_NODE_USES` と同じく module スコープの定数にそろえる)
 const RUNTIME_VERIFIER_LINE = new RegExp(`^node\\s+${escapeForRegExp(RUNTIME_VERIFIER)}$`);
+// シェルのオプションを設定するだけの行 (`set -euo pipefail` / `set -e`)。
+// CLAUDE.md §6 が bash に求めている書き出しなので、検証のステップに置かれても
+// 「検証以外の処理」とは数えない (理由は isVerifierOnlyStep の docstring)。
+// **オプションだけの行に限る** — `set -x && node other.js` は `&&` が一致しないので落ちる
+const SHELL_OPTION_LINE = /^set(\s+[-+][A-Za-z]+|\s+[A-Za-z]+)+$/;
 // ワークフローは**ファイル名を書き並べず、置き場ごと**見る。
 // 特定の 1 本 (ci.yml) だけを対象にすると、Node を用意する別のワークフローを足した瞬間に
 // その 1 本だけが黙って検査から外れる (痕跡はテスト件数すら変わらない)
@@ -1104,13 +1109,17 @@ function pullRequestReachableFiles(jobs: readonly WorkflowJob[]): Set<string> {
     for (const job of jobs) {
       // 呼び出し元が PR に届いていなければ、その先もこの経路では届かない
       if (!reachable.has(job.file)) continue;
+      // ローカルの再利用可能ワークフロー呼び出しだけをたどる。
+      // **ゲートの判定より先に絞る** — jobNeverRunsReason は needs: の連なりを
+      // たどるので、呼び出しでないジョブ (このリポジトリでは全部) にまで
+      // 巡のたびに走らせると、結果を必ず捨てる仕事を繰り返すことになる。
+      // 2 つはどちらも副作用の無い `continue` なので、順番を入れ替えても意味は変わらない
+      const uses = usesOf(job.definition);
+      if (!uses.startsWith("./.github/workflows/")) continue;
       // スキップされうる呼び出しは「必ず走る経路」ではないのでたどらない
       // (`if:` / `continue-on-error` と `needs:` の連鎖を同じ 1 か所で見る)
       const siblings = byFile.get(job.file) ?? new Map<string, Record<string, unknown>>();
       if (jobNeverRunsReason(job.definition, siblings) !== null) continue;
-      // ローカルの再利用可能ワークフロー呼び出しだけをたどる
-      const uses = usesOf(job.definition);
-      if (!uses.startsWith("./.github/workflows/")) continue;
       // 呼び出し先のファイル名 (走査はファイル名で持っているので最後の要素にする)
       const target = uses.split("@")[0].split("/").pop() ?? "";
       // まだ数えていなければ足して、もう 1 巡する
@@ -1171,13 +1180,26 @@ function runsVerifiedWorkOnEveryPullRequest(
  * `run:` の中身は解釈しない方針なので「何を先に走らせたか」は読めないが、
  * **「検証以外も書かれている」ことだけは形で分かる**。直し方も 1 通り
  * (「検証は独立したステップに置く」) しかなく、直しようの無い要求にはならない。
+ *
+ * **ただしシェルのオプション設定だけは「他の処理」と数えない。** `set -euo pipefail`
+ * は CLAUDE.md §6 が bash に求めている書き出しなので、規約どおりに
+ * `run: |` の 1 行目へ置いた瞬間にこの判定が外れ、**「検証以外も書かれている」という
+ * 事実と違う理由**で名指しされる (実測)。しかも案内される直し方
+ * (「検証は独立したステップに置く」) は既に満たしているので、**直しようが無くなる** —
+ * このリポジトリが検出網について繰り返し避けている形そのもの。
+ * `set` の組み込みコマンドは Node を起動できず `PATH` も書き換えられない
+ * (できるのは `export` / 代入で、どちらもこのパターンには一致しない) ので、
+ * 通しても「検証より前に別の Node で何かが走る」ことにはならない。
+ * **許すのは「`set` とオプションだけ」の行に限る** — `set -x && node other.js` のような
+ * 続きのある行は `&&` がパターンに合わず、これまでどおり落ちる。
  */
 function isVerifierOnlyStep(step: Record<string, unknown>): boolean {
-  // run: を行に割り、空行とシェルのコメントを除いた「実際に走る行」だけを見る
+  // run: を行に割り、空行とシェルのコメント、シェルのオプション設定を除いて
+  // 「実際に何かを走らせる行」だけを見る
   const lines = String(step.run ?? "")
     .split("\n")
     .map((line) => line.trim())
-    .filter((line) => line !== "" && !line.startsWith("#"));
+    .filter((line) => line !== "" && !line.startsWith("#") && !SHELL_OPTION_LINE.test(line));
   // 走る行がすべて起動行なら、検証だけのステップ (行が 1 つも無ければ検証していない)
   return lines.length > 0 && lines.every((line) => RUNTIME_VERIFIER_LINE.test(line));
 }
@@ -1853,6 +1875,35 @@ function collectPinnedSources(): PinnedSource[] {
 }
 
 /**
+ * 基準となる major が決まらなかったときに、**その本当の原因**を 1 文で述べる。
+ *
+ * **「揃っていない」と決め打ちしてはいけない。** ピンが 2 か所とも読めないと major は
+ * どちらも null になり、`new Set([null, null]).size === 1` が成立するので runtimeMajor は
+ * 「一致した結果の null」として落ちてくる。つまり**値は食い違っていない**のに、
+ * 決め打ちの文言は「揃っていない」と報告する (実測: `.nvmrc` を消して Dockerfile を
+ * 壊すと 5 つのテストがそう出た)。読み手は一致している 2 か所を突き合わせて原因を
+ * 探すことになり、本当の原因 (ファイルが読めない) は別の 1 つのテストにしか現れない —
+ * readTextOrError / readMajorFrom がまさに避けるために作られた取り違えと同じ形。
+ *
+ * **文言は 1 か所で作る。** 以前は同じ文が 5 つのテストへ書き写されていたので、
+ * 理由の付け方を直すとどれかが取り残される (§6 DRY)。
+ *
+ * **純粋関数として切り出すのは、実際のピンが揃っているかぎり分岐の片方しか通らないから** —
+ * 呼び出し側の値だけで確かめると、「読めない」側の文言を潰しても全件緑のままになる
+ * (このファイルが判定を合成入力で固定しているのと同じ理由)。
+ */
+function describeMissingRuntimeMajor(sources: readonly PinnedSource[]): string {
+  // 読み取れなかった出どころ (あれば、そちらが原因)
+  const unreadable = sources.filter((source) => source.major === null);
+  // 1 つでも読めていなければ、直す先が分かるようラベルを添えて述べる
+  if (unreadable.length > 0) {
+    return `ピン留めの ${unreadable.map((source) => source.label).join(" / ")} から major を読み取れないため`;
+  }
+  // すべて読めたうえで値が割れている場合だけ「揃っていない」と言える
+  return `ピン留め ${sources.length} か所の major が揃っていないため`;
+}
+
+/**
  * package.json の直接依存 (dependencies + devDependencies) の名前を並べる。
  *
  * ロックファイルの `packages[""]` ではなく package.json を読むのは、
@@ -1952,6 +2003,8 @@ const pinnedSources = collectPinnedSources();
 // それ自体を最初のテストが落とす (後続は「基準が無い」ことを明示して落ちる)
 const runtimeMajor =
   new Set(pinnedSources.map((source) => source.major)).size === 1 ? pinnedSources[0].major : null;
+// 基準が決まらなかったときに後続のテストが出す理由 (実際のピンから 1 度だけ作る)
+const runtimeMajorMissingReason = describeMissingRuntimeMajor(pinnedSources);
 
 // 対象パッケージに当たる ignore エントリ (件数・中身は個別のテストで確かめる)
 const ignoreEntries = collectIgnoreEntries(
@@ -2154,7 +2207,7 @@ describe("実行する Node の major を宣言しているすべての場所の
     // 基準が決まっていなければ、その事実を明示して落とす
     expect(
       runtimeMajor,
-      "ピン留め 2 か所が揃っていないため、engines の判定基準が決まらない",
+      `${runtimeMajorMissingReason}、engines の判定基準が決まらない`,
     ).not.toBeNull();
     // engines.node は下限つきの範囲なので、パース済みの package.json から素直に引く
     const enginesNode = asRecord(asRecord(packageJsonRead.value).engines).node;
@@ -2178,7 +2231,7 @@ describe("実行する Node の major を宣言しているすべての場所の
     // 報告され、**正しい README を直せ**という誤った案内になる (§6 握り潰さない)
     expect(
       runtimeMajor,
-      "ピン留め 2 か所が揃っていないため、README の案内と照合する基準が決まらない",
+      `${runtimeMajorMissingReason}、README の案内と照合する基準が決まらない`,
     ).not.toBeNull();
     // README から「Node.js <major> 系」を読み取る
     const readmeMajor = readReadmeNodeMajor();
@@ -2211,7 +2264,7 @@ describe("実行する Node の major を宣言しているすべての場所の
     // 基準が決まっていなければ、その事実を明示して落とす (上と同じ理由)
     expect(
       runtimeMajor,
-      `ピン留め 2 か所が揃っていないため、${GUARDED_DEPENDENCY} と照合する基準が決まらない`,
+      `${runtimeMajorMissingReason}、${GUARDED_DEPENDENCY} と照合する基準が決まらない`,
     ).not.toBeNull();
     // 実行する Node の major と一致していることを確かめる
     expect(
@@ -2233,7 +2286,7 @@ describe("実行する Node の major を宣言しているすべての場所の
     // 基準が決まっていなければ、その事実を明示して落とす (上と同じ理由)
     expect(
       runtimeMajor,
-      `ピン留め 2 か所が揃っていないため、解決済みの ${GUARDED_DEPENDENCY} と照合する基準が決まらない`,
+      `${runtimeMajorMissingReason}、解決済みの ${GUARDED_DEPENDENCY} と照合する基準が決まらない`,
     ).not.toBeNull();
     // 宣言が正しくても、overrides や巻き上げで解決だけがずれる場合を捕まえる
     expect(
@@ -2246,7 +2299,7 @@ describe("実行する Node の major を宣言しているすべての場所の
     // 基準が決まっていなければ、その事実を明示して落とす
     expect(
       runtimeMajor,
-      "ピン留め 2 か所が揃っていないため、依存の engines を照合する基準が決まらない",
+      `${runtimeMajorMissingReason}、依存の engines を照合する基準が決まらない`,
     ).not.toBeNull();
     // 直接依存の名前を package.json から取り出す
     const names = directDependencyNames(packageJsonRead.value);
@@ -2300,8 +2353,12 @@ describe("実行する Node の major を宣言しているすべての場所の
       [NPM_ECOSYSTEM, NPM_DIRECTORY],
       [DOCKER_ECOSYSTEM, DOCKER_DIRECTORY],
     ] as const) {
-      // 1 つでもあれば、意図して書いた形ではないので落とす (fail-closed)
-      expect(
+      // 1 つでもあれば、意図して書いた形ではないので落とす (fail-closed)。
+      // **soft にするのは、2 つのブロックが互いに独立だから** — 素の expect だと
+      // npm 側で投げた時点でループが終わり、docker 側の件数が数えられないまま
+      // 「npm を直す → 押す → 今度は docker が出る」と CI の巡が増える
+      // (このファイルが上位の 3 口の表明を soft にしているのと同じ事情)
+      expect.soft(
         countUnreadableElements(config, ecosystem, directory),
         `dependabot.yml の ${ecosystem} / ${directory} に、この検査が黙って読み飛ばす形の要素がある ` +
           "(空のリスト要素 `-`、リストでない ignore / directories、文字列でない dependency-name など)。" +
@@ -2713,6 +2770,41 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
           steps: [
             setupNodeStep,
             { run: "PATH=/opt/node20/bin:$PATH npm ci && npm run test\nnode scripts/verify-node-major.mjs" },
+          ],
+        }),
+      ],
+      expected: named(
+        `${RUNTIME_VERIFIER} が他の処理と同じ run: にまとめられている (先に走った処理の Node が分からない)`,
+      ),
+    },
+    {
+      // **シェルのオプション設定は「他の処理」ではない。** CLAUDE.md §6 が bash に
+      // 求めている書き出しを規約どおりに置いただけで名指しされると、案内される直し方
+      // (「検証は独立したステップに置く」) は既に満たしているので直しようが無くなる
+      // (実測で `set -euo pipefail` を足すとこの検査が落ちた)
+      label: "検証のステップが set -euo pipefail で始まっている",
+      jobs: [
+        jobOf({
+          steps: [
+            setupNodeStep,
+            { run: "set -euo pipefail\nnode scripts/verify-node-major.mjs" },
+            { run: "npm ci" },
+          ],
+        }),
+      ],
+      expected: [],
+    },
+    {
+      // **オプションだけの行に限る。** `set` に続きを書いた形は、そこで何が走るか
+      // 読めないのでこれまでどおり落とす (通すと「検証より前に別の Node で走る」形が
+      // シェルの 1 行で書けてしまう)
+      label: "検証のステップの set に続きが書かれている",
+      jobs: [
+        jobOf({
+          steps: [
+            setupNodeStep,
+            { run: "set -x && /opt/node20/bin/node other.js\nnode scripts/verify-node-major.mjs" },
+            { run: "npm ci" },
           ],
         }),
       ],
@@ -3334,6 +3426,30 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
     // 実際の README は常に 1 件なので、**規則そのものは合成した本文でしか固定できない**
     // (「1 件のときだけ」を「1 件以上」へ緩める変異が全件緑で通っていた＝実測)
     expect(parseReadmeNodeMajor(text)).toBe(expected);
+  });
+
+  it("describeMissingRuntimeMajor が、読めない場合と割れている場合を言い分ける", () => {
+    // 2 か所とも読めない形 (major は同じ null なので「揃っていない」とは言えない)
+    expect(
+      describeMissingRuntimeMajor([
+        { label: ".nvmrc", major: null, readError: "Error: ENOENT" },
+        { label: "Dockerfile", major: null, readError: null },
+      ]),
+    ).toBe("ピン留めの .nvmrc / Dockerfile から major を読み取れないため");
+    // 片方だけ読めない形 (読めない側だけを名指しする)
+    expect(
+      describeMissingRuntimeMajor([
+        { label: ".nvmrc", major: 26, readError: null },
+        { label: "Dockerfile", major: null, readError: null },
+      ]),
+    ).toBe("ピン留めの Dockerfile から major を読み取れないため");
+    // すべて読めたうえで値が割れている形だけが「揃っていない」
+    expect(
+      describeMissingRuntimeMajor([
+        { label: ".nvmrc", major: 26, readError: null },
+        { label: "Dockerfile", major: 22, readError: null },
+      ]),
+    ).toBe("ピン留め 2 か所の major が揃っていないため");
   });
 
   it("readTextOrError が、読めなかった原因を握り潰さずに運ぶ", () => {
