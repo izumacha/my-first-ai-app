@@ -1910,13 +1910,16 @@ function collectPinnedSources(): PinnedSource[] {
 /**
  * ピン留めの出どころのうち、**major を取り出せなかったもの**だけを残す。
  *
- * **述語をここに 1 つだけ置く。** 「読めない」の判定は、失敗文言を組み立てる
- * describeMissingRuntimeMajor と、「ピン留めが読めて値も揃っている」ことを見るテストの
- * 両方が使う。書き写すと**落ちた集合と名指しする集合が食い違い**、読み手は原因では
- * ないファイルを指される (この形は前巡で 1 度直している。§6 DRY)。
+ * **述語をここに 1 つだけ置く。** 書き写すと**落ちた集合と名指しする集合が食い違い**、
+ * 読み手は原因ではないファイルを指される (この形は前巡で 1 度直している。§6 DRY)。
  *
- * 利用側をここに書き並べないのは isPlainMapping と同じ理由 — 列挙そのものが写しで、
- * 必ず実態より短くなる側へずれる。条件を直す人は関数名を grep して確かめること。
+ * **利用側をここに書き並べない (意図的)。** 直前の段落で利用側を 2 つ挙げて
+ * 「両方が使う」と数えていたが、**それ自体が「列挙しない」と書いた 2 行上で
+ * 規約を破っている**形だった。列挙は写しで、必ず実態より短くなる側へずれる
+ * (この repo は `usesOf` の「3 つの検査」と `isPlainMapping` の 4 件の一覧で
+ * 2 度そうなっている)。数を書けば、利用側が増えた回に**数字だけが古くなり**、
+ * 述語を直す人は挙がっている分だけ見て残りを取り残す。条件を直す人は
+ * 関数名を grep して実際の利用側を確かめること。
  */
 function unreadablePinnedSources(sources: readonly PinnedSource[]): PinnedSource[] {
   // major を取り出せなかった出どころだけを残す
@@ -1943,7 +1946,9 @@ function unreadablePinnedSources(sources: readonly PinnedSource[]): PinnedSource
  */
 function describeMissingRuntimeMajor(sources: readonly PinnedSource[]): string {
   // 読み取れなかった出どころ (あれば、そちらが原因)
-  // 「読めない」の判定は共有の述語から受け取る (書き写さない。理由は同関数の docstring)
+  // 「読めない」の判定は共有の述語から受け取る
+  // (書き写さない。理由は unreadablePinnedSources の docstring。
+  //  「同関数」と書くとこの関数自身の docstring を指すと読めるが、そちらには無い)
   const unreadable = unreadablePinnedSources(sources);
   // 1 つでも読めていなければ、直す先が分かるようラベルを添えて述べる
   if (unreadable.length > 0) {
