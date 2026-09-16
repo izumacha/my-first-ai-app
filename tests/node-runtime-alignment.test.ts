@@ -215,8 +215,37 @@ const RUNTIME_VERIFIER_LINE = new RegExp(`^node\\s+${escapeForRegExp(RUNTIME_VER
 // シェルのオプションを設定するだけの行 (`set -euo pipefail` / `set -e`)。
 // CLAUDE.md §6 が bash に求めている書き出しなので、検証のステップに置かれても
 // 「検証以外の処理」とは数えない (理由は isVerifierOnlyStep の docstring)。
-// **オプションだけの行に限る** — `set -x && node other.js` は `&&` が一致しないので落ちる
-const SHELL_OPTION_LINE = /^set(\s+[-+][A-Za-z]+|\s+[A-Za-z]+)+$/;
+// **オプションだけの行に限る** — `set -x && node other.js` は `&&` が一致しないので落ちる。
+// **交替は 1 本にする** — 以前は `[-+]` の有無で 2 分岐に書いていたが、前置きの `\s+` が
+// 共通なので `[-+]?` と完全に等価 (総当たりで不一致 0 件)。分岐が 2 本あると、
+// オプションの綴りを足すときに片方だけ直す余地が残る
+const SHELL_OPTION_LINE = /^set(\s+[-+]?[A-Za-z]+)+$/;
+
+/**
+ * `run:` の 1 行から、**行末のシェルコメントを落として**前後の空白を整える。
+ *
+ * **CLAUDE.md §5 は「コメントは行の直前または行末に記述」と定めている。** ところが
+ * 行末に書いた瞬間、`RUNTIME_VERIFIER_LINE` も `SHELL_OPTION_LINE` も行末を `$` で
+ * 固定しているため一致が外れ、**事実と違う理由**で名指しされていた (どちらも実測):
+ *
+ *   - `node scripts/verify-node-major.mjs  # 実際の Node を確かめる`
+ *     → 毎回起動しているのに「`scripts/verify-node-major.mjs` を実行していない」
+ *   - `set -euo pipefail  # 失敗したら即座に止める`
+ *     → 検証しか書かれていないのに「他の処理と同じ run: にまとめられている」
+ *
+ * どちらも案内される直し方 (「実行しろ」「独立したステップに置け」) を**既に満たして
+ * いる**ので直しようが無い。このリポジトリが検出網について繰り返し避けている形そのもの
+ * なので、読み手 (シェル) と同じようにコメントを落としてから照合する。
+ *
+ * **`#` が語の先頭にあるときだけ落とす。** bash がコメントとして扱うのはその形だけで、
+ * 一律に落とすと `node scripts/verify-node-major.mjs#evil` (別ファイル名) が
+ * 起動行に化けて**素通りする** (fail-open)。落とす範囲を狭めた側の誤りは
+ * 「一致しない = 落ちる」に倒れるので、見逃す側には転ばない。
+ */
+function stripShellComment(line: string): string {
+  // 行頭か空白の直後から始まる `#` 以降を落とし、前後の空白を整える
+  return line.replace(/(^|\s)#.*$/, "").trim();
+}
 // ワークフローは**ファイル名を書き並べず、置き場ごと**見る。
 // 特定の 1 本 (ci.yml) だけを対象にすると、Node を用意する別のワークフローを足した瞬間に
 // その 1 本だけが黙って検査から外れる (痕跡はテスト件数すら変わらない)
@@ -1043,10 +1072,11 @@ function describeInputs(inputs: Record<string, unknown>): string {
  * そこで `run:` を行に割り、**`node <パス>` そのものの行**があることを求める。
  */
 function invokesRuntimeVerifier(step: Record<string, unknown>): boolean {
-  // run: を行に割り、前後の空白を落としてから、起動の行そのものを探す
+  // run: を行に割り、行末コメントと前後の空白を落としてから、起動の行そのものを探す
+  // (落とす理由と、落とす範囲を `#` が語の先頭のときだけに限る理由は stripShellComment)
   return String(step.run ?? "")
     .split("\n")
-    .map((line) => line.trim())
+    .map(stripShellComment)
     .some((line) => RUNTIME_VERIFIER_LINE.test(line));
 }
 
@@ -1195,11 +1225,14 @@ function runsVerifiedWorkOnEveryPullRequest(
  */
 function isVerifierOnlyStep(step: Record<string, unknown>): boolean {
   // run: を行に割り、空行とシェルのコメント、シェルのオプション設定を除いて
-  // 「実際に何かを走らせる行」だけを見る
+  // 「実際に何かを走らせる行」だけを見る。
+  // **コメントの落とし方は stripShellComment に任せる** — 行頭の `#` だけを見ていた頃は、
+  // §5 が認める行末コメントを付けた瞬間にこの判定が外れていた (実測)。
+  // 丸ごとコメントの行はここで空文字になり、下の空行の除去に掛かる
   const lines = String(step.run ?? "")
     .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line !== "" && !line.startsWith("#") && !SHELL_OPTION_LINE.test(line));
+    .map(stripShellComment)
+    .filter((line) => line !== "" && !SHELL_OPTION_LINE.test(line));
   // 走る行がすべて起動行なら、検証だけのステップ (行が 1 つも無ければ検証していない)
   return lines.length > 0 && lines.every((line) => RUNTIME_VERIFIER_LINE.test(line));
 }
@@ -1891,10 +1924,25 @@ function collectPinnedSources(): PinnedSource[] {
  * **純粋関数として切り出すのは、実際のピンが揃っているかぎり分岐の片方しか通らないから** —
  * 呼び出し側の値だけで確かめると、「読めない」側の文言を潰しても全件緑のままになる
  * (このファイルが判定を合成入力で固定しているのと同じ理由)。
+ *
+ * **「読めない」の判定そのものは `unreadablePinnedSources` から受け取る。** 同じ述語は
+ * 「ピン留めが読めて値も揃っている」テストも使っており、書き写すと**落ちた集合と
+ * 名指しする集合が食い違う** — そのテストの直前のコメントが、まさにこの形を前回
+ * 直したことを書いている。3 つ目の写しをここで作り直さない (§6 DRY)。
+ */
+function unreadablePinnedSources(sources: readonly PinnedSource[]): PinnedSource[] {
+  // major を取り出せなかった出どころだけを残す
+  return sources.filter((source) => source.major === null);
+}
+
+/**
+ * 基準となる major が決まらなかったときに、**その本当の原因**を 1 文で述べる。
+ * (docstring の続きは下の関数。ここは「読めない」の判定を共有するための入口)
  */
 function describeMissingRuntimeMajor(sources: readonly PinnedSource[]): string {
   // 読み取れなかった出どころ (あれば、そちらが原因)
-  const unreadable = sources.filter((source) => source.major === null);
+  // 「読めない」の判定は共有の手から受け取る (述語を書き写さない。理由は下記)
+  const unreadable = unreadablePinnedSources(sources);
   // 1 つでも読めていなければ、直す先が分かるようラベルを添えて述べる
   if (unreadable.length > 0) {
     return `ピン留めの ${unreadable.map((source) => source.label).join(" / ")} から major を読み取れないため`;
@@ -2182,7 +2230,7 @@ describe("実行する Node の major を宣言しているすべての場所の
     // **判定した集合そのものから文言を導く。** 以前は同じ述語を文言の側でもう一度
     // 書いていたため、「読めない」の定義を片方だけ広げると**落ちた集合と名指しする
     // 集合が食い違い**、読み手は原因ではないファイルを指されることになる (§6 DRY)
-    const unreadableSources = pinnedSources.filter((source) => source.major === null);
+    const unreadableSources = unreadablePinnedSources(pinnedSources);
     const unreadable = unreadableSources.map((source) => source.label);
     expect(
       unreadable,
@@ -2776,6 +2824,42 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
       expected: named(
         `${RUNTIME_VERIFIER} が他の処理と同じ run: にまとめられている (先に走った処理の Node が分からない)`,
       ),
+    },
+    {
+      // **CLAUDE.md §5 が認める行末コメントを落とさない。** 行末に書いた瞬間、
+      // 行末を `$` で固定した 2 つのパターンから同時に外れ、「検証していない」
+      // 「他の処理とまとめられている」という**事実と違う理由**が出ていた (実測)
+      label: "検証の行とオプションの行に行末コメントが付いている",
+      jobs: [
+        jobOf({
+          steps: [
+            setupNodeStep,
+            {
+              run:
+                "set -euo pipefail  # 失敗したら即座に止める\n" +
+                `node ${RUNTIME_VERIFIER}  # 実際に走る Node を確かめる`,
+            },
+            { run: "npm ci" },
+          ],
+        }),
+      ],
+      expected: [],
+    },
+    {
+      // **`#` が語の先頭にあるときだけ落とす。** 一律に落とすと、別ファイル名を指す
+      // この形が起動行に化けて素通りする (fail-open)。bash も語の途中の `#` は
+      // コメントにしないので、読み手にそろえてある
+      label: "起動行に見えるがファイル名が違う (語の途中の #)",
+      jobs: [
+        jobOf({
+          steps: [
+            setupNodeStep,
+            { run: `node ${RUNTIME_VERIFIER}#evil` },
+            { run: "npm ci" },
+          ],
+        }),
+      ],
+      expected: named(`${RUNTIME_VERIFIER} を実行していない`),
     },
     {
       // **シェルのオプション設定は「他の処理」ではない。** CLAUDE.md §6 が bash に
@@ -3426,6 +3510,17 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
     // 実際の README は常に 1 件なので、**規則そのものは合成した本文でしか固定できない**
     // (「1 件のときだけ」を「1 件以上」へ緩める変異が全件緑で通っていた＝実測)
     expect(parseReadmeNodeMajor(text)).toBe(expected);
+  });
+
+  it("stripShellComment が、語の先頭の # だけをコメントとして落とす", () => {
+    // 行末コメント: `#` の直前が空白なので落とす (§5 が認める書き方)
+    expect(stripShellComment("set -euo pipefail  # 失敗したら止める")).toBe("set -euo pipefail");
+    // 丸ごとコメントの行: 空文字になり、呼び出し側の空行の除去に掛かる
+    expect(stripShellComment("  # 説明だけの行")).toBe("");
+    // **語の途中の `#` は落とさない** — 落とすと別ファイル名が起動行に化ける (fail-open)
+    expect(stripShellComment(`node ${RUNTIME_VERIFIER}#evil`)).toBe(`node ${RUNTIME_VERIFIER}#evil`);
+    // コメントが無い行は前後の空白を整えるだけ (従来の trim と同じ振る舞い)
+    expect(stripShellComment(`  node ${RUNTIME_VERIFIER}  `)).toBe(`node ${RUNTIME_VERIFIER}`);
   });
 
   it("describeMissingRuntimeMajor が、読めない場合と割れている場合を言い分ける", () => {
