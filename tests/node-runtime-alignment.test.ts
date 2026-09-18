@@ -131,7 +131,7 @@
 //   Dependabot ではなく「ランタイムを上げる判断」の側に置くのが目的)。
 
 // Vitest の DSL
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 // ピン留めを書いた素のテキスト (.nvmrc / Dockerfile / README) と、
 // ワークフローの一覧 (ファイル名を書き並べず、ディレクトリから列挙する) を読むため。
 // 実行時検証スクリプトの挙動を見る検査は、使い捨ての作業場を作って本物を置くので
@@ -4120,20 +4120,29 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
 // スレッドを同期的に塞ぐので vitest は割り込めず、テスト側の時間切れが先に来ると
 // 約束した「スクリプトが … 以内に終わらず SIGTERM で打ち切られた」という
 // 名前付きの診断が**原理的に出せない**（「test timed out in …」だけが残る）。
-// いま起動する it には下の VERIFIER_SUITE_TIMEOUT_MS (60s) を与えており、
-// いちばん多い it は 10 回まわすので、3s なら全部が時間切れになっても収まる。
-// **どちらかを動かすときは、この関係が保たれているかを必ず確かめること**
-// (既定のまま 5s に戻すなら、この値もそれより短くする必要がある)。
+// いま起動する it には下の VERIFIER_SUITE_TIMEOUT_MS を与えている。
+// **この関係は runVerifier が起動のたびに数えて落とすので、約束ではなく検査になっている**
+// （以前はここで「必ず確かめること」と書いていただけで、起動するケースを足すと
+// 黙って診断が失われた。いちばん多い it は既に持ち時間の半分を使っている）。
 // スクリプトはミリ秒で終わる処理なので、この値でも十分に余裕がある
 const VERIFIER_TIMEOUT_MS = 3_000;
 // スクリプトを起動する it に与える時間。1 回の起動あたり VERIFIER_TIMEOUT_MS が
-// 上限で、いちばん多い it は 10 回まわすので、全部が時間切れになっても
-// 打ち切りの診断が出るだけの余裕を持たせる (既定の 5s では足りない)
+// 上限なので、その it の起動回数ぶんが全部時間切れになっても打ち切りの診断が
+// 出るだけの余裕を持たせる (既定の 5s では足りない)。
+// **足りているかは runVerifier が起動のたびに検査する**（数えずに済ませると、
+// 起動するケースを足した人が診断を失ったことに気付けない）
 const VERIFIER_SUITE_TIMEOUT_MS = 60_000;
 
 describe("実行時検証スクリプトそのものの挙動", () => {
   // スクリプト本体の絶対パス (起動するのは常にこの**実物**)
   const verifierPath = resolve(REPO_ROOT, RUNTIME_VERIFIER);
+  // この it の中でスクリプトを起動した回数 (持ち時間との関係を runVerifier が検査する)
+  let spawnsInCurrentTest = 0;
+  // 起動回数の上限は it 単位で決まるので、it ごとに数え直す
+  beforeEach(() => {
+    spawnsInCurrentTest = 0;
+  });
+
   // 「`.nvmrc` の形が読めない」ときにスクリプトが出す文言の目印。
   // 「major が違う」との**理由の違い**を区別するために使う (下の書式一致の検査)
   const FORMAT_ERROR_MARKER = ".nvmrc は major だけを書くこと";
@@ -4157,6 +4166,24 @@ describe("実行時検証スクリプトそのものの挙動", () => {
    *                     (削除・改名の事故を再現する)
    */
   function runVerifier(nvmrcContent: string | null): VerifierRun {
+    // この it で何回目の起動かを数える (下の不変条件の検査に使う)
+    spawnsInCurrentTest += 1;
+    // **「打ち切り時間 × 起動回数 <= その it の持ち時間」を機械的に保つ。**
+    // spawnSync はワーカーのスレッドを同期的に塞ぐので vitest は割り込めず、
+    // テスト側の時間切れが先に来ると、約束した名前付きの診断
+    // (「スクリプトが …ms 以内に終わらず SIGTERM で打ち切られた」) が**原理的に出せない** —
+    // 残るのは「test timed out in …」だけで、verify-node-major.mjs への手掛かりが消える。
+    // 以前はこの関係をコメントで約束していただけだったので、起動するケースを足すと
+    // **黙って診断が失われた**。数えて落とせば、足した人がその場で気付く
+    if (spawnsInCurrentTest * VERIFIER_TIMEOUT_MS > VERIFIER_SUITE_TIMEOUT_MS) {
+      // 直し方 (持ち時間を増やす / it を分ける) まで添えて落とす
+      throw new Error(
+        `1 つの it でスクリプトを ${spawnsInCurrentTest} 回起動しており、打ち切り時間 ` +
+          `(${VERIFIER_TIMEOUT_MS}ms) の総和が it の持ち時間 (${VERIFIER_SUITE_TIMEOUT_MS}ms) を超える。` +
+          "VERIFIER_SUITE_TIMEOUT_MS を増やすか、起動を複数の it へ分けること " +
+          "(超えたままだと打ち切りの診断が出せず「test timed out」だけが残る)。",
+      );
+    }
     // OS の一時領域に、この検査専用の作業場を作る (名前が衝突しないよう mkdtemp)
     // **名前にわざと空白を入れる。** スクリプトは失敗文言から自分の絶対パスを削るが、
     // 目印の作り方を `URL.pathname` に戻すと百分率エンコード (`my%20app`) になって
