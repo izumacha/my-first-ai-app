@@ -276,6 +276,11 @@ interface PinnedSource {
   // **書式の問題と読み取りの事故を取り違えないために持つ** — 原因が無いと
   // 「書式を直せ」という案内だけが出て、正しい書式のファイルを指すことになる
   readError: string | null;
+  // その出どころが複数の段を持つ場合の、段ごとの major (持たない出どころは undefined)。
+  // **「読めない」と「段ごとに食い違う」を言い分けるためだけに持つ** — 畳んだあとの
+  // null からはどちらか分からず、後者を前者として報告すると
+  // 「読み取りを直せ」という、直す先の違う案内になる
+  conflictingMajors?: number[] | null;
 }
 
 /** 直接依存 1 つ分の「サポートする Node の範囲」。 */
@@ -1520,8 +1525,22 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
           ? "setup-node に if: / continue-on-error が付いている (効かなくても後続が走る)"
           : "setup-node が無い",
       );
-    } else if (
-      steps.slice(0, setupIndex).some((step) => runsRepositoryCode(step) && !isVerifierOnlyStep(step))
+    }
+    // **位置の指摘は `else` にしない。** 条件付きの setup-node があると
+    // `setupIndex` は -1 になるので、`else if` で繋ぐと「前にリポジトリのコードがある」
+    // という根本原因が黙って抑止される —— `[npm ci, setup-node(if: 付き), 検証, npm test]`
+    // は 1 巡目に「if: が付いている」しか出ず、直して push した 2 巡目にはじめて
+    // 「setup-node が後ろにある」と分かる (＝CI を 1 巡よけいに使う)。
+    // 条件付きの**検証**についてはこの抑止が起きない形になっており、
+    // 対称でないのは意図した差ではなかった。
+    // **位置を見るときは `isSetupNodeStep` で探す** — 条件が付いていても「書かれている
+    // 位置」は分かるので、無条件かどうかとは別に前後関係を言える
+    const declaredSetupIndex = steps.findIndex(isSetupNodeStep);
+    if (
+      declaredSetupIndex !== -1 &&
+      steps
+        .slice(0, declaredSetupIndex)
+        .some((step) => runsRepositoryCode(step) && !isVerifierOnlyStep(step))
     ) {
       // **「setup-node より前にリポジトリのコードがある」ことを、検証の有無に関わらず
       // 名指しする。** これが根本原因 (`npm ci` がランナー既定の Node で走り、
@@ -1754,7 +1773,7 @@ function readDockerfileNodeMajor(): number | null {
  * 揃っていない / 読めない段があれば null を返し、呼び出し側が fail-closed で落とす。
  * 規則そのものの根拠は `readDockerfileNodeMajor` の docstring を参照。
  */
-function nodeMajorOfDockerfileText(text: string): number | null {
+function collectNodeMajorsOfDockerfileText(text: string): number[] | null {
   // コメントを落としたうえで、すべての `FROM node:<major>` を集める
   const majors = new Set<number>();
   // **`ARG NAME=既定値` を先に集めておく。** `FROM $BASE` の形を「読めない段」と
@@ -1845,8 +1864,28 @@ function nodeMajorOfDockerfileText(text: string): number | null {
     // 数字で始まるタグだけを採用する
     majors.add(Number(major[1]));
   }
-  // ちょうど 1 つに揃っているときだけ採用する (0 件 = 読めない / 2 件以上 = 段ごとに食い違い)
-  return majors.size === 1 ? [...majors][0] : null;
+  // 見つかった major を、宣言順ではなく値の順で返す (失敗文言を安定させるため)
+  return [...majors].sort((left, right) => left - right);
+}
+
+/**
+ * Dockerfile の `FROM node:<major>` から、**ちょうど 1 つに揃っている** major を返す。
+ *
+ * <b>集める手と畳む手を分けてある。</b> 以前はこの関数が「読めない段があった」と
+ * 「段ごとに major が食い違う」の<b>両方を <c>null</c> へ畳んで</b>いたため、
+ * 失敗文言が後者を前者として報告していた ——`FROM node:26-alpine` と
+ * `FROM node:22-alpine AS tools` が同居する Dockerfile で、
+ * 「major を読み取れない出どころがある … 読み取りも合わせて直すこと」と出て、
+ * <b>直すべきは段のドリフトなのに読み取り側を疑わせる</b>案内になっていた。
+ * これは describeMissingRuntimeMajor が防ごうとしている取り違え
+ * (「読めない」を「揃っていない」と言わない) の<b>ちょうど裏返し</b>で、
+ * そちら向きだけが手当てされていなかった。
+ */
+function nodeMajorOfDockerfileText(text: string): number | null {
+  // 段ごとの major を集める (読めない段があれば null が返る)
+  const majors = collectNodeMajorsOfDockerfileText(text);
+  // ちょうど 1 つに揃っているときだけ採用する
+  return majors !== null && majors.length === 1 ? majors[0] : null;
 }
 
 /**
@@ -1893,6 +1932,20 @@ function parseReadmeNodeMajor(text: string): number | null {
  * CI が入れる Node はピンそのものになった (突き合わせる相手が存在しない)。
  * 代わりに「その配線が保たれているか」を専用のテストで見る。
  */
+/**
+ * Dockerfile の段ごとの major を集める（読めない段があれば <c>null</c>）。
+ *
+ * <b>失敗文言のためだけに使う。</b> 合否そのものは
+ * <see cref="nodeMajorOfDockerfileText"/> が畳んだ値で決まり、ここは
+ * 「なぜ決まらなかったか」を言い分けるための材料を取るだけ。
+ */
+function describeDockerfileStageMajors(): number[] | null {
+  // 読めなければ段の情報も無い
+  const read = readTextOrError(DOCKERFILE_PATH);
+  // 中身が取れたときだけ段ごとの major を集める
+  return read.text === null ? null : collectNodeMajorsOfDockerfileText(read.text);
+}
+
 function collectPinnedSources(): PinnedSource[] {
   // 2 つの出どころをラベル付きで並べて返す。
   // **値と原因は同じ 1 回の読み取りから導く** (readMajorFrom の docstring 参照) —
@@ -1903,6 +1956,11 @@ function collectPinnedSources(): PinnedSource[] {
     {
       label: "Dockerfile (FROM node:<major>)",
       ...readMajorFrom(DOCKERFILE_PATH, nodeMajorOfDockerfileText),
+      // **段ごとの major も持っておく。** 値が決まらなかった理由が「読めない段がある」
+      // なのか「段ごとに食い違っている」なのかは、畳んだあとの null からは分からない。
+      // 失敗文言が後者を前者として報告すると、直すべき段のドリフトではなく
+      // 読み取り側を疑わせることになる (nodeMajorOfDockerfileText の docstring 参照)
+      conflictingMajors: describeDockerfileStageMajors(),
     },
   ];
 }
@@ -1944,6 +2002,33 @@ function unreadablePinnedSources(sources: readonly PinnedSource[]): PinnedSource
  * 呼び出し側の値だけで確かめると、「読めない」側の文言を潰しても全件緑のままになる
  * (このファイルが判定を合成入力で固定しているのと同じ理由)。
  */
+/**
+ * 値が決まらなかった出どころ 1 つについて、<b>その本当の原因</b>を短く述べる。
+ *
+ * <b>「読み取れない」で畳まない。</b> 段ごとに major が食い違っているだけの
+ * Dockerfile を「読み取れない」と報告すると、直すべきは段のドリフトなのに
+ * 読み取り側を疑わせる案内になる（このファイルが
+ * describeMissingRuntimeMajor で防いでいる取り違えの裏返し）。
+ *
+ * <b>2 か所の文言をここへ寄せる。</b> 主たる検査の失敗文言と
+ * describeMissingRuntimeMajor が同じ判断を必要とするので、書き写すと
+ * 片方だけが「食い違い」を言えるようになる（§6 DRY）。
+ */
+function describePinnedSourceProblem(source: PinnedSource): string {
+  // 段ごとの major が 2 つ以上あるなら、読めなかったのではなく食い違っている
+  if (source.conflictingMajors != null && source.conflictingMajors.length > 1) {
+    // どの major が混ざっているかまで出す（直す先がそのまま分かるように）
+    return `${source.label} の段ごとに major が食い違っている (${source.conflictingMajors.join(" / ")})`;
+  }
+  // ファイルそのものを読めなかったなら、その原因 (errno) を添える
+  if (source.readError !== null) {
+    // 権限やシンボリックリンクの事故を「書式を直せ」と案内しないため
+    return `${source.label} を読めない (${source.readError})`;
+  }
+  // 残るのは「読めたが書式から major を取り出せない」場合
+  return `${source.label} から major を読み取れない`;
+}
+
 function describeMissingRuntimeMajor(sources: readonly PinnedSource[]): string {
   // 読み取れなかった出どころ (あれば、そちらが原因)
   // 「読めない」の判定は共有の述語から受け取る
@@ -1952,7 +2037,7 @@ function describeMissingRuntimeMajor(sources: readonly PinnedSource[]): string {
   const unreadable = unreadablePinnedSources(sources);
   // 1 つでも読めていなければ、直す先が分かるようラベルを添えて述べる
   if (unreadable.length > 0) {
-    return `ピン留めの ${unreadable.map((source) => source.label).join(" / ")} から major を読み取れないため`;
+    return `ピン留めの ${unreadable.map(describePinnedSourceProblem).join(" / ")}ため`;
   }
   // すべて読めたうえで値が割れている場合だけ「揃っていない」と言える
   return `ピン留め ${sources.length} か所の major が揃っていないため`;
@@ -2241,13 +2326,14 @@ describe("実行する Node の major を宣言しているすべての場所の
     const unreadable = unreadableSources.map((source) => source.label);
     expect(
       unreadable,
-      `実行する Node の major を読み取れない出どころがある: ${unreadableSources
-        // **ファイルを読めなかった場合は原因 (errno) を添える** — 添えないと
-        // 権限やシンボリックリンクの事故が「書式を直せ」という案内になり、
-        // 正しい書式のファイルを指すことになる (§6 握り潰さない)
-        .map((source) => (source.readError === null ? source.label : `${source.label} (${source.readError})`))
+      `実行する Node の major が決まらない出どころがある: ${unreadableSources
+        // **原因は決め打ちせず、出どころごとに言い分ける** — ファイルを読めなかった
+        // 事故・書式から読み取れない・段ごとに食い違っている、の 3 つは直す先が違う。
+        // とくに最後を「読み取れない」と報告すると、直すべきは段のドリフトなのに
+        // 読み取り側を疑わせることになる (describePinnedSourceProblem の docstring)
+        .map(describePinnedSourceProblem)
         .join(", ")}。` +
-        "このテストは 2 か所の一致を前提にしているので、書式を変えた (多段ビルドで別 major を足した等) なら読み取りも合わせて直すこと。",
+        "このテストは 2 か所の一致を前提にしている。段ごとに食い違っているなら Dockerfile の各段を同じ major に揃え、書式を変えたのなら読み取りも合わせて直すこと。",
     ).toEqual([]);
     // 読み取れた major が全て同じであることを確かめる
     expect(
@@ -2256,6 +2342,46 @@ describe("実行する Node の major を宣言しているすべての場所の
         .map((source) => `${source.label}=${source.major}`)
         .join(", ")}。Node を上げるときは 2 か所すべてを同じ major に揃えること。`,
     ).toHaveLength(1);
+  });
+
+  it("このスイートを走らせている Node が、ピン留めした major と同じ", () => {
+    // 基準が決まっていなければ、その事実を明示して落とす
+    expect(
+      runtimeMajor,
+      `${runtimeMajorMissingReason}、走っている Node と照合する基準が決まらない`,
+    ).not.toBeNull();
+
+    // いま **このプロセスが** 動いている Node の major
+    const runningMajor = Number(process.versions.node.split(".")[0]);
+
+    // **この 1 行が、静的な検査と実行時検証の隙間を塞ぐ。**
+    //
+    // 静的な検査が見えるのは「宣言として YAML に現れる Node」まで、
+    // `scripts/verify-node-major.mjs` が申告できるのは「自分が走った時点」までで、
+    // **その後ろで差し替えられた Node** はどちらからも見えない。ところが
+    // lint / typecheck / test / e2e が実際に走るのは、まさにその「後ろ」。
+    //
+    // 覆えないと書かれていた残る境界 2 つは、どちらもここに現れる:
+    //   (1) 検証より後ろの `run:` による `echo /opt/node20/bin >> $GITHUB_PATH`
+    //   (2) 同じ `run:` の中だけで完結する入れ替え
+    //       (`. nvm.sh && nvm use 20 && npm test`)
+    // どちらの形でも、**スイートを走らせている Node 自身**は 20 を名乗るので落ちる。
+    //
+    // 実測: この検査を足す前は、`.nvmrc` が 26 のまま Node 22 で `npm run test` を
+    // 走らせても **362 件すべて緑**だった —— 「ピン留めした Node で検証した」ことを
+    // 証明するために作ったスイートが、まさにその 1 点だけを見ていなかった。
+    //
+    // 綴りに依存しないので、`run:` の中身を解釈する必要も、新しい抜け道を
+    // 追いかける必要もない (この repo が CSP と Stripe API 版で学んだ形)。
+    expect(
+      runningMajor,
+      `このスイートは Node ${process.versions.node} で走っているが、ピン留めは ${runtimeMajor} 系。` +
+        "lint / typecheck / test が実際に走る Node がピンと違うなら、緑は「ピン留めした Node で動く」" +
+        "ことの証明にならない。手元なら nvm use などで .nvmrc の major に合わせること。" +
+        "CI なら、setup-node より後ろで Node を差し替えているステップが無いかを確認すること " +
+        "(PATH への追記・run: の中の nvm / volta / asdf は、静的な検査からも " +
+        "scripts/verify-node-major.mjs からも見えない)。",
+    ).toBe(runtimeMajor);
   });
 
   it("package.json の engines.node が、ピン留めした major の実行を許している", () => {
@@ -2924,6 +3050,29 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
       ),
     },
     {
+      // **setup-node に条件が付いていても、位置は同じ巡で名指しする。**
+      // 位置の指摘を `else if (setupIndex === -1)` に繋いでいたときは、
+      // 条件付きだと setupIndex が -1 になるため「if: が付いている」しか出ず、
+      // それを直して push した次の巡にようやく「後ろにある」が出ていた (＝CI を
+      // 1 巡よけいに使う)。条件付きの**検証**では同じ抑止が起きないので、
+      // 対称でないのは意図した差ではなかった
+      label: "条件付きの setup-node が、リポジトリのコードより後ろにある",
+      jobs: [
+        jobOf({
+          steps: [
+            { run: "npm ci" },
+            { ...setupNodeStep, if: "${{ false }}" },
+            { run: "node scripts/verify-node-major.mjs" },
+            { run: "npm run test" },
+          ],
+        }),
+      ],
+      expected: named(
+        "setup-node に if: / continue-on-error が付いている (効かなくても後続が走る)" +
+          " / setup-node がリポジトリのコードより後ろにある (先に走る処理はランナー既定の Node で動く)",
+      ),
+    },
+    {
       // 検証に条件が付いていても、setup-node の位置は同じ巡で名指しする
       // (以前はこの形だと「検証に if: が付いている」しか出なかった＝実測)
       label: "条件付きの検証の後ろ・setup-node の前に別の run: がある",
@@ -3531,18 +3680,35 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
   });
 
   it("describeMissingRuntimeMajor が、読めない場合と割れている場合を言い分ける", () => {
-    // 2 か所とも読めない形 (major は同じ null なので「揃っていない」とは言えない)
+    // 2 か所とも決まらない形 (major は同じ null なので「揃っていない」とは言えない)。
+    // **読めなかった事故と、読めたが書式から取れない形を言い分ける**
     expect(
       describeMissingRuntimeMajor([
         { label: ".nvmrc", major: null, readError: "Error: ENOENT" },
         { label: "Dockerfile", major: null, readError: null },
       ]),
-    ).toBe("ピン留めの .nvmrc / Dockerfile から major を読み取れないため");
-    // 片方だけ読めない形 (読めない側だけを名指しする)
+    ).toBe("ピン留めの .nvmrc を読めない (Error: ENOENT) / Dockerfile から major を読み取れないため");
+    // 片方だけ決まらない形 (その側だけを名指しする)
     expect(
       describeMissingRuntimeMajor([
         { label: ".nvmrc", major: 26, readError: null },
         { label: "Dockerfile", major: null, readError: null },
+      ]),
+    ).toBe("ピン留めの Dockerfile から major を読み取れないため");
+    // **段ごとに食い違っている形は「読み取れない」と言わない。**
+    // 直すべきは段のドリフトなので、読み取り側を疑わせてはいけない
+    // (どの major が混ざっているかまで出して、直す先をそのまま示す)
+    expect(
+      describeMissingRuntimeMajor([
+        { label: ".nvmrc", major: 26, readError: null },
+        { label: "Dockerfile", major: null, readError: null, conflictingMajors: [22, 26] },
+      ]),
+    ).toBe("ピン留めの Dockerfile の段ごとに major が食い違っている (22 / 26)ため");
+    // 段が 1 つしか無いのに決まらない場合は、食い違いではなく読み取りの問題
+    expect(
+      describeMissingRuntimeMajor([
+        { label: ".nvmrc", major: 26, readError: null },
+        { label: "Dockerfile", major: null, readError: null, conflictingMajors: [] },
       ]),
     ).toBe("ピン留めの Dockerfile から major を読み取れないため");
     // すべて読めたうえで値が割れている形だけが「揃っていない」
@@ -3552,6 +3718,21 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
         { label: "Dockerfile", major: 22, readError: null },
       ]),
     ).toBe("ピン留め 2 か所の major が揃っていないため");
+  });
+
+  it("collectNodeMajorsOfDockerfileText が、段ごとの major を畳まずに返す", () => {
+    // **畳む前の情報を持つのが要点。** nodeMajorOfDockerfileText は
+    // 「読めない段がある」と「段ごとに食い違う」の両方を null へ畳むので、
+    // 失敗文言が後者を前者として報告していた (この関数はその材料を返す)
+    expect(collectNodeMajorsOfDockerfileText("FROM node:26-alpine\nFROM node:22 AS tools\n")).toEqual([
+      22, 26,
+    ]);
+    // 揃っていれば 1 件だけ
+    expect(collectNodeMajorsOfDockerfileText("FROM node:26-alpine\nFROM node:26 AS tools\n")).toEqual([26]);
+    // 読めない段があれば null (食い違いとは区別する)
+    expect(collectNodeMajorsOfDockerfileText("FROM node:26-alpine\nFROM node:lts-alpine\n")).toBeNull();
+    // node の段が 1 つも無ければ空 (読めないのではなく、対象が無い)
+    expect(collectNodeMajorsOfDockerfileText("FROM golang:1.22 AS build\n")).toEqual([]);
   });
 
   it("readTextOrError が、読めなかった原因を握り潰さずに運ぶ", () => {
