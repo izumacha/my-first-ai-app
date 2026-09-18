@@ -1413,6 +1413,282 @@ interface MissingSetupNodeJob {
  * 表に出ず、巡が 1 つ増える)。これは除外表を外した理由と同じ形
  * 「1 つの事情が、それでは正当化できない検査まで免除する」。
  */
+/**
+ * ステップより**広い場所**で宣言された差し替え（ジョブ / ワークフロー / コンテナ単位）を
+ * 理由の一覧にして返す。
+ *
+ * **ここだけ「位置」を持たない。** 下の 2 つ（有無と条件・並び順）はステップの並びを見るが、
+ * これらは宣言された時点でそのジョブの全ステップに効くので、**どこに書かれていても同じ**。
+ * 判定の性質が違うものを 1 つの関数に混ぜると、読み手は「この if はどのステップの話か」を
+ * 毎回追い直すことになるので分けてある（§6 単一責務）。
+ */
+function collectScopeWideSwapReasons(job: WorkflowJob): string[] {
+  // **ステップより広い場所で宣言された `env: PATH:` は、そのジョブの全ステップに効く。**
+  // ステップ単位のものと同じく**宣言として YAML に現れる**のに読まないと、
+  // 広い側で `/opt/node20/bin` を先頭に置き、実行時検証のステップだけ
+  // step 単位の `env:` で正しい PATH に戻す、という 2 段構えで
+  // **両方の網が緑のまま**スイートが別の Node で走る (実測)。
+  // 位置に関係なく効くので、宣言があること自体を落とす (直し方は「宣言しない」)。
+  // **`container:` の `env:` も同じ扱いにする** — これもコンテナの中で走る全ステップに
+  // 効くので、ジョブ / ワークフロー単位だけを塞いでも同じ 2 段構えが `container.env`
+  // 経由でそのまま通る (3 つのうち 1 つでも読み落とすと、その 1 つへ書き換えるだけで
+  // 迂回できる = 塞いだつもりの穴が別のキーで開いたままになる)。
+  // `container:` が文字列 (`container: node:20`) のときは `env:` を持ちようがなく、
+  // `asRecord` が空の対応表に潰すので何も宣言していない扱いになる
+  // コンテナの定義 (文字列で書かれていれば空の対応表になる)
+  const container = asRecord(job.definition.container);
+  const scopedPathEnv = [
+    { label: "ジョブ", declared: declaresPathEnv(job.definition) },
+    { label: "ワークフロー", declared: declaresPathEnv({ env: job.workflowEnv }) },
+    { label: "コンテナ", declared: declaresPathEnv(container) },
+  ]
+    .filter((scope) => scope.declared)
+    .map((scope) => scope.label);
+  // 当てはまった宣言を溜める入れ物
+  const reasons: string[] = [];
+  if (scopedPathEnv.length > 0) {
+    reasons.push(
+      `${scopedPathEnv.join(" / ")}単位の env: で PATH を宣言している (そのジョブの全ステップの探索パスが変わる)`,
+    );
+  }
+  // **`container.options` も同じ経路。** `--env PATH=…` は `docker create` へ
+  // そのまま渡るので、そのコンテナで走る全ステップが継ぐ — `container.env` を
+  // 塞いだ理由 (「1 つでも読み落とすと、そこへ書き換えるだけで迂回できる」) が
+  // そのまま当てはまる (実測で全件緑だった)。**`env:` とは別の理由にする** —
+  // 直す先が別のキーなので、`env:` の文言に混ぜると直し方が伝わらない
+  if (declaresPathInContainerOptions(container)) {
+    reasons.push(
+      "container.options で PATH を宣言している (そのコンテナで走る全ステップの探索パスが変わる)",
+    );
+  }
+  // **ステップより広い `defaults.run.shell` も同じ扱い。** その範囲の全 `run:` の
+  // 実行シェルそのものを差し替えるので、広い側で Node 20 を先頭に置く独自シェルを
+  // 宣言し、実行時検証のステップだけ `shell: bash` で戻す 2 段構えにすると、
+  // `env: PATH:` のときとまったく同じ形で両方の網が緑のままになる (実測)。
+  // `container:` には `defaults:` が無いので、ここは 2 つのスコープだけを見る
+  // **`scopedPathEnv` と同じ形にそろえる。** 添字で名前と対象を結ぶ書き方だと、
+  // スコープを 1 つ足すときに名前の一覧と `index === n` の分岐を別々に直すことになり、
+  // 食い違うと**別のスコープの名前で報告される**（`scopedPathEnv` は実際に
+  // この差分で 4 つ目のスコープが増えている）
+  const scopedShell = [
+    { label: "ジョブ", declared: declaresCustomDefaultShell(job.definition) },
+    { label: "ワークフロー", declared: declaresCustomDefaultShell({ defaults: job.workflowDefaults }) },
+  ]
+    .filter((scope) => scope.declared)
+    .map((scope) => scope.label);
+  if (scopedShell.length > 0) {
+    reasons.push(
+      `${scopedShell.join(" / ")}単位の defaults: で独自の shell: を宣言している (そのジョブの全 run: の実行シェルが変わる)`,
+    );
+  }
+  // 当てはまらなければ空のまま返る
+  return reasons;
+}
+
+/**
+ * **必要な 2 つ（無条件の `setup-node` と実行時検証）が「効く形で」置かれているか**を見て、
+ * 足りない分を理由の一覧にして返す。
+ *
+ * 見るのは**有無と条件**で、前後関係は下の {@link describePlacementProblem} が見る。
+ * 分けてあるのは、こちらが**土台が無い状態**（-1 が返っている）を扱うのに対し、
+ * あちらは**土台が揃ってはじめて成り立つ**判定だから — 混ぜると「比べる相手がいないのに
+ * 並び順を語る」分岐を書けてしまう。
+ */
+function collectGuardPresenceReasons(
+  steps: readonly Record<string, unknown>[],
+  setupIndex: number,
+  verifierIndex: number,
+): string[] {
+  // 当てはまった不足を溜める入れ物
+  const reasons: string[] = [];
+  // 無条件の setup-node が 1 つも無い場合は、条件付きの有無で文言を分ける
+  if (setupIndex === -1) {
+    // setup-node 自体はあるなら、書き忘れではなく「効かない置き方」だと伝える
+    reasons.push(
+      steps.some(isSetupNodeStep)
+        ? "setup-node に if: / continue-on-error が付いている (効かなくても後続が走る)"
+        : "setup-node が無い",
+    );
+  }
+  // **位置の指摘は `else` にしない。** 条件付きの setup-node があると
+  // `setupIndex` は -1 になるので、`else if` で繋ぐと「前にリポジトリのコードがある」
+  // という根本原因が黙って抑止される —— `[npm ci, setup-node(if: 付き), 検証, npm test]`
+  // は 1 巡目に「if: が付いている」しか出ず、直して push した 2 巡目にはじめて
+  // 「setup-node が後ろにある」と分かる (＝CI を 1 巡よけいに使う)。
+  // 条件付きの**検証**についてはこの抑止が起きない形になっており、
+  // 対称でないのは意図した差ではなかった。
+  // **位置を見るときは `isSetupNodeStep` で探す** — 条件が付いていても「書かれている
+  // 位置」は分かるので、無条件かどうかとは別に前後関係を言える
+  const declaredSetupIndex = steps.findIndex(isSetupNodeStep);
+  if (
+    declaredSetupIndex !== -1 &&
+    steps
+      .slice(0, declaredSetupIndex)
+      .some((step) => runsRepositoryCode(step) && !isVerifierOnlyStep(step))
+  ) {
+    // **「setup-node より前にリポジトリのコードがある」ことを、検証の有無に関わらず
+    // 名指しする。** これが根本原因 (`npm ci` がランナー既定の Node で走り、
+    // そこで入る node_modules は検証していない Node のもの) なのに、以前は
+    // 検証まわりの文言しか出なかった: `[npm ci, setup-node, 検証, npm test]` は
+    // 1 巡目に「検証がリポジトリのコードより後ろ」、直すと 2 巡目に「検証が
+    // setup-node より前」と出て、**3 巡かけても setup-node の位置は一度も
+    // 名指しされない** (docstring は名指しすると書いているのに = 実測)。
+    // **判定は「setup-node より前に、検証以外のリポジトリのコードがあるか」で行う。**
+    // 先頭 1 つ (`steps[firstRepoCode]`) だけを見る形だと、検証がたまたま先頭に
+    // 来ているだけで抑止され、`[検証, npm ci, setup-node, npm test]` の
+    // `npm ci` がランナー既定の Node で走ることを名指ししない (実測。しかも検証に
+    // `if:` が付くと、その巡は「検証に if: が付いている」しか出ずさらに 1 巡増える)。
+    // **`invokesRuntimeVerifier` で判定してもいけない** — 検証を他の処理と同じ
+    // `run:` にまとめた形 (`[run: npm ci + 検証, setup-node, npm test]`) まで
+    // 抑止され、同じく根本原因が名指しされない (実測)。
+    // 抑止されるのは `[検証, setup-node, npm ci]` のように**検証だけのステップしか
+    // 前に無い**形で、そこは下の並び順の判定がより具体的な文言で名指しする
+    reasons.push(
+      "setup-node がリポジトリのコードより後ろにある (先に走る処理はランナー既定の Node で動く)",
+    );
+  }
+  // 1 つも無ければ、そのジョブは「宣言として見えない形」を何も検証していない
+  if (verifierIndex === -1) {
+    // 実体が無いのか、条件付きなのかを文言で分ける
+    reasons.push(
+      steps.some(invokesRuntimeVerifier)
+        ? `${RUNTIME_VERIFIER} に if: / continue-on-error が付いている`
+        : `${RUNTIME_VERIFIER} を実行していない`,
+    );
+  }
+  // 当てはまらなければ空のまま返る
+  return reasons;
+}
+
+/**
+ * 並び順まわりの問題を**いちばん具体的なもの 1 つ**だけ述べる（無ければ `null`）。
+ *
+ * **ここだけは束ねない。** 「検証が setup-node より前」のような形は、その帰結として
+ * 「検証より後ろに差し替えうるステップがある」も同時に成り立つので、並べると
+ * 原因ではない派生の指摘が混ざって直す先が分かりにくくなる（広い場所の宣言や
+ * 有無の不足を**束ねて**出しているのと、意図的に扱いを変えている）。
+ *
+ * 呼ばれるのは `setupIndex` と `verifierIndex` が両方見つかっているときだけ
+ * （比べる土台が無いところでは成り立たない）。
+ */
+function describePlacementProblem(
+  steps: readonly Record<string, unknown>[],
+  setupIndex: number,
+  verifierIndex: number,
+  firstRepoCode: number,
+): string | null {
+  // **検証は、それだけのステップに置く。** スイートと同じ `run:` にまとめられると
+  // 並び順の要求 (下の 2 つ) がステップの粒度でしか効かず、一度も発火しないまま
+  // スイートが先に別の Node で走る (実測。理由は isVerifierOnlyStep の docstring)
+  if (!isVerifierOnlyStep(steps[verifierIndex])) {
+    return (
+      `${RUNTIME_VERIFIER} が他の処理と同じ run: にまとめられている (先に走った処理の Node が分からない)`
+    );
+  }
+  // setup-node より前だと、用意した Node ではなくランナー既定の Node を見てしまう
+  if (verifierIndex < setupIndex) {
+    return (
+      `${RUNTIME_VERIFIER} が setup-node より前にある (用意した Node を検証していない)`
+    );
+  }
+  // **リポジトリのコードより後ろでもいけない。** 先にスイートを走らせてから検証すると、
+  // 検証は「そのステップの Node」を見るだけで、既に走り終えた検証 (lint / test / e2e) が
+  // どの Node で動いたかは分からない。`$GITHUB_PATH` などジョブ全体に効く入れ替えを
+  // 挟む形が、後置だと素通りした (実測)。検証自身も `run:` なので、期待どおりの
+  // 並びでは検証が「最初のリポジトリのコード」になる
+  if (verifierIndex > firstRepoCode) {
+    return (
+      `${RUNTIME_VERIFIER} がリポジトリのコードより後ろにある (先に走った検証の Node が分からない)`
+    );
+  }
+  // **実行時検証のステップ自身の `env: PATH:` を落とす。** 下の「検証より後ろ」の走査は
+  // `verifierIndex + 1` から始まるので、**検証ステップに付けた `env: PATH:` だけが
+  // どちらの網からも見えない**。これは上で塞いだ広い側の宣言と**対になる穴**で、
+  // 向きが逆なだけの同じ 2 段構えになる: `setup-node` の後ろに
+  // `volta-cli/action (node-version: '20')` を置いて PATH の先頭を Node 20 にし、
+  // **検証ステップにだけ** `env: { PATH: <Node 26 の bin>:... }` を添えると、
+  // 検証は「26 です」と申告して終了コード 0 で通り、続く `npm ci` / lint / test は
+  // Node 20 で走る (実測で全件緑)。実行時検証は「宣言として見えない入れ替え」を
+  // 引き受けている最後の砦なので、**その砦自身の探索パスを別に向ける宣言**は
+  // 値に関わらず落とす (直し方は「検証ステップに PATH を宣言しない」)
+  if (declaresPathEnv(steps[verifierIndex])) {
+    return (
+      `${RUNTIME_VERIFIER} のステップに env: で PATH が宣言されている (検証だけ別の Node を指せる)`
+    );
+  }
+  // **独自の shell: も同じ口。** 広い側 (`defaults.run.shell`) で Node 20 を
+  // 先頭に置き、検証ステップだけ `shell:` で戻すと、`env: PATH:` とまったく
+  // 同じ 2 段構えになる (直す先がキーごとに違うので、文言を分ける)
+  if (declaresCustomShell(steps[verifierIndex])) {
+    return (
+      `${RUNTIME_VERIFIER} のステップに独自の shell: が指定されている (検証だけ別の Node を指せる)`
+    );
+  }
+  // **「setup-node がリポジトリのコードより後ろ」を別途見る必要は無い。**
+  // ここまでの判定で `setupIndex <= verifierIndex <= firstRepoCode` が確定しており、
+  // 実行時検証自身も `run:` (= リポジトリのコード) なので、setup-node は必ず
+  // 最初のリポジトリのコードより前にある。**この不変条件は「どの判定も免除されない」
+  // ことに依存する** — 除外表を持っていた頃は `runtimeVerifier` の免除が右側の
+  // 不等号を外し、`[run: npm ci, setup-node, 検証, run: npm run test]` が
+  // 名指しされないまま `npm ci` をランナー既定の Node で走らせていた (実測)。
+  // 除外表を外したのでこの穴は閉じており、ここに分岐を置くと一度も出ない
+  // 死んだコードになる (§6 デッドコードを残さない)。
+  // **実行時検証の「後ろ」で Node を差し替える形を落とす。**
+  // 上の並び順の要求により、実行時検証は必ず**最初のリポジトリのコード**になる。
+  // つまり検証が見るのは「その時点」の Node で、**それより後ろで入れ替えられると
+  // 静的な網からも実行時検証からも見えない**。実測で、正しい setup-node と検証の
+  // 後ろに `uses: volta-cli/action@v4 (node-version: '20')` を足した形は
+  // **全件緑のまま通り**、lint / test / e2e は実際には Node 20 で走る。
+  // アクションの名前で絞らないのは、`docker://ghcr.io/acme/ci-node:20` が
+  // 素通りしたのと同じ理由 (名前から Node を持ち込むかは判定できない)。
+  // **最後のリポジトリのコードより後ろは見ない** — そこに置かれた
+  // `actions/upload-artifact` はもう誰の Node にも影響しないので、
+  // 落とすと正当な形に直しようの無い要求を出すことになる。
+  // **`run:` による差し替え (`echo ... >> $GITHUB_PATH`) はここでも見えない** —
+  // 中身を解釈しない限り区別できず、冒頭コメントに「残る境界」として書いてある。
+  // 最後にリポジトリのコードを実行するステップの位置 (それより後ろは影響しない)
+  const lastRepoCode = steps.findLastIndex(runsRepositoryCode);
+  // 検証より後ろ・最後のリポジトリのコードまでにある uses: のステップを集める。
+  // **終端を含める (`+ 1`)。** 最後のリポジトリのコードが `run:` なら `usesOf` が
+  // 空文字列なので下の絞り込みで落ち、含めても何も変わらない。一方それが
+  // **ローカルの composite action (`uses: ./...`)** のときは、そのステップ自身が
+  // 「中身を読めない uses:」と「スイートの実行」を兼ねる — 終端を除いていたときは
+  // `[setup-node, 検証, uses: ./.github/actions/run-suite]` が**名指しされず**、
+  // action.yml の中で Node を入れ替えてからスイートを走らせる形が
+  // 静的な網からも実行時検証からも見えなかった (実測で空配列)。
+  // 後ろにもう 1 つ `run:` を足すと同じ差し替えが捕まっていたので、
+  // 見落としは純粋にこの境界だけが原因。
+  // **ステップの `env: PATH:` も同じ扱いで見る。** これは `run:` の中身と違って
+  // **宣言として YAML に現れる**ので、静的に読める — 読まないと
+  // `run: npm ci && npm run test` に `env: { PATH: /opt/node20/bin:... }` を添えるだけで
+  // スイートが別の Node で走り、**両方の網が緑のまま**になる (実測)。
+  // `run:` の中の `export PATH=...` は中身を解釈しないと分からないので引き続き見えず、
+  // そちらは冒頭コメントに「残る境界」として書いてある。
+  const swappers = steps
+    .slice(verifierIndex + 1, lastRepoCode + 1)
+    .filter((step) => usesOf(step) !== "" || declaresPathEnv(step) || declaresCustomShell(step));
+  // 1 つでもあれば、検証済みの Node で残りが走る保証が無い
+  if (swappers.length > 0) {
+    return (
+      `${RUNTIME_VERIFIER} より後ろに Node を差し替えうるステップがある ` +
+          `(${swappers.map(describeSwapper).join(" / ")})。検証した Node のまま走る保証が無い。` +
+          // **直し方は 2 通りあり、ローカル action だけ別**。第三者アクションや
+          // `env: PATH:` は位置を変えれば済むが、`uses: ./...` は**それ自身が
+          // リポジトリのコード**なので、前へ出せば「検証より前」、後ろへ出そうにも
+          // 自分が最後のリポジトリのコード — どちらの案内も成立しない。
+          // 案内どおりに直せない要求は、いずれ検査ごと緩められる (この repo が
+          // 繰り返し避けている形) ので、取れる手段だけを書く。
+          // **当てはまるぶんは両方出す** — 片方だけにすると、ローカル action と
+          // `actions/cache` が混ざったときに後者へ案内が付かず、直して push した
+          // 次の巡ではじめて残りの案内が出る (この差分がまさに減らそうとしている
+          // 「CI の巡が増える」形)
+          describeSwapperAdvice(swappers)
+    );
+  }
+  // どの判定にも掛からなかった（並び順は満たされている）
+  return null;
+}
+
 function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetupNodeJob[] {
   // **ワークフローごとのジョブ索引は 1 度だけ作る。** `needs:` をたどるのに要るが、
   // 中身はジョブごとに変わらない (ループ不変) ので、各ジョブで作り直すと
@@ -1444,70 +1720,6 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
     if (firstRepoCode === -1) return [];
     // 走らない形なら、置き方を見る前にそれを名指しする
     if (neverRuns !== null) return [{ file: job.file, job: job.name, reason: neverRuns }];
-    // **ステップより広い場所で宣言された `env: PATH:` は、そのジョブの全ステップに効く。**
-    // ステップ単位のものと同じく**宣言として YAML に現れる**のに読まないと、
-    // 広い側で `/opt/node20/bin` を先頭に置き、実行時検証のステップだけ
-    // step 単位の `env:` で正しい PATH に戻す、という 2 段構えで
-    // **両方の網が緑のまま**スイートが別の Node で走る (実測)。
-    // 位置に関係なく効くので、宣言があること自体を落とす (直し方は「宣言しない」)。
-    // **`container:` の `env:` も同じ扱いにする** — これもコンテナの中で走る全ステップに
-    // 効くので、ジョブ / ワークフロー単位だけを塞いでも同じ 2 段構えが `container.env`
-    // 経由でそのまま通る (3 つのうち 1 つでも読み落とすと、その 1 つへ書き換えるだけで
-    // 迂回できる = 塞いだつもりの穴が別のキーで開いたままになる)。
-    // `container:` が文字列 (`container: node:20`) のときは `env:` を持ちようがなく、
-    // `asRecord` が空の対応表に潰すので何も宣言していない扱いになる
-    // コンテナの定義 (文字列で書かれていれば空の対応表になる)
-    const container = asRecord(job.definition.container);
-    const scopedPathEnv = [
-      { label: "ジョブ", declared: declaresPathEnv(job.definition) },
-      { label: "ワークフロー", declared: declaresPathEnv({ env: job.workflowEnv }) },
-      { label: "コンテナ", declared: declaresPathEnv(container) },
-    ]
-      .filter((scope) => scope.declared)
-      .map((scope) => scope.label);
-    // **独立した指摘は 1 度にまとめて出す。** 1 件ずつ早期 return すると、
-    // 「env: PATH: を宣言していて、かつ setup-node も無い」ジョブは直して push する
-    // たびに次の 1 件が出る = CI の巡が増える (上位の expect.soft を soft にしている
-    // 理由とまったく同じ事情が、1 段下に残っていた)。
-    // **一方、並び順の判定はまとめない** — 「検証が setup-node より前」のような形は
-    // その帰結として「検証より後ろに差し替えうるステップがある」も同時に成り立ち、
-    // 束ねると原因ではない派生の指摘が混ざって直す先が分かりにくくなる
-    const reasons: string[] = [];
-    if (scopedPathEnv.length > 0) {
-      reasons.push(
-        `${scopedPathEnv.join(" / ")}単位の env: で PATH を宣言している (そのジョブの全ステップの探索パスが変わる)`,
-      );
-    }
-    // **`container.options` も同じ経路。** `--env PATH=…` は `docker create` へ
-    // そのまま渡るので、そのコンテナで走る全ステップが継ぐ — `container.env` を
-    // 塞いだ理由 (「1 つでも読み落とすと、そこへ書き換えるだけで迂回できる」) が
-    // そのまま当てはまる (実測で全件緑だった)。**`env:` とは別の理由にする** —
-    // 直す先が別のキーなので、`env:` の文言に混ぜると直し方が伝わらない
-    if (declaresPathInContainerOptions(container)) {
-      reasons.push(
-        "container.options で PATH を宣言している (そのコンテナで走る全ステップの探索パスが変わる)",
-      );
-    }
-    // **ステップより広い `defaults.run.shell` も同じ扱い。** その範囲の全 `run:` の
-    // 実行シェルそのものを差し替えるので、広い側で Node 20 を先頭に置く独自シェルを
-    // 宣言し、実行時検証のステップだけ `shell: bash` で戻す 2 段構えにすると、
-    // `env: PATH:` のときとまったく同じ形で両方の網が緑のままになる (実測)。
-    // `container:` には `defaults:` が無いので、ここは 2 つのスコープだけを見る
-    // **`scopedPathEnv` と同じ形にそろえる。** 添字で名前と対象を結ぶ書き方だと、
-    // スコープを 1 つ足すときに名前の一覧と `index === n` の分岐を別々に直すことになり、
-    // 食い違うと**別のスコープの名前で報告される**（`scopedPathEnv` は実際に
-    // この差分で 4 つ目のスコープが増えている）
-    const scopedShell = [
-      { label: "ジョブ", declared: declaresCustomDefaultShell(job.definition) },
-      { label: "ワークフロー", declared: declaresCustomDefaultShell({ defaults: job.workflowDefaults }) },
-    ]
-      .filter((scope) => scope.declared)
-      .map((scope) => scope.label);
-    if (scopedShell.length > 0) {
-      reasons.push(
-        `${scopedShell.join(" / ")}単位の defaults: で独自の shell: を宣言している (そのジョブの全 run: の実行シェルが変わる)`,
-      );
-    }
     // 必ず効く setup-node の位置 (if: / continue-on-error 付きは数えない)
     const setupIndex = steps.findIndex(isUnconditionalSetupNode);
     // **実行時検証も同じジョブで、無条件・setup-node より後ろに置く。**
@@ -1517,61 +1729,19 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
     const verifierIndex = steps.findIndex(
       (step) => invokesRuntimeVerifier(step) && isUnconditionalStep(step),
     );
-    // 無条件の setup-node が 1 つも無い場合は、条件付きの有無で文言を分ける
-    if (setupIndex === -1) {
-      // setup-node 自体はあるなら、書き忘れではなく「効かない置き方」だと伝える
-      reasons.push(
-        steps.some(isSetupNodeStep)
-          ? "setup-node に if: / continue-on-error が付いている (効かなくても後続が走る)"
-          : "setup-node が無い",
-      );
-    }
-    // **位置の指摘は `else` にしない。** 条件付きの setup-node があると
-    // `setupIndex` は -1 になるので、`else if` で繋ぐと「前にリポジトリのコードがある」
-    // という根本原因が黙って抑止される —— `[npm ci, setup-node(if: 付き), 検証, npm test]`
-    // は 1 巡目に「if: が付いている」しか出ず、直して push した 2 巡目にはじめて
-    // 「setup-node が後ろにある」と分かる (＝CI を 1 巡よけいに使う)。
-    // 条件付きの**検証**についてはこの抑止が起きない形になっており、
-    // 対称でないのは意図した差ではなかった。
-    // **位置を見るときは `isSetupNodeStep` で探す** — 条件が付いていても「書かれている
-    // 位置」は分かるので、無条件かどうかとは別に前後関係を言える
-    const declaredSetupIndex = steps.findIndex(isSetupNodeStep);
-    if (
-      declaredSetupIndex !== -1 &&
-      steps
-        .slice(0, declaredSetupIndex)
-        .some((step) => runsRepositoryCode(step) && !isVerifierOnlyStep(step))
-    ) {
-      // **「setup-node より前にリポジトリのコードがある」ことを、検証の有無に関わらず
-      // 名指しする。** これが根本原因 (`npm ci` がランナー既定の Node で走り、
-      // そこで入る node_modules は検証していない Node のもの) なのに、以前は
-      // 検証まわりの文言しか出なかった: `[npm ci, setup-node, 検証, npm test]` は
-      // 1 巡目に「検証がリポジトリのコードより後ろ」、直すと 2 巡目に「検証が
-      // setup-node より前」と出て、**3 巡かけても setup-node の位置は一度も
-      // 名指しされない** (docstring は名指しすると書いているのに = 実測)。
-      // **判定は「setup-node より前に、検証以外のリポジトリのコードがあるか」で行う。**
-      // 先頭 1 つ (`steps[firstRepoCode]`) だけを見る形だと、検証がたまたま先頭に
-      // 来ているだけで抑止され、`[検証, npm ci, setup-node, npm test]` の
-      // `npm ci` がランナー既定の Node で走ることを名指ししない (実測。しかも検証に
-      // `if:` が付くと、その巡は「検証に if: が付いている」しか出ずさらに 1 巡増える)。
-      // **`invokesRuntimeVerifier` で判定してもいけない** — 検証を他の処理と同じ
-      // `run:` にまとめた形 (`[run: npm ci + 検証, setup-node, npm test]`) まで
-      // 抑止され、同じく根本原因が名指しされない (実測)。
-      // 抑止されるのは `[検証, setup-node, npm ci]` のように**検証だけのステップしか
-      // 前に無い**形で、そこは下の並び順の判定がより具体的な文言で名指しする
-      reasons.push(
-        "setup-node がリポジトリのコードより後ろにある (先に走る処理はランナー既定の Node で動く)",
-      );
-    }
-    // 1 つも無ければ、そのジョブは「宣言として見えない形」を何も検証していない
-    if (verifierIndex === -1) {
-      // 実体が無いのか、条件付きなのかを文言で分ける
-      reasons.push(
-        steps.some(invokesRuntimeVerifier)
-          ? `${RUNTIME_VERIFIER} に if: / continue-on-error が付いている`
-          : `${RUNTIME_VERIFIER} を実行していない`,
-      );
-    }
+    // **独立した指摘は 1 度にまとめて出す。** 1 件ずつ早期 return すると、
+    // 「env: PATH: を宣言していて、かつ setup-node も無い」ジョブは直して push する
+    // たびに次の 1 件が出る = CI の巡が増える (上位の expect.soft を soft にしている
+    // 理由とまったく同じ事情が、1 段下に残っていた)。
+    // **一方、並び順の判定はまとめない** — 「検証が setup-node より前」のような形は
+    // その帰結として「検証より後ろに差し替えうるステップがある」も同時に成り立ち、
+    // 束ねると原因ではない派生の指摘が混ざって直す先が分かりにくくなる
+    // **判定の性質ごとに分けた 3 つから集める。** 広い場所の宣言と「有無・条件」は
+    // 束ねて出し、並び順だけは 1 つに絞る（理由は describePlacementProblem の docstring）
+    const reasons = [
+      ...collectScopeWideSwapReasons(job),
+      ...collectGuardPresenceReasons(steps, setupIndex, verifierIndex),
+    ];
     // **位置の判定は、setup-node と実行時検証が両方見つかっているときだけ成り立つ**
     // (比べる土台が無い)。見つかっていなければ、ここまでの独立した指摘を返して終える
     if (setupIndex === -1 || verifierIndex === -1) {
@@ -1584,116 +1754,11 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
     // **位置の指摘どうしはまとめない** — 「検証が setup-node より前」はその帰結として
     // 「検証より後ろに差し替えうるステップがある」も成り立ち、束ねると原因ではない
     // 派生の指摘が混ざって直す先が分かりにくくなる
-    const withReasons = (reason: string) => [
-      { file: job.file, job: job.name, reason: [...reasons, reason].join(" / ") },
-    ];
-    // **検証は、それだけのステップに置く。** スイートと同じ `run:` にまとめられると
-    // 並び順の要求 (下の 2 つ) がステップの粒度でしか効かず、一度も発火しないまま
-    // スイートが先に別の Node で走る (実測。理由は isVerifierOnlyStep の docstring)
-    if (!isVerifierOnlyStep(steps[verifierIndex])) {
-      return withReasons(
-        `${RUNTIME_VERIFIER} が他の処理と同じ run: にまとめられている (先に走った処理の Node が分からない)`,
-      );
-    }
-    // setup-node より前だと、用意した Node ではなくランナー既定の Node を見てしまう
-    if (verifierIndex < setupIndex) {
-      return withReasons(
-        `${RUNTIME_VERIFIER} が setup-node より前にある (用意した Node を検証していない)`,
-      );
-    }
-    // **リポジトリのコードより後ろでもいけない。** 先にスイートを走らせてから検証すると、
-    // 検証は「そのステップの Node」を見るだけで、既に走り終えた検証 (lint / test / e2e) が
-    // どの Node で動いたかは分からない。`$GITHUB_PATH` などジョブ全体に効く入れ替えを
-    // 挟む形が、後置だと素通りした (実測)。検証自身も `run:` なので、期待どおりの
-    // 並びでは検証が「最初のリポジトリのコード」になる
-    if (verifierIndex > firstRepoCode) {
-      return withReasons(
-        `${RUNTIME_VERIFIER} がリポジトリのコードより後ろにある (先に走った検証の Node が分からない)`,
-      );
-    }
-    // **実行時検証のステップ自身の `env: PATH:` を落とす。** 下の「検証より後ろ」の走査は
-    // `verifierIndex + 1` から始まるので、**検証ステップに付けた `env: PATH:` だけが
-    // どちらの網からも見えない**。これは上で塞いだ広い側の宣言と**対になる穴**で、
-    // 向きが逆なだけの同じ 2 段構えになる: `setup-node` の後ろに
-    // `volta-cli/action (node-version: '20')` を置いて PATH の先頭を Node 20 にし、
-    // **検証ステップにだけ** `env: { PATH: <Node 26 の bin>:... }` を添えると、
-    // 検証は「26 です」と申告して終了コード 0 で通り、続く `npm ci` / lint / test は
-    // Node 20 で走る (実測で全件緑)。実行時検証は「宣言として見えない入れ替え」を
-    // 引き受けている最後の砦なので、**その砦自身の探索パスを別に向ける宣言**は
-    // 値に関わらず落とす (直し方は「検証ステップに PATH を宣言しない」)
-    if (declaresPathEnv(steps[verifierIndex])) {
-      return withReasons(
-        `${RUNTIME_VERIFIER} のステップに env: で PATH が宣言されている (検証だけ別の Node を指せる)`,
-      );
-    }
-    // **独自の shell: も同じ口。** 広い側 (`defaults.run.shell`) で Node 20 を
-    // 先頭に置き、検証ステップだけ `shell:` で戻すと、`env: PATH:` とまったく
-    // 同じ 2 段構えになる (直す先がキーごとに違うので、文言を分ける)
-    if (declaresCustomShell(steps[verifierIndex])) {
-      return withReasons(
-        `${RUNTIME_VERIFIER} のステップに独自の shell: が指定されている (検証だけ別の Node を指せる)`,
-      );
-    }
-    // **「setup-node がリポジトリのコードより後ろ」を別途見る必要は無い。**
-    // ここまでの判定で `setupIndex <= verifierIndex <= firstRepoCode` が確定しており、
-    // 実行時検証自身も `run:` (= リポジトリのコード) なので、setup-node は必ず
-    // 最初のリポジトリのコードより前にある。**この不変条件は「どの判定も免除されない」
-    // ことに依存する** — 除外表を持っていた頃は `runtimeVerifier` の免除が右側の
-    // 不等号を外し、`[run: npm ci, setup-node, 検証, run: npm run test]` が
-    // 名指しされないまま `npm ci` をランナー既定の Node で走らせていた (実測)。
-    // 除外表を外したのでこの穴は閉じており、ここに分岐を置くと一度も出ない
-    // 死んだコードになる (§6 デッドコードを残さない)。
-    // **実行時検証の「後ろ」で Node を差し替える形を落とす。**
-    // 上の並び順の要求により、実行時検証は必ず**最初のリポジトリのコード**になる。
-    // つまり検証が見るのは「その時点」の Node で、**それより後ろで入れ替えられると
-    // 静的な網からも実行時検証からも見えない**。実測で、正しい setup-node と検証の
-    // 後ろに `uses: volta-cli/action@v4 (node-version: '20')` を足した形は
-    // **全件緑のまま通り**、lint / test / e2e は実際には Node 20 で走る。
-    // アクションの名前で絞らないのは、`docker://ghcr.io/acme/ci-node:20` が
-    // 素通りしたのと同じ理由 (名前から Node を持ち込むかは判定できない)。
-    // **最後のリポジトリのコードより後ろは見ない** — そこに置かれた
-    // `actions/upload-artifact` はもう誰の Node にも影響しないので、
-    // 落とすと正当な形に直しようの無い要求を出すことになる。
-    // **`run:` による差し替え (`echo ... >> $GITHUB_PATH`) はここでも見えない** —
-    // 中身を解釈しない限り区別できず、冒頭コメントに「残る境界」として書いてある。
-    // 最後にリポジトリのコードを実行するステップの位置 (それより後ろは影響しない)
-    const lastRepoCode = steps.findLastIndex(runsRepositoryCode);
-    // 検証より後ろ・最後のリポジトリのコードまでにある uses: のステップを集める。
-    // **終端を含める (`+ 1`)。** 最後のリポジトリのコードが `run:` なら `usesOf` が
-    // 空文字列なので下の絞り込みで落ち、含めても何も変わらない。一方それが
-    // **ローカルの composite action (`uses: ./...`)** のときは、そのステップ自身が
-    // 「中身を読めない uses:」と「スイートの実行」を兼ねる — 終端を除いていたときは
-    // `[setup-node, 検証, uses: ./.github/actions/run-suite]` が**名指しされず**、
-    // action.yml の中で Node を入れ替えてからスイートを走らせる形が
-    // 静的な網からも実行時検証からも見えなかった (実測で空配列)。
-    // 後ろにもう 1 つ `run:` を足すと同じ差し替えが捕まっていたので、
-    // 見落としは純粋にこの境界だけが原因。
-    // **ステップの `env: PATH:` も同じ扱いで見る。** これは `run:` の中身と違って
-    // **宣言として YAML に現れる**ので、静的に読める — 読まないと
-    // `run: npm ci && npm run test` に `env: { PATH: /opt/node20/bin:... }` を添えるだけで
-    // スイートが別の Node で走り、**両方の網が緑のまま**になる (実測)。
-    // `run:` の中の `export PATH=...` は中身を解釈しないと分からないので引き続き見えず、
-    // そちらは冒頭コメントに「残る境界」として書いてある。
-    const swappers = steps
-      .slice(verifierIndex + 1, lastRepoCode + 1)
-      .filter((step) => usesOf(step) !== "" || declaresPathEnv(step) || declaresCustomShell(step));
-    // 1 つでもあれば、検証済みの Node で残りが走る保証が無い
-    if (swappers.length > 0) {
-      return withReasons(
-        `${RUNTIME_VERIFIER} より後ろに Node を差し替えうるステップがある ` +
-            `(${swappers.map(describeSwapper).join(" / ")})。検証した Node のまま走る保証が無い。` +
-            // **直し方は 2 通りあり、ローカル action だけ別**。第三者アクションや
-            // `env: PATH:` は位置を変えれば済むが、`uses: ./...` は**それ自身が
-            // リポジトリのコード**なので、前へ出せば「検証より前」、後ろへ出そうにも
-            // 自分が最後のリポジトリのコード — どちらの案内も成立しない。
-            // 案内どおりに直せない要求は、いずれ検査ごと緩められる (この repo が
-            // 繰り返し避けている形) ので、取れる手段だけを書く。
-            // **当てはまるぶんは両方出す** — 片方だけにすると、ローカル action と
-            // `actions/cache` が混ざったときに後者へ案内が付かず、直して push した
-            // 次の巡ではじめて残りの案内が出る (この差分がまさに減らそうとしている
-            // 「CI の巡が増える」形)
-            describeSwapperAdvice(swappers),
-      );
+    // 並び順の問題 (いちばん具体的な 1 つ。無ければ null)
+    const placement = describePlacementProblem(steps, setupIndex, verifierIndex, firstRepoCode);
+    // あれば、ここまでに溜めた独立した指摘と一緒に名指しする
+    if (placement !== null) {
+      return [{ file: job.file, job: job.name, reason: [...reasons, placement].join(" / ") }];
     }
     // 位置の判定にはどれも掛からなかった。独立した指摘が残っていればそれを返す
     // (何も無ければ空 = 置き方は満たされている)
