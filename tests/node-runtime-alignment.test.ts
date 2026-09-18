@@ -1733,11 +1733,8 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
     // 「env: PATH: を宣言していて、かつ setup-node も無い」ジョブは直して push する
     // たびに次の 1 件が出る = CI の巡が増える (上位の expect.soft を soft にしている
     // 理由とまったく同じ事情が、1 段下に残っていた)。
-    // **一方、並び順の判定はまとめない** — 「検証が setup-node より前」のような形は
-    // その帰結として「検証より後ろに差し替えうるステップがある」も同時に成り立ち、
-    // 束ねると原因ではない派生の指摘が混ざって直す先が分かりにくくなる
-    // **判定の性質ごとに分けた 3 つから集める。** 広い場所の宣言と「有無・条件」は
-    // 束ねて出し、並び順だけは 1 つに絞る（理由は describePlacementProblem の docstring）
+    // **一方、並び順だけは 1 つに絞る** (理由は describePlacementProblem の docstring)。
+    // 広い場所の宣言と「有無・条件」を別々の関数から集めるのは、判定の性質が違うため
     const reasons = [
       ...collectScopeWideSwapReasons(job),
       ...collectGuardPresenceReasons(steps, setupIndex, verifierIndex),
@@ -1747,16 +1744,12 @@ function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetup
     if (setupIndex === -1 || verifierIndex === -1) {
       return [{ file: job.file, job: job.name, reason: reasons.join(" / ") }];
     }
-    // 位置の指摘を、**ここまでに溜めた独立した指摘と一緒に**返すための小さなヘルパー。
-    // 位置の指摘だけを単独で返していたときは、`env: PATH:` の宣言が
-    // 「検証より後ろの差し替え」を伏せてしまい、直して push するまで次の 1 件が
-    // 表に出なかった (独立した指摘をまとめた理由と同じ事情が、1 段下に残っていた)。
-    // **位置の指摘どうしはまとめない** — 「検証が setup-node より前」はその帰結として
-    // 「検証より後ろに差し替えうるステップがある」も成り立ち、束ねると原因ではない
-    // 派生の指摘が混ざって直す先が分かりにくくなる
     // 並び順の問題 (いちばん具体的な 1 つ。無ければ null)
     const placement = describePlacementProblem(steps, setupIndex, verifierIndex, firstRepoCode);
-    // あれば、ここまでに溜めた独立した指摘と一緒に名指しする
+    // **あれば、ここまでに溜めた独立した指摘と一緒に名指しする。** 位置の指摘だけを
+    // 単独で返していたときは、`env: PATH:` の宣言が「検証より後ろの差し替え」を
+    // 伏せてしまい、直して push するまで次の 1 件が表に出なかった
+    // (独立した指摘をまとめたのと同じ事情が、1 段下に残っていた)
     if (placement !== null) {
       return [{ file: job.file, job: job.name, reason: [...reasons, placement].join(" / ") }];
     }
