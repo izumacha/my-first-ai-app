@@ -1923,17 +1923,33 @@ function parseReadmeNodeMajor(text: string): number | null {
 }
 
 /**
- * Dockerfile の段ごとの major を集める（読めない段があれば `null`）。
+ * Dockerfile を **1 回だけ**読み、畳んだ major・原因・段ごとの major を同じ中身から導く。
  *
- * **失敗文言のためだけに使う。** 合否そのものは
- * {@link nodeMajorOfDockerfileText} が畳んだ値で決まり、ここは
- * 「なぜ決まらなかったか」を言い分けるための材料を取るだけ。
+ * **{@link readMajorFrom} が確立した「値と原因は同じ 1 回の読み取りから」を Dockerfile でも守る。**
+ * 以前は値と原因を `readMajorFrom(DOCKERFILE_PATH, ...)` で取り、段ごとの一覧だけを
+ * 別の関数がもう 1 回読んでいた。同じファイルを 2 回読むと**2 回の結果が食い違いうる** —
+ * 1 回目が読めず 2 回目が読める（壊れたシンボリックリンクの復旧・入れ替え）と、
+ * `readError` が立っているのに `conflictingMajors` も埋まる。
+ * {@link describePinnedSourceProblem} は段のドリフトを先に見るので、
+ * **errno を落として「段ごとに major が食い違っている」と報告する** —
+ * 本当の原因は「読めなかった」なのに、直す先を段のドリフトへ誘導することになる。
+ * これは `readMajorFrom` の docstring が防ぐために作られた取り違えそのもので、
+ * 別の入口から戻っていた。
+ *
+ * 畳む規則は {@link nodeMajorOfDockerfileText} に任せる（同じ中身を 2 度解釈するが、
+ * **読み取りが 1 回なら食い違いようがない**。規則の写しを作らないほうを優先する）。
  */
-function describeDockerfileStageMajors(): number[] | null {
-  // 読めなければ段の情報も無い
+function readDockerfilePin(): MajorReadResult & { conflictingMajors: number[] | null } {
+  // Dockerfile を 1 回だけ読む（値・原因・段ごとの一覧がすべてこの中身から決まる）
   const read = readTextOrError(DOCKERFILE_PATH);
-  // 中身が取れたときだけ段ごとの major を集める
-  return read.text === null ? null : collectNodeMajorsOfDockerfileText(read.text);
+  // 読めなければ値も段の一覧も無い（原因だけを運ぶ）
+  if (read.text === null) return { major: null, readError: read.error, conflictingMajors: null };
+  // 読めた中身から、畳んだ major と段ごとの major の両方を導く
+  return {
+    major: nodeMajorOfDockerfileText(read.text),
+    readError: null,
+    conflictingMajors: collectNodeMajorsOfDockerfileText(read.text),
+  };
 }
 
 /**
@@ -1953,15 +1969,10 @@ function collectPinnedSources(): PinnedSource[] {
   // 「書式を直せ」と誤った案内をしうる
   return [
     { label: ".nvmrc", ...readMajorFrom(NVMRC_PATH, parseNvmrcMajor) },
-    {
-      label: "Dockerfile (FROM node:<major>)",
-      ...readMajorFrom(DOCKERFILE_PATH, nodeMajorOfDockerfileText),
-      // **段ごとの major も持っておく。** 値が決まらなかった理由が「読めない段がある」
-      // なのか「段ごとに食い違っている」なのかは、畳んだあとの null からは分からない。
-      // 失敗文言が後者を前者として報告すると、直すべき段のドリフトではなく
-      // 読み取り側を疑わせることになる (nodeMajorOfDockerfileText の docstring 参照)
-      conflictingMajors: describeDockerfileStageMajors(),
-    },
+    // **段ごとの major も同じ 1 回の読み取りから持ち帰る。** 値が決まらなかった理由が
+    // 「読めない段がある」なのか「段ごとに食い違っている」なのかは、畳んだあとの null からは
+    // 分からない。2 回に分けて読むと原因と一覧が食い違いうるので、readDockerfilePin に任せる
+    { label: "Dockerfile (FROM node:<major>)", ...readDockerfilePin() },
   ];
 }
 
