@@ -87,12 +87,11 @@ export function asArray(value: unknown): unknown[] {
  * 読めない要素が 1 つでもあれば専用の検査が落ちるようにしてある。
  */
 export function objectElementsOf(value: unknown): Record<string, unknown>[] {
-  // 配列でなければ空配列 (= 要素なし) にしてから、要素を 1 つずつ振るう
-  return asArray(value).filter(
-    // null と配列を除いたオブジェクトだけを残す (typeof は null も配列も "object" と答えるため)
-    (entry): entry is Record<string, unknown> =>
-      typeof entry === "object" && entry !== null && !Array.isArray(entry),
-  );
+  // 配列でなければ空配列 (= 要素なし) にしてから、共有の述語で要素を振るう。
+  // 判定を書き写さないのは、この関数と readParsed とワークフロー走査が
+  // 「対応表でなければ、そこから先は読めない」という同じ事情を見ているため
+  // (条件を直したときに一部だけ取り残されると、その検出網が黙って緩む)
+  return asArray(value).filter(isPlainMapping);
 }
 
 /**
@@ -214,6 +213,32 @@ export function describeShape(value: unknown): string {
   return typeof value;
 }
 
+/**
+ * 値が YAML / JSON の「対応表」(キーと値の組) かどうかを判定する。
+ *
+ * `asRecord` では代わりにならない。あちらは**配列も通す** (`typeof [] === "object"`) うえ、
+ * 対応表でない値を黙って `{}` に潰すため、「中身が無い」と「そもそも形が違う」の
+ * 区別が付かない。設定ファイルを構造として読む検査はどれも
+ * 「対応表でなければ、そこから先は読めない = 黙って検査から外れる」という同じ事情を
+ * 抱えているので、判定をここに 1 つだけ置く (§6 DRY)。
+ *
+ * **写しを作らないこと。** ファイルのトップレベル・設定のリスト要素・ワークフローの
+ * `jobs` / ジョブ定義 / `steps`・`env:` の読み取り・失敗文言の整形と、利用側は複数ある。
+ * 書き写すと、1 か所だけ条件を直したときに残りの検出網が黙って緩む
+ * (このリポジトリが繰り返し踏んでいる形)。
+ *
+ * **利用側をここに書き並べない (意図的)。** 以前は 4 つの呼び出し元を名指しで
+ * 列挙していたが、**列挙そのものが写し**で、実際にこの述語の利用側が増えた回で
+ * 一覧だけが古くなった (`declaresPathEnv` と `triggersOnEveryPullRequest` が漏れ、
+ * 「影響範囲は 4 か所」と読める状態になっていた)。条件を直す人は
+ * `isPlainMapping` を grep して実際の利用側を確かめること — 一覧は必ず実態より
+ * 短くなる側へずれ、影響範囲を実際より狭く見積もらせる。
+ */
+export function isPlainMapping(value: unknown): value is Record<string, unknown> {
+  // オブジェクトで、null でも配列でもないものだけを対応表として扱う
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 // 1 つの入力ファイルを読んだ結果 (解釈できた値と、読めなかったときの原因)
 export interface ReadResult {
   // パースできた値 (読めなければ null)
@@ -225,8 +250,8 @@ export interface ReadResult {
 /**
  * ファイルを読んで解釈し、**例外を投げずに** 結果か原因のどちらかを返す。
  *
- * 3 つの入力 (dependabot.yml / package.json / package-lock.json) はいずれも
- * describe のトップレベルで読まれる。そこで例外が投げられると、このファイルの検査は
+ * 設定ファイル (dependabot.yml / package.json / package-lock.json) は describe の
+ * トップレベルで読まれる。そこで例外が投げられると、そのファイルの検査は
  * すべて「収集時エラー」になり、丁寧に書いた日本語の失敗文言が 1 つも出ない。
  * 実際に起こりうるのは、ファイルの削除・改名 (ENOENT)、マージ事故による破損
  * (SyntaxError / YAMLParseError) など。とくに dependabot.yml の削除は検出対象 (b)
@@ -236,6 +261,13 @@ export interface ReadResult {
  *
  * 例外は握り潰さず ReadResult に載せ、専用のテストが原因付きで報告する
  * (CLAUDE.md §6 エラーを握り潰さない)。
+ *
+ * **読み手は「決まった数のファイル」を前提にしないこと。** ワークフロー走査は
+ * `.github/workflows/` にあるファイルを 1 本ずつこの関数へ渡すので、入力は開いた集合。
+ * 呼ばれる場所は同じく describe のトップレベル (走査結果を 1 度だけ作って共有する)
+ * なので、**例外を投げない契約はこの呼び出し側にも要る**。
+ * 「どれも形の分かった数個のファイルだから」を理由に下の fail-closed を緩めると、
+ * 空 / 全体コメントアウトのワークフローが黙って検査から外れる状態へ戻る。
  */
 export function readParsed(path: string, parse: (text: string) => unknown): ReadResult {
   // 読み取りとパースの結果を受ける入れ物
@@ -251,9 +283,10 @@ export function readParsed(path: string, parse: (text: string) => unknown): Read
   // 空ファイルや全体をコメントアウトしたファイルは parseYaml が null を返す (実測)。
   // これを素通りさせると、「構造として解釈できる」と名乗るテストが
   // 中身の無いファイルに対して緑になり、読み手に誤った安心を与える。
-  // 3 つの入力はいずれもトップレベルがオブジェクトである前提なので、そうでなければ
-  // 読めなかったものとして扱う (fail-closed)
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+  // どの入力もトップレベルがオブジェクトである前提なので、そうでなければ
+  // 読めなかったものとして扱う (fail-closed)。判定は共有の述語に任せる —
+  // 同じ条件をワークフロー走査側も使うので、書き写すと片方だけ緩む
+  if (!isPlainMapping(value)) {
     // 何が入っていたかを添えて原因を作る。**値そのものは埋め込まない** —
     // JSON.stringify は循環参照 (YAML のアンカーで自己参照配列が書ける。実測) で
     // 例外を投げ、しかもこの行は catch の外なので、収集時エラーになって
