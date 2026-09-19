@@ -876,8 +876,14 @@ interface SetupNodeStep {
   // ジョブ名 (同じファイルに setup-node を持つジョブが 2 つあると、
   // ファイル名だけではどちらを直せばよいか分からない。姉妹の 2 つの検査も job を出す)
   job: string;
-  // そのステップの `with`（判定の対象）
+  // そのステップの `with`（判定の対象。キーは小文字にそろえてある）
   inputs: Record<string, unknown>;
+  // **失敗文言に出すための、YAML に書かれたままの `with`。**
+  // 判定用の `inputs` はキーを小文字へ畳んでいるので、それを文言に出すと
+  // `Node-Version: '20'` と書いたワークフローに対して `node-version=20` と報告し、
+  // **読み手がワークフローを grep しても見つからない** (`ImageStepUse.location` が
+  // 空白の混入で踏んだのとまったく同じ失敗を、正規化の側から作り直すことになる)
+  rawInputs: Record<string, unknown>;
 }
 
 /**
@@ -901,7 +907,13 @@ function collectSetupNodeSteps(jobs: readonly WorkflowJob[]): SetupNodeStep[] {
     // setup-node のステップに絞り、その with をファイル名・ジョブ名付きで返す
     return steps
       .filter(isSetupNodeStep)
-      .map((step) => ({ file: job.file, job: job.name, inputs: normalizeInputs(step.with) }));
+      .map((step) => ({
+        file: job.file,
+        job: job.name,
+        inputs: normalizeInputs(step.with),
+        // 文言用に、書かれたままの綴りも控える（判定には使わない）
+        rawInputs: asRecord(step.with),
+      }));
   });
 }
 
@@ -1383,37 +1395,6 @@ interface MissingSetupNodeJob {
 }
 
 /**
- * このリポジトリのコードを実行するのに、**無条件の `setup-node` をその前に**
- * 置いていないジョブを集める。
- *
- * **版が入り込む 3 つ目の口で、しかも「書き忘れ」で到達する。**
- * GitHub ホストのランナー (`ubuntu-latest`) には Node が最初から入っているため、
- * `setup-node` を 1 つも置かないジョブで `npm ci && npm run test` と書くと、
- * **ランナー既定の major** でスイートが丸ごと走る。`.nvmrc` は一切参照されない。
- * `setup-node` の `with` とイメージだけを見る検査はこれを**全件緑のまま通す** (実測)。
- *
- * 「置いてあるか」だけでは足りず、**位置と条件**まで見る (どちらも実測で素通りした):
- *   - `run: npm ci` の**後ろ**に `setup-node` … `npm ci` はランナー既定の Node で走り、
- *     そこで入る / ビルドされる node_modules は検証していない Node のもの。
- *   - `if:` 付きの `setup-node` … 実行されなければランナー既定の Node のまま。
- *     条件の中身は静的に決まらないので、「無条件でない」ことをもって落とす。
- *
- * 判定を `run:` の**文言**から当てないのは、綴りを変えるだけで黙って外れるから
- * (実測: `./node_modules/.bin/vitest run` も `/usr/local/bin/node server.js` も
- * 拾えなかった)。構造で見て、当てはまるジョブはすべて対象にする (fail-closed。
- * 例外の逃げ道を持たない理由は `runsRepositoryCode` の手前の注記)。
- *
- * **イメージ側の検査と重複しても、それぞれの理由で名指しする。** 以前は
- * `uses: docker://` で名指しされたジョブを丸ごと除いていたが、その抑止が
- * **効くのは抑止して困る場合だけ**だった: イメージだけのジョブ (`run:` も
- * ローカル action も無い) は `firstRepoCode === -1` でどのみちここを素通りするので
- * 抑止は要らず、逆に `docker://hadolint` と `run: npm ci` を両方持つジョブでは、
- * hadolint の 1 行が**同じジョブの setup-node / 実行時検証 / 差し替えの指摘を
- * まとめて伏せて**いた (CI は赤のままだが、docker の行を消すまで本当の問題が
- * 表に出ず、巡が 1 つ増える)。これは除外表を外した理由と同じ形
- * 「1 つの事情が、それでは正当化できない検査まで免除する」。
- */
-/**
  * ステップより**広い場所**で宣言された差し替え（ジョブ / ワークフロー / コンテナ単位）を
  * 理由の一覧にして返す。
  *
@@ -1518,12 +1499,20 @@ function collectGuardPresenceReasons(
   // 条件付きの**検証**についてはこの抑止が起きない形になっており、
   // 対称でないのは意図した差ではなかった。
   // **位置を見るときは `isSetupNodeStep` で探す** — 条件が付いていても「書かれている
-  // 位置」は分かるので、無条件かどうかとは別に前後関係を言える
+  // 位置」は分かるので、無条件かどうかとは別に前後関係を言える。
+  // **ただし無条件のものがあるなら、そちらを基準にする。** 実際に Node を用意するのは
+  // 無条件の setup-node なので、条件付きのものが**前に**置かれているだけの形
+  // (`[setup-node(if: 付き), npm ci, setup-node, 検証, npm test]`) で
+  // 先頭の条件付きを基準にすると、`slice` の範囲が空になって根本原因
+  // (`npm ci` がランナー既定の Node で走る) が黙って抑止される — この `if` が
+  // `else if` をやめてまで直した非対称が、基準の取り方で戻っていた (実測)。
+  // 無条件のものが無いときだけ、書かれている位置 (条件付き) へ落とす
   const declaredSetupIndex = steps.findIndex(isSetupNodeStep);
+  const effectiveSetupIndex = setupIndex !== -1 ? setupIndex : declaredSetupIndex;
   if (
-    declaredSetupIndex !== -1 &&
+    effectiveSetupIndex !== -1 &&
     steps
-      .slice(0, declaredSetupIndex)
+      .slice(0, effectiveSetupIndex)
       .some((step) => runsRepositoryCode(step) && !isVerifierOnlyStep(step))
   ) {
     // **「setup-node より前にリポジトリのコードがある」ことを、検証の有無に関わらず
@@ -1689,6 +1678,37 @@ function describePlacementProblem(
   return null;
 }
 
+/**
+ * このリポジトリのコードを実行するのに、**無条件の `setup-node` をその前に**
+ * 置いていないジョブを集める。
+ *
+ * **版が入り込む 3 つ目の口で、しかも「書き忘れ」で到達する。**
+ * GitHub ホストのランナー (`ubuntu-latest`) には Node が最初から入っているため、
+ * `setup-node` を 1 つも置かないジョブで `npm ci && npm run test` と書くと、
+ * **ランナー既定の major** でスイートが丸ごと走る。`.nvmrc` は一切参照されない。
+ * `setup-node` の `with` とイメージだけを見る検査はこれを**全件緑のまま通す** (実測)。
+ *
+ * 「置いてあるか」だけでは足りず、**位置と条件**まで見る (どちらも実測で素通りした):
+ *   - `run: npm ci` の**後ろ**に `setup-node` … `npm ci` はランナー既定の Node で走り、
+ *     そこで入る / ビルドされる node_modules は検証していない Node のもの。
+ *   - `if:` 付きの `setup-node` … 実行されなければランナー既定の Node のまま。
+ *     条件の中身は静的に決まらないので、「無条件でない」ことをもって落とす。
+ *
+ * 判定を `run:` の**文言**から当てないのは、綴りを変えるだけで黙って外れるから
+ * (実測: `./node_modules/.bin/vitest run` も `/usr/local/bin/node server.js` も
+ * 拾えなかった)。構造で見て、当てはまるジョブはすべて対象にする (fail-closed。
+ * 例外の逃げ道を持たない理由は `runsRepositoryCode` の手前の注記)。
+ *
+ * **イメージ側の検査と重複しても、それぞれの理由で名指しする。** 以前は
+ * `uses: docker://` で名指しされたジョブを丸ごと除いていたが、その抑止が
+ * **効くのは抑止して困る場合だけ**だった: イメージだけのジョブ (`run:` も
+ * ローカル action も無い) は `firstRepoCode === -1` でどのみちここを素通りするので
+ * 抑止は要らず、逆に `docker://hadolint` と `run: npm ci` を両方持つジョブでは、
+ * hadolint の 1 行が**同じジョブの setup-node / 実行時検証 / 差し替えの指摘を
+ * まとめて伏せて**いた (CI は赤のままだが、docker の行を消すまで本当の問題が
+ * 表に出ず、巡が 1 つ増える)。これは除外表を外した理由と同じ形
+ * 「1 つの事情が、それでは正当化できない検査まで免除する」。
+ */
 function collectJobsMissingSetupNode(jobs: readonly WorkflowJob[]): MissingSetupNodeJob[] {
   // **ワークフローごとのジョブ索引は 1 度だけ作る。** `needs:` をたどるのに要るが、
   // 中身はジョブごとに変わらない (ループ不変) ので、各ジョブで作り直すと
@@ -1805,7 +1825,9 @@ function collectImageOnlySteps(jobs: readonly WorkflowJob[]): ImageStepUse[] {
 }
 
 /**
- * Dockerfile が使う Node のベースイメージ major を読み取る。
+ * Dockerfile の**中身**から、段ごとの node イメージ major を集める (ファイル入出力を伴わない)。
+ *
+ * 読めない段があれば null を返し、畳んだ結果を使う側が fail-closed で落とす。
  *
  * **最初の 1 件だけを見ない。** 多段ビルドで `FROM node:22-alpine AS tools` のような
  * 別 major の段が足されると、先頭だけを見る実装では揃っているように見えてしまい、
@@ -1817,19 +1839,6 @@ function collectImageOnlySteps(jobs: readonly WorkflowJob[]): ImageStepUse[] {
  * `FROM --platform=linux/amd64 node:22` を**素通り**させていた (実測で全件緑。
  * まさに多段ビルドのドリフトを見逃す形)。ワークフロー側で同じ取りこぼしを塞いだ
  * 判定があるので、そこへ寄せて書き写しも増やさない (§6 DRY)。
- */
-function readDockerfileNodeMajor(): number | null {
-  // 読み取りと解釈は共有の手に任せ、値だけを返す (読めなければ null)。
-  // 中身の解釈を純粋関数に分けてあるのは、合成した Dockerfile で挙動を固定するため —
-  // ファイル入出力と混ぜたままだと、読めない段の扱いを変える変異が拾えない
-  return readMajorFrom(DOCKERFILE_PATH, nodeMajorOfDockerfileText).major;
-}
-
-/**
- * Dockerfile の**中身**から node イメージの major を読み取る (ファイル入出力を伴わない)。
- *
- * 揃っていない / 読めない段があれば null を返し、呼び出し側が fail-closed で落とす。
- * 規則そのものの根拠は `readDockerfileNodeMajor` の docstring を参照。
  */
 function collectNodeMajorsOfDockerfileText(text: string): number[] | null {
   // コメントを落としたうえで、すべての `FROM node:<major>` を集める
@@ -1940,9 +1949,21 @@ function collectNodeMajorsOfDockerfileText(text: string): number[] | null {
  * そちら向きだけが手当てされていなかった。
  */
 function nodeMajorOfDockerfileText(text: string): number | null {
-  // 段ごとの major を集める (読めない段があれば null が返る)
-  const majors = collectNodeMajorsOfDockerfileText(text);
-  // ちょうど 1 つに揃っているときだけ採用する
+  // 段ごとの major を集めてから、畳む規則に通す
+  return foldNodeMajors(collectNodeMajorsOfDockerfileText(text));
+}
+
+/**
+ * 段ごとに集めた major を、Dockerfile 全体の 1 つの major へ畳む。
+ *
+ * **畳む規則をここ 1 か所に置くのが要点。** 段ごとの一覧も要る `readDockerfilePin` が
+ * 「集める」と「畳む」を別々に呼べるので、**同じ中身を 2 度解釈せずに**両方を得られる。
+ * 以前は `nodeMajorOfDockerfileText` の中でもう 1 度集め直していたため、
+ * 同じ文字列に対して走査が 2 往復していた（規則の写しを作らないほうを優先した結果だが、
+ * 畳む側を切り出せば写しも二度手間も同時に無くせる）。
+ */
+function foldNodeMajors(majors: number[] | null): number | null {
+  // ちょうど 1 つに揃っているときだけ採用する (読めない段があれば null のまま)
   return majors !== null && majors.length === 1 ? majors[0] : null;
 }
 
@@ -1994,20 +2015,18 @@ function parseReadmeNodeMajor(text: string): number | null {
  * これは `readMajorFrom` の docstring が防ぐために作られた取り違えそのもので、
  * 別の入口から戻っていた。
  *
- * 畳む規則は {@link nodeMajorOfDockerfileText} に任せる（同じ中身を 2 度解釈するが、
- * **読み取りが 1 回なら食い違いようがない**。規則の写しを作らないほうを優先する）。
+ * 畳む規則は {@link foldNodeMajors} に任せる（規則の写しを作らず、しかも
+ * 段ごとの一覧を 1 度集めるだけで畳んだ値も得られる＝同じ中身を 2 度解釈しない）。
  */
 function readDockerfilePin(): MajorReadResult & { conflictingMajors: number[] | null } {
   // Dockerfile を 1 回だけ読む（値・原因・段ごとの一覧がすべてこの中身から決まる）
   const read = readTextOrError(DOCKERFILE_PATH);
   // 読めなければ値も段の一覧も無い（原因だけを運ぶ）
   if (read.text === null) return { major: null, readError: read.error, conflictingMajors: null };
+  // 段ごとの major は 1 度だけ集める (同じ中身を 2 度走査しない)
+  const majors = collectNodeMajorsOfDockerfileText(read.text);
   // 読めた中身から、畳んだ major と段ごとの major の両方を導く
-  return {
-    major: nodeMajorOfDockerfileText(read.text),
-    readError: null,
-    conflictingMajors: collectNodeMajorsOfDockerfileText(read.text),
-  };
+  return { major: foldNodeMajors(majors), readError: null, conflictingMajors: majors };
 }
 
 /**
@@ -2308,7 +2327,10 @@ describe("実行する Node の major を宣言しているすべての場所の
     // (失敗文言が実際の指定を出すため、直し方も迷わない)
     const misconfigured = setupSteps
       .filter((step) => !isNvmrcWiredSetupNode(step.inputs))
-      .map((step) => `${step.file}: ${step.job} (${describeInputs(step.inputs)})`);
+      // **文言には書かれたままの綴りを出す** — 判定用に小文字へ畳んだ側を出すと、
+      // `Node-Version: '20'` に対して `node-version=20` と報告してしまい、
+      // 読み手がワークフローを grep しても見つからない
+      .map((step) => `${step.file}: ${step.job} (${describeInputs(step.rawInputs)})`);
     // **3 つの口の判定は soft にする。** 通常の expect は最初の 1 件で中断するので、
     // 2 つ以上の口が同時に開いていると、直して push するたびに次の 1 件が出る
     // (CI の巡が増える)。とくに `uses: docker://` と setup-node の置き方は
@@ -3139,6 +3161,31 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
       expected: named(
         "setup-node に if: / continue-on-error が付いている (効かなくても後続が走る)" +
           " / setup-node がリポジトリのコードより後ろにある (先に走る処理はランナー既定の Node で動く)",
+      ),
+    },
+    {
+      // **条件付きの setup-node が先頭にあっても、無条件のものの位置で名指しする。**
+      // 位置の基準を「最初に**書かれている** setup-node」に取っていたときは、
+      // 先頭の条件付きが基準になって `slice` の範囲が空になり、
+      // `npm ci` がランナー既定の Node で走るという根本原因が黙って抑止されていた
+      // (実測。この形だけ「検証が後ろ」しか出ず、直して push した次の巡に
+      // ようやく setup-node の位置が出る＝CI を 1 巡よけいに使う)。
+      // 実際に Node を用意するのは**無条件の** setup-node なので、そちらを基準にする
+      label: "条件付きの setup-node の後ろ・無条件の setup-node の前に run: がある",
+      jobs: [
+        jobOf({
+          steps: [
+            { ...setupNodeStep, if: "${{ false }}" },
+            { run: "npm ci" },
+            setupNodeStep,
+            { run: "node scripts/verify-node-major.mjs" },
+            { run: "npm run test" },
+          ],
+        }),
+      ],
+      expected: named(
+        "setup-node がリポジトリのコードより後ろにある (先に走る処理はランナー既定の Node で動く)" +
+          ` / ${RUNTIME_VERIFIER} がリポジトリのコードより後ろにある (先に走った検証の Node が分からない)`,
       ),
     },
     {
@@ -4004,6 +4051,20 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
     expect(collectSetupNodeSteps([plain])[0]?.inputs).toEqual({ "node-version-file": ".nvmrc" });
   });
 
+  it("collectSetupNodeSteps が、失敗文言用に書かれたままの with: も控える", () => {
+    // **判定は小文字へ畳んだ側、文言は書かれたままの側。** 畳んだ側を文言に出すと、
+    // `Node-Version: '20'` と書いたワークフローに対して `node-version=20` と報告し、
+    // 読み手がワークフローを grep しても見つからない (ImageStepUse.location が
+    // 空白の混入で踏んだのと同じ失敗を、正規化の側から作り直すことになる)
+    const cased = jobOf({
+      steps: [{ uses: "actions/setup-node@v7", with: { "Node-Version": "20" } }],
+    });
+    // 控えてあるのは YAML に書かれたままの綴り
+    expect(collectSetupNodeSteps([cased])[0]?.rawInputs).toEqual({ "Node-Version": "20" });
+    // 文言もその綴りで出る (grep すれば当該行に当たる)
+    expect(describeInputs(collectSetupNodeSteps([cased])[0]!.rawInputs)).toBe("Node-Version=20");
+  });
+
   it.each([
     {
       label: "ARG の既定値で node の段に解決する (ドリフトを検出する)",
@@ -4050,9 +4111,11 @@ describe("CI の配線を見る検出網そのものの挙動", () => {
     expect(nodeMajorOfDockerfileText(text)).toBe(expected);
   });
 
-  it("readDockerfileNodeMajor が、変数で書いた FROM を読めない段として落とす", () => {
-    // 実在の Dockerfile は読める (誤検知を出さない)
-    expect(readDockerfileNodeMajor()).not.toBeNull();
+  it("nodeMajorOfDockerfileText が、変数で書いた FROM を読めない段として落とす", () => {
+    // 実在の Dockerfile は読める (誤検知を出さない)。
+    // **読み取りは readDockerfilePin に通す** — 値と原因を 1 回の読み取りから導く
+    // 唯一の入口で、ここだけ別の読み手を残すとそちらが実態から外れる (§6 DRY)
+    expect(readDockerfilePin().major).not.toBeNull();
     // **変数の段は「別イメージ」ではなく「読めない段」**。黙って飛ばすと、
     // 残りの段だけで揃っていることになり多段ビルドのドリフトを見逃す
     expect(nodeMajorOfDockerfileText("FROM node:26-alpine\nFROM $BASE AS tools\n")).toBeNull();
