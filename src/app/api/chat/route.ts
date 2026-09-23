@@ -674,6 +674,15 @@ function mapErrorToResponse(error: unknown): NextResponse<ChatErrorResponse> | R
   if (error instanceof Anthropic.APIError) {
     // 認証エラー（API キー無効等）は 401 と日本語の安全な文言を返す
     if (error.status === 401) {
+      // キーの失効・誤設定は運用者が必ず気づくべき障害なので、痕跡をサーバログに残す
+      // （§6 握り潰さない）。クライアントへ返す文言は MissingApiKeyError と同じなので、
+      // ログが無いと「未設定」と「無効」のうち起きやすいこちら側だけが観測不能になる。
+      // 上流の message にはキーの断片や内部構成が載りうるので name だけを出す
+      // （§9 機密情報・内部詳細をログに漏らさない）。
+      console.error(
+        "チャット API の上流が 401 を返しました（API キーが無効の可能性）:",
+        error.name
+      );
       return jsonError(ERROR_MESSAGES.invalidApiKey, 401);
     }
     // 上流のレート制限（429）はそのまま 429 として返す（CLAUDE.md のステータス契約）。

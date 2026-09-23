@@ -665,16 +665,30 @@ describe("POST /api/chat の上流エラーマッピング", () => {
     expect(body.error).toContain("リクエストの内容が不正です");
   });
 
-  it("上流 Anthropic の 401（API キー無効）は 401 と安全な文言を返す", async () => {
+  it("上流 Anthropic の 401（API キー無効）は 401 と安全な文言を返し、サーバログには残す", async () => {
     // 上流でだけ 401 になるモックを仕込む
     rejectOnceWithApiError(401, "authentication_error");
-    // 正常な形のリクエストを送る（API キーが無効な想定）
-    const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
-    // 200 のストリームではなく 401 が返ることを確認する（旧実装はここが 200 になっていた）
-    expect(res.status).toBe(401);
-    // 内部メッセージではなく安全な日本語文言が返ることを確認する
-    const body = (await res.json()) as { error: string };
-    expect(body.error).toContain("API キーが無効です");
+    // console.error でのサーバログ出力を握って、テスト出力を汚さず呼び出しも検証できるようにする
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // 正常な形のリクエストを送る（API キーが無効な想定）
+      const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
+      // 200 のストリームではなく 401 が返ることを確認する（旧実装はここが 200 になっていた）
+      expect(res.status).toBe(401);
+      // 内部メッセージではなく安全な日本語文言が返ることを確認する
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toContain("API キーが無効です");
+      // クライアントへは同じ文言を返す MissingApiKeyError と区別が付くよう、
+      // 「キーが無効だった」という事実はサーバログに残っていることを確認する。
+      // これが無いと、運用で起きやすいキー失効側だけが痕跡ゼロで観測不能になる
+      expect(errorSpy).toHaveBeenCalled();
+      // ログにキーそのものや上流の内部メッセージを載せていないことも確認する（§9）
+      const logged = errorSpy.mock.calls.flat().join(" ");
+      expect(logged).not.toContain("authentication_error");
+    } finally {
+      // スパイを戻して他のテストへ影響させない
+      errorSpy.mockRestore();
+    }
   });
 
   it("API キー未設定（MissingApiKeyError）は 401 を返し、環境変数名を応答に漏らさない", async () => {
