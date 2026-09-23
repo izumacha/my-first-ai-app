@@ -638,15 +638,19 @@ describe("POST /api/chat の上流エラーマッピング", () => {
    * @param status - 上流の HTTP ステータスコード
    * @param type - Anthropic エラー種別文字列
    */
-  function rejectOnceWithApiError(status: number, type: string): void {
+  function rejectOnceWithApiError(
+    status: number,
+    type: string,
+    upstreamMessage = "upstream error"
+  ): void {
     // 指定ステータスの具象エラークラスで reject する実装を 1 回だけ設定する
     createMock.mockImplementationOnce(() =>
       Promise.reject(
         // APIError.generate はステータスに応じた具象エラークラスを生成する
         Anthropic.APIError.generate(
           status,
-          { error: { type, message: "upstream error" } },
-          "upstream error",
+          { error: { type, message: upstreamMessage } },
+          upstreamMessage,
           new Headers()
         )
       )
@@ -665,16 +669,47 @@ describe("POST /api/chat の上流エラーマッピング", () => {
     expect(body.error).toContain("リクエストの内容が不正です");
   });
 
-  it("上流 Anthropic の 401（API キー無効）は 401 と安全な文言を返す", async () => {
-    // 上流でだけ 401 になるモックを仕込む
-    rejectOnceWithApiError(401, "authentication_error");
-    // 正常な形のリクエストを送る（API キーが無効な想定）
-    const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
-    // 200 のストリームではなく 401 が返ることを確認する（旧実装はここが 200 になっていた）
-    expect(res.status).toBe(401);
-    // 内部メッセージではなく安全な日本語文言が返ることを確認する
-    const body = (await res.json()) as { error: string };
-    expect(body.error).toContain("API キーが無効です");
+  it("上流 Anthropic の 401（API キー無効）は 401 と安全な文言を返し、サーバログには残す", async () => {
+    // 上流でだけ 401 になるモックを仕込む。上流の message には実際の失効時と同じく
+    // API キーの断片が載る形にしておき、それがログへ漏れないことまで見る
+    rejectOnceWithApiError(
+      401,
+      "authentication_error",
+      "invalid x-api-key sk-ant-api03-TESTSECRET"
+    );
+    // console.error でのサーバログ出力を握って、テスト出力を汚さず呼び出しも検証できるようにする
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // 正常な形のリクエストを送る（API キーが無効な想定）
+      const res = await POST(makeRequest({ messages: validMessages }, uniqueIp()));
+      // 200 のストリームではなく 401 が返ることを確認する（旧実装はここが 200 になっていた）
+      expect(res.status).toBe(401);
+      // 内部メッセージではなく安全な日本語文言が返ることを確認する
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toContain("API キーが無効です");
+      // クライアントへは同じ文言を返す MissingApiKeyError と区別が付くよう、
+      // 「キーが無効だった」という事実はサーバログに残っていることを確認する。
+      // これが無いと、運用で起きやすいキー失効側だけが痕跡ゼロで観測不能になる。
+      // どのログ行かまで固定する（別の経路の console.error で満たされないように）
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("401"),
+        expect.anything(),
+        expect.anything()
+      );
+      // 実際に出している値を取り出して中身まで確かめる
+      const logged = errorSpy.mock.calls.flat().join(" ");
+      // 鍵そのものがログへ出ていないこと。上流の message を出す実装へ戻ると落ちる（§9）
+      expect(logged).not.toContain("sk-ant");
+      // 上流の応答本文由来の綴りも出していないこと
+      expect(logged).not.toContain("authentication_error");
+      // 運用者が原因を判別できる情報は出ていること。
+      // error.name は SDK のどのクラスも this.name を設定しないため常に "Error" で、
+      // 出しても 1 ビットの情報も無い。constructor.name へ戻す退行をここで固定する
+      expect(logged).toContain("AuthenticationError");
+    } finally {
+      // スパイを戻して他のテストへ影響させない
+      errorSpy.mockRestore();
+    }
   });
 
   it("API キー未設定（MissingApiKeyError）は 401 を返し、環境変数名を応答に漏らさない", async () => {
