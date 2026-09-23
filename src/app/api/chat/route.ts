@@ -677,11 +677,22 @@ function mapErrorToResponse(error: unknown): NextResponse<ChatErrorResponse> | R
       // キーの失効・誤設定は運用者が必ず気づくべき障害なので、痕跡をサーバログに残す
       // （§6 握り潰さない）。クライアントへ返す文言は MissingApiKeyError と同じなので、
       // ログが無いと「未設定」と「無効」のうち起きやすいこちら側だけが観測不能になる。
-      // 上流の message にはキーの断片や内部構成が載りうるので name だけを出す
+      //
+      // 出すのは constructor.name と status。**error.name は使えない** ——
+      // SDK の APIError 系はどのクラスも this.name を代入しないため、
+      // Error.prototype.name が残って常に文字列 "Error" になる（実測）。
+      // それをログへ出しても 1 ビットの情報も無く、「name なら安全で有用」という
+      // 判断自体が成り立たない（MissingApiKeyError は自前で this.name を設定して
+      // いるので、あちらの書き方をここへ写すと意味が変わる）。
+      //
+      // 逆に error.message は使わない。SDK は上流の応答本文をそのまま message へ
+      // 畳み込むので、キーの断片（invalid x-api-key sk-ant-...）が載りうる（実測）。
+      // constructor.name（"AuthenticationError"）と status は本文に由来しないので安全
       // （§9 機密情報・内部詳細をログに漏らさない）。
       console.error(
         "チャット API の上流が 401 を返しました（API キーが無効の可能性）:",
-        error.name
+        error.constructor.name,
+        error.status
       );
       return jsonError(ERROR_MESSAGES.invalidApiKey, 401);
     }
