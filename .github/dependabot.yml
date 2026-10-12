@@ -57,8 +57,12 @@ updates:
       #   この条件は永久に発火しない — 判定が循環してしまう)。
       #   **落ちても機械的に削除しないこと。** この ignore は **すべての** major 更新を
       #   止めているので、外してよいのは「そろって許している上限より上の major が無い」
-      #   ときだけ。上限は失敗文言が出すので、それを見て
-      #   「削除」か「HELD_MAJOR を上限へ更新」かを選ぶ。
+      #   ときだけ。上限は失敗文言が出すので、それを見て次のどちらかを選ぶ:
+      #     (1) 上限より上の major が出ていない → この ignore とテストを削除する。
+      #     (2) 出ている → ignore は残し、**テストの HELD_MAJOR と package.json の
+      #         devDependencies.eslint の両方を同じ変更で上限の major へそろえる**
+      #         (HELD_MAJOR だけ動かすと「留め置き中の major に居る」判定が成立せず、
+      #          この ignore の削除・重複を見張る検査が skip される)。
       #
       # 効き方: `version-update:semver-major` だけを対象にするので、9 系の
       #   minor / patch 更新は従来どおり npm-minor-and-patch グループで届く。

@@ -169,7 +169,15 @@ export function coversDirectory(entry: DependabotUpdateEntry, directory: string)
  *
  * **区切りの一部を占める `*` は `[^/]*` のまま**にする（`/app*` は shell の glob と同じく
  * `/app` にも一致する）。ここを一律 `[^/]+` にすると、そちらが逆向きの誤判定になる。
- * `**` は「0 個以上のパス要素」なので `.*` のまま（`/**` は root も覆う）。
+ *
+ * **`**` を含む綴りは「判定できない」として覆っていない扱いにする。** 以前は `.*` へ
+ * 展開しており、`/**` が root に一致していた。`**` が「0 個以上のパス要素」なら root を
+ * 覆うが、**この環境から公式ドキュメントへ到達できないので裏取りできない**。覆うと
+ * 決めつけると、`directories: ["/**"]` へ変えた時点で「root へ効かなくなった `ignore`」を
+ * 「効いている」と読む**唯一残った素通りの経路**になる（レビューで実測。`*` 側は上の
+ * 区切り判定で閉じたので、`**` だけが残っていた）。判定できないものは拒否する
+ * （§9 fail-closed）。`**` を使いたい場合は `directory: "/"` にするか、`directories` に
+ * `/` を明示すれば判定できる＝**直し方がある**ので、行き止まりの要求にはならない。
  *
  * **この環境から Dependabot の公式ドキュメントへ到達できない**ため、glob の意味論は
  * 上の推論と実測に基づく近似。**誤る向きは意図して fail-closed 側**に寄せてある
@@ -178,11 +186,10 @@ export function coversDirectory(entry: DependabotUpdateEntry, directory: string)
  * `tests/dependabot-eslint-guard.test.ts` の「ディレクトリの glob 判定」が固定する。
  */
 export function directoryPatternCovers(pattern: string, directory: string): boolean {
-  // `**` は「任意」、`*` は「/ を含まない任意」に相当する。先に `**` を目印へ退避し、
-  // 残った正規表現メタ文字を無効化してから、目印を展開し直す
-  const doubleStarMark = "\u0000";
+  // `**` の意味論を裏取りできないので、含む綴りは覆っていない扱いにする (上の説明を参照)
+  if (pattern.includes("**")) return false;
+  // `*` は「/ を含まない任意」に相当する。正規表現メタ文字を無効化してから展開する
   const escaped = pattern
-    .replace(/\*\*/g, doubleStarMark)
     .replace(/[.+?^${}()|[\]\\]/g, "\\$&")
     // 置換関数で「その `*` が区切りのあいだを丸ごと占めるか」を見る。
     // 第 2・第 3 引数は `String.prototype.replace` が渡す出現位置と走査中の文字列
@@ -193,9 +200,7 @@ export function directoryPatternCovers(pattern: string, directory: string): bool
       const endsSegment = at + 1 === whole.length || whole[at + 1] === "/";
       // 両方なら要素を丸ごと占めるので、空のパス要素を作らないよう 1 文字以上を要求する
       return startsSegment && endsSegment ? "[^/]+" : "[^/]*";
-    })
-    .split(doubleStarMark)
-    .join(".*");
+    });
   // 前後を固定して全体一致で判定する
   return new RegExp(`^${escaped}$`).test(directory);
 }
@@ -447,13 +452,14 @@ export function asRecord(value: unknown): Record<string, unknown> {
  * null や非オブジェクトは既に振るい落とされている。ここで同じ判定を重ねても
  * 決して真にならない分岐が増えるだけなので置かない (CLAUDE.md §6 デッドコードを残さない)。
  *
- * **「要素がオブジェクトであること」と「その要素が存在すること」は別の話で、
- * 保証の強さが違うので扱いも変える。** 前者は objectElementsOf という*構築*が
- * 型のレベルで保証しており、崩す方法が無いので分岐を置かない (§6)。後者
- * (空配列への添字アクセスが undefined になること) を防いでいるのは
- * 「直前の toHaveLength(1) が先に throw する」という**文の並び順だけ**で、
- * 検査を分割・並べ替えれば簡単に崩れる。だから呼び出し側は `?? {}` を残している。
- * 一方だけ残っているのは書き忘れではなく、この差による意図的な非対称。
+ * **「要素がオブジェクトであること」と「その要素が存在すること」は別の話。**
+ * 前者は objectElementsOf という*構築*が型のレベルで保証しており、崩す方法が無いので
+ * 分岐を置かない (§6)。後者 (空配列への添字アクセスが undefined になること) は
+ * 呼び出し側の責任で、以前は「直前の `toHaveLength(1)` が先に throw する」という
+ * **文の並び順**に頼っていたため `?? {}` を添えていた。issue #44 A.3 でその検査を
+ * 分割した結果、現在の呼び出しは `forEach` の要素なので**存在が構造から保証される**
+ * ——`?? {}` は要らなくなり、repo から消えている。並び順に頼る形へ戻すなら、
+ * 呼び出し側で存在を埋めること。
  */
 export function sortedKeysOf(entry: DependabotIgnoreEntry): string[] {
   // キーを取り出して並べ替える (比較しやすくするため)

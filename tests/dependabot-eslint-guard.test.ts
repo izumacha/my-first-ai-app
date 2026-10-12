@@ -103,15 +103,14 @@ const UPSTREAM_CONFIG_PACKAGE = "eslint-config-next";
 // (この検査が peer 範囲を見張る対象そのもの)。**
 // 期限判定はここに挙げた全員が次の major を許したときだけ発火する。
 //
-// **「今 9 系に制限しているか」で出し入れしない — 載るなら制限の有無を問わず挙げる。**
-// 現時点で eslint-plugin-react-hooks (7.1.1) の peer は
-// `... || ^9.0.0 || ^10.0.0` で既に 10 を許しており、保留を実際に塞いでいるのは
-// 残る 3 つ (react: `^9.7` まで / import・jsx-a11y: `^9` まで) だけ。それでも
-// react-hooks を一覧に残すのは、**将来 peer が狭まったことを検出できる唯一の経路が
-// ここだから**。外すと「react-hooks が 10 非対応の版へ差し替わり、同時に他の 3 つが
-// 10 対応した」ときに blockingPeers が空になり、期限判定が「全部 10 を許した、
-// ignore を消せ」と誤って指示する (従うと lint が壊れる)。
-// 逆に一覧へ残しておけば、その版が blockingPeers に現れて保留が正しく維持される。
+// **「今どこまで制限しているか」で出し入れしない — 載るなら制限の有無を問わず挙げる。**
+// 一覧の中には既に次の major を許しているものもあるが(現在値は issue #44 C.9 のとおり
+// ここには書かない。下の「どこまで許しているか」の注記を参照)、それでも一覧に残すのは
+// **将来 peer が狭まったことを検出できる唯一の経路がここだから**。外すと
+// 「いま緩いものが次の major に非対応な版へ差し替わり、同時に他が対応した」ときに
+// blockingPeers が空になり、期限判定が「全部そろった、ignore を消せ」と誤って指示する
+// (従うと lint が壊れる)。逆に一覧へ残しておけば、その版が blockingPeers に現れて
+// 保留が正しく維持される。
 //
 // **一覧の決め方(この規則で機械的に導ける):**
 //   `eslint-config-next` の直接依存のうち、**eslint に peer 依存を宣言しているもの全部**。
@@ -398,8 +397,18 @@ describe("dependabot.yml の ESLint major 保留", () => {
   const blockingPeers = upstreamPeers.filter((peer) => !satisfies(nextMajorVersion, peer.range));
   // 監視対象がそろって許している major の上限 (保留を外してよいかの材料。issue #44 A.2)
   const commonlyAllowedMajor = highestCommonlyAllowedMajor(upstreamPeers, HELD_MAJOR + 1);
-  // 打ち切りまで進めたら「上限なし」(`*` のような常に充足する範囲しか無い状態)
-  const commonlyAllowedIsUnbounded = commonlyAllowedMajor >= HELD_MAJOR + 1 + MAJOR_PROBE_SPAN;
+  // **「もう誰も制限していない」は打ち切り到達では判定しない (レビューで実測)。**
+  // 打ち切りに届くだけなら `>=10` のような「下限だけの範囲」でも起きるが、そちらは
+  // 9 を拒むので「常に充足」ではない——打ち切り到達を根拠に「全員が常に充足する範囲」と
+  // 書くと、名指しした相手について事実と違うことを言う。判定は
+  // 失敗文言の「※常に充足」の注記と同じ述語（どんな版でも満たすか）で行う
+  const noPeerConstrainsMajor =
+    upstreamPeers.length > 0 && upstreamPeers.every((peer) => satisfies("0.0.0", peer.range));
+  // 上限が見つからなかった (打ち切りまで進んだ) 状態。**「制限が無い」とは別物**で、
+  // `>=10` のような下限だけの範囲でもここに入る。有限の上限を名指しできないので、
+  // 文言はその事実と打ち切り値をそのまま出す
+  const commonlyAllowedCeilingUnknown =
+    !noPeerConstrainsMajor && commonlyAllowedMajor >= HELD_MAJOR + 1 + MAJOR_PROBE_SPAN;
 
   // **ディレクトリの glob 判定の境界を固定する。** この判定が「覆っている」と誤れば、
   // root へ効かなくなった ignore を「効いている」と読んで検査が緑のまま素通りする
@@ -423,9 +432,15 @@ describe("dependabot.yml の ESLint major 保留", () => {
     expect(directoryPatternCovers("/app*", "/application")).toBe(true);
     expect(directoryPatternCovers("/app*", "/app/x")).toBe(false);
 
-    // `**` は「0 個以上のパス要素」なので root も覆う
-    expect(directoryPatternCovers("/**", "/"), "`/**` は root を覆う").toBe(true);
-    expect(directoryPatternCovers("/**", "/a/b")).toBe(true);
+    // **`**` を含む綴りは「判定できない」として覆っていない扱いにする。**
+    // 公式ドキュメントへ到達できず「0 個以上のパス要素」かを裏取りできないので、
+    // 覆うと決めつけると `directories: ["/**"]` が唯一残った素通りの経路になる
+    // (レビューで実測)。直し方は `directory: "/"` か `directories` に `/` を明示する
+    expect(directoryPatternCovers("/**", "/"), "`**` は判定できないので覆わない").toBe(false);
+    expect(directoryPatternCovers("/**", "/a/b")).toBe(false);
+    expect(directoryPatternCovers("/**/*", "/a/b")).toBe(false);
+    // `*` の 1 つだけなら従来どおり判定する (`**` を含むかで分かれることの確認)
+    expect(directoryPatternCovers("/*", "/a")).toBe(true);
 
     // 完全一致はそのまま通る (glob を含まない現行の設定がこれ)
     expect(directoryPatternCovers("/", "/")).toBe(true);
@@ -481,6 +496,24 @@ describe("dependabot.yml の ESLint major 保留", () => {
     // **呼び出し側はこの状態に入らない** (件数一致と規則照合が先に skip させる) が、
     // 値の意味を固定しておく
     expect(highestCommonlyAllowedMajor([], 10)).toBe(10 + MAJOR_PROBE_SPAN);
+
+    // **打ち切り値は「有限の上限」と区別できる大きさでなければならない。**
+    // `MAJOR_PROBE_SPAN` が 0 だと `^10` だけの peer でも
+    // `highest >= from + SPAN` が成立し、「有限の上限が見つからなかった」枝へ落ちて
+    // 事実と違うことを言う。上の `toBe(10)` はこの定数から期待値を導いていないので、
+    // 区別できることは別に固定する
+    expect(
+      highestCommonlyAllowedMajor([{ name: "a", range: "^10.0.0" }], 10),
+      "有限の上限は打ち切り値より小さくなければ区別できない",
+    ).toBeLessThan(10 + MAJOR_PROBE_SPAN);
+
+    // **「もう誰も制限していない」の判定に使う述語**が、打ち切り到達とは別物であること。
+    // `>=10` は打ち切りまで進むが 9 を拒むので「どんな版でも満たす」ではない
+    // ——ここを取り違えると、名指しした相手について事実と違うことを言う文言が出る
+    expect(satisfies("0.0.0", "*"), "`*` はどんな版でも満たす").toBe(true);
+    expect(satisfies("0.0.0", ">=10.0.0"), "下限だけの範囲は「どんな版でも満たす」ではない").toBe(
+      false,
+    );
   });
 
   // 件数もファイル名も定数側から導く — テスト名に書き写すと、入力を増減したときや
@@ -744,12 +777,20 @@ describe("dependabot.yml の ESLint major 保留", () => {
           // **上限なしのときは枝ごと分ける** — 「上限より上の major が出ているか」という
           // 問いは常に真になって選択の役に立たず、「その major へ更新」の指す先も無い
           // (レビューで実測。読み手を値の無い選択肢へ押し出していた)
-          (commonlyAllowedIsUnbounded
+          (noPeerConstrainsMajor
             ? `**監視対象はもう ${GUARDED_DEPENDENCY} の major を 1 つも制限していません` +
-              `(全員が常に充足する範囲)。** 留め置き直す先が無いので、` +
+              `(全員がどんな版でも満たす範囲)。** 留め置き直す先が無いので、` +
               `${displayPath(DEPENDABOT_PATH)} の ignore とこのテストを削除し、` +
               `${GUARDED_DEPENDENCY} の major 更新を取り込んでください。`
-            : `**監視対象がそろって許しているのは major ${commonlyAllowedMajor} までです。** ` +
+            : commonlyAllowedCeilingUnknown
+              ? `**監視対象はそろって major ${HELD_MAJOR + 1} 以上を許しており、` +
+                `有限の上限が見つかりませんでした**` +
+                `(major ${HELD_MAJOR + 1 + MAJOR_PROBE_SPAN} まで試した打ち切り。` +
+                `\`>=${HELD_MAJOR + 1}\` のような下限だけの範囲があるとこうなります)。` +
+                `留め置き直す先を名指しできないので、上の範囲一覧を見て` +
+                `「このまま ignore を削除してよいか」を人が判断してください` +
+                `(削除すると以後のすべての major が Dependabot から提案されます)。`
+              : `**監視対象がそろって許しているのは major ${commonlyAllowedMajor} までです。** ` +
               `やることは 2 通りで、どちらかは「major ${commonlyAllowedMajor} より上の ` +
               `${GUARDED_DEPENDENCY} の major が既に出ているか」で決まります` +
               `(\`npm view ${GUARDED_DEPENDENCY} versions\` 等で確認)。` +
@@ -769,8 +810,15 @@ describe("dependabot.yml の ESLint major 保留", () => {
     },
   );
 
-  // 留め置き中でなければ、この検査は対象外 (skip として CI の出力にも現れる)
-  it.skipIf(allowedMajor !== HELD_MAJOR)(
+  // 留め置き中でなければ、この検査は対象外 (skip として CI の出力にも現れる)。
+  // **解釈できない範囲 (null) は「留め置き中」と見なして検査する (fail-closed)。**
+  // 以前は `allowedMajor !== HELD_MAJOR` だけで振るっていたので、`package.json` の範囲を
+  // `>=9` のような書き方にしたうえで ignore を消すと、**この検査も・形の検査も
+  // (0 件なので) ・期限判定も・解除漏れの検査も全部 skip** され、唯一赤くなるのは
+  // 「範囲が解釈できる形か」だけだった。その文言は `package.json` しか名指ししないので、
+  // 範囲を直した次の変更では**保留がもう消えている**（レビューで実測。A.3 と同じ死角が
+  // 件数側に残っていた）。読めないなら「まだ留め置き中」の側へ倒す
+  it.skipIf(dependabotRead.error !== null || (allowedMajor !== null && allowedMajor !== HELD_MAJOR))(
     "留め置いている major に居る間は、major 更新の ignore を 1 件だけ維持している",
     () => {
       // npm エコシステムの ignore にエントリが「ちょうど 1 件」あること。
@@ -789,7 +837,10 @@ describe("dependabot.yml の ESLint major 保留", () => {
           // 「別のブロックへ移された」とだけ案内すると、起きていない移動を探させる
           `移されています。**ブロックは npm のままでも、\`directories\` の綴りが ` +
           `${GUARDED_DIRECTORY} を覆っていなければ 0 件になります**` +
-          `(\`/*\` は 1 階層下だけを指し root を含みません)。` +
+          `(\`/*\` は 1 階層下だけを指し root を含みません。\`**\` を含む綴りは` +
+          `意味論を裏取りできないので「判定できない＝覆っていない」扱いです——` +
+          `\`directory: "${GUARDED_DIRECTORY}"\` にするか \`directories\` に ` +
+          `\`${GUARDED_DIRECTORY}\` を明示してください)。` +
           `2 件以上なら Dependabot が両方を適用し、意図より広く止まります。` +
           `この保留が要る理由は ${displayPath(DEPENDABOT_PATH)} のコメントと CLAUDE.md ` +
           `§3「テスト」節の eslint 留め置きの項を参照 (消すと lint が ` +
