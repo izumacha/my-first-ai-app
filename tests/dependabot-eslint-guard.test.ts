@@ -66,6 +66,7 @@ import {
   countUnreadableElements,
   DEPENDABOT_PATH,
   describeReadError,
+  directoryPatternCovers,
   displayPath,
   findLockEntry,
   MAJOR_UPDATE_TYPE,
@@ -274,6 +275,45 @@ function sameNameSet(left: readonly string[], right: readonly string[]): boolean
   return sortedNames(left).every((name, index) => name === sortedRight[index]);
 }
 
+// 「そろって許している major の上限」を探すときの打ち切り幅。
+// `*` のような常に充足する範囲が混ざると上限が無くなるので、ここで止める。
+// 到達したこと自体を呼び出し側が「上限なし」として扱う
+const MAJOR_PROBE_SPAN = 30;
+
+/**
+ * 監視対象の peer 範囲が「そろって許している major」の上限を返す。
+ *
+ * `from` から 1 つずつ上へ試し、全員が許す限り進める。`from` を 1 つでも許さない者が
+ * いれば `from - 1` を返す (= まだ保留が要る)。全員が打ち切りまで許したときは
+ * `from + MAJOR_PROBE_SPAN` を返すので、呼び出し側はそれを「上限なし」と読む。
+ *
+ * **なぜ「次の major」1 点だけでは足りないのか (issue #44 A.2)。**
+ * `version-update:semver-major` は**すべての** major 更新を止めるので、保留を外してよいのは
+ * 「これ以上の major が無い」ときだけ。`HELD_MAJOR + 1` を許すかだけを見ると、保留が長引いて
+ * eslint 11 が出た時点で、peer が `^10` までしか許していなくても blockingPeers が空になり
+ * 「全部そろった、ignore とこのテストを消せ」と指示してしまう。従うと Dependabot が 11 を
+ * 提案して lint が壊れるのに、警告してくれるはずのガードは同じ指示で削除済みになる。
+ *
+ * **レジストリへ問い合わせずに「実際に提案される major」は分からない**
+ * (§11 外部 API はモックして実際には呼ばない)。そこで判定は従来どおり
+ * 「次の major を全員が許したか」で発火させ、**文言側にこの上限を出して人が決める材料にする**
+ * ——「上限まで上げて打ち止めなら削除、上限より上の major が既に出ているなら
+ * HELD_MAJOR を上限へ更新」の 2 通りを示す。
+ */
+function highestCommonlyAllowedMajor(peers: readonly UpstreamPeer[], from: number): number {
+  // 1 つでも許さない者がいれば「まだ from には届いていない」ことを表す値から始める
+  let highest = from - 1;
+  // from から 1 つずつ上へ、全員が許す限り進める
+  for (let major = from; major <= from + MAJOR_PROBE_SPAN; major += 1) {
+    // 全員が許すかを代表バージョン (`<major>.0.0`) で見る
+    if (!peers.every((peer) => satisfies(`${major}.0.0`, peer.range))) break;
+    // 許されたのでここまでは進める
+    highest = major;
+  }
+  // 到達できた上限を返す
+  return highest;
+}
+
 describe("dependabot.yml の ESLint major 保留", () => {
   // 3 つの入力を、例外を投げない形で読む (理由は readParsed の docstring)。
   // Dependabot 設定は構造として読む (コメントはパーサが落とすので検査に混ざらない)
@@ -356,6 +396,92 @@ describe("dependabot.yml の ESLint major 保留", () => {
   const nextMajorVersion = `${HELD_MAJOR + 1}.0.0`;
   // 次の major をまだ許していない上流 (= 保留の理由として残っているもの)
   const blockingPeers = upstreamPeers.filter((peer) => !satisfies(nextMajorVersion, peer.range));
+  // 監視対象がそろって許している major の上限 (保留を外してよいかの材料。issue #44 A.2)
+  const commonlyAllowedMajor = highestCommonlyAllowedMajor(upstreamPeers, HELD_MAJOR + 1);
+  // 打ち切りまで進めたら「上限なし」(`*` のような常に充足する範囲しか無い状態)
+  const commonlyAllowedIsUnbounded = commonlyAllowedMajor >= HELD_MAJOR + 1 + MAJOR_PROBE_SPAN;
+
+  // **ディレクトリの glob 判定の境界を固定する。** この判定が「覆っている」と誤れば、
+  // root へ効かなくなった ignore を「効いている」と読んで検査が緑のまま素通りする
+  // (issue #44 A.1。`/*` が root を覆うと判定していた)。公式ドキュメントへ到達できないため
+  // 意味論は近似なので、どちらへ倒すかをここで明示的に固定する
+  it("ディレクトリの glob 判定が、空のパス要素を作らない", () => {
+    // **本題**: 区切りのあいだを丸ごと占める `*` は 1 文字以上。
+    // `directories: ["/*"]` は 1 階層下を指す綴りで root は含まない
+    expect(directoryPatternCovers("/*", "/"), "`/*` は root を覆わない").toBe(false);
+    // 1 階層下は覆う
+    expect(directoryPatternCovers("/*", "/app"), "`/*` は 1 階層下を覆う").toBe(true);
+    // 2 階層下は覆わない (`*` は区切りを跨げない)
+    expect(directoryPatternCovers("/*", "/a/b"), "`/*` は 2 階層下を覆わない").toBe(false);
+    // 途中の階層でも同じ規則
+    expect(directoryPatternCovers("/packages/*", "/packages/app")).toBe(true);
+    expect(directoryPatternCovers("/packages/*", "/packages")).toBe(false);
+
+    // **締めすぎない側**: 区切りの一部を占める `*` は空にも一致する
+    // (shell の glob と同じ。一律 1 文字以上にすると、こちらが逆向きの誤判定になる)
+    expect(directoryPatternCovers("/app*", "/app"), "`/app*` は `/app` を覆う").toBe(true);
+    expect(directoryPatternCovers("/app*", "/application")).toBe(true);
+    expect(directoryPatternCovers("/app*", "/app/x")).toBe(false);
+
+    // `**` は「0 個以上のパス要素」なので root も覆う
+    expect(directoryPatternCovers("/**", "/"), "`/**` は root を覆う").toBe(true);
+    expect(directoryPatternCovers("/**", "/a/b")).toBe(true);
+
+    // 完全一致はそのまま通る (glob を含まない現行の設定がこれ)
+    expect(directoryPatternCovers("/", "/")).toBe(true);
+    expect(directoryPatternCovers("/app", "/")).toBe(false);
+
+    // 正規表現のメタ文字は無効化されている (パスの一部として扱う)
+    expect(directoryPatternCovers("/a.b", "/axb"), "`.` はメタ文字として効かない").toBe(false);
+    expect(directoryPatternCovers("/a.b", "/a.b")).toBe(true);
+  });
+
+  // **「そろって許している上限」の挙動を合成入力で固定する。** 実在の peer 範囲は
+  // 現時点でどれも次の major を許していないので、この関数を潰しても
+  // (常に `from - 1` を返すようにしても) ほかの検査は全件緑のまま通る。
+  // 失敗文言がこの値を出して保留解除の判断材料にする以上、値そのものを固定する
+  it("そろって許している major の上限を、合成した peer 範囲で正しく求める", () => {
+    // 1 つでも次の major を許さなければ「まだ届いていない」
+    expect(
+      highestCommonlyAllowedMajor([{ name: "a", range: "^9.0.0" }], 10),
+      "9 までしか許さない peer があれば 9 (= from - 1)",
+    ).toBe(9);
+    // 全員が 10 までなら上限は 10
+    expect(
+      highestCommonlyAllowedMajor(
+        [
+          { name: "a", range: "^9.0.0 || ^10.0.0" },
+          { name: "b", range: ">=10.0.0 <11.0.0" },
+        ],
+        10,
+      ),
+    ).toBe(10);
+    // **一番狭い者に合わせる** — 1 人が 12 まで許しても、もう 1 人が 10 までなら 10
+    expect(
+      highestCommonlyAllowedMajor(
+        [
+          { name: "a", range: ">=10.0.0 <13.0.0" },
+          { name: "b", range: ">=10.0.0 <11.0.0" },
+        ],
+        10,
+      ),
+      "上限は最も狭い peer で決まる",
+    ).toBe(10);
+    // **途切れたらそこで止める** — 11 を飛ばして 12 を許す範囲でも 10 止まり
+    expect(
+      highestCommonlyAllowedMajor([{ name: "a", range: "^10.0.0 || ^12.0.0" }], 10),
+      "連続して許されている範囲までしか進めない",
+    ).toBe(10);
+    // 常に充足する範囲しか無ければ打ち切りまで進む (呼び出し側が「上限なし」と読む)
+    expect(
+      highestCommonlyAllowedMajor([{ name: "a", range: "*" }], 10),
+      "`*` は打ち切りまで進む",
+    ).toBe(10 + MAJOR_PROBE_SPAN);
+    // 監視対象が空なら `every` は真になるので打ち切りまで進む。
+    // **呼び出し側はこの状態に入らない** (件数一致と規則照合が先に skip させる) が、
+    // 値の意味を固定しておく
+    expect(highestCommonlyAllowedMajor([], 10)).toBe(10 + MAJOR_PROBE_SPAN);
+  });
 
   // 件数もファイル名も定数側から導く — テスト名に書き写すと、入力を増減したときや
   // パス定数を変えたときに、CI の出力だけが実態と食い違ったまま残る (§6 一元管理)
@@ -499,9 +625,14 @@ describe("dependabot.yml の ESLint major 保留", () => {
           `${UPSTREAM_CONFIG_PACKAGE} の依存ではなく eslint.config.mjs へ直接載せた ` +
           `プラグインなら、REQUIRED_UPSTREAM_PLUGINS と LOCALLY_ADDED_LINT_PLUGINS の ` +
           `両方へ足すと一致します。` +
-          `**一覧の増減は ${displayPath(DEPENDABOT_PATH)} と CLAUDE.md §3 の説明にも ` +
-          `反映してください** ` +
-          `(そちらは機械検査が無いので、直さないとコードと説明が食い違ったまま残ります)。`,
+          // **散文へ一覧を写させない (issue #44 C.9)。** 以前はここで
+          // 「dependabot.yml と CLAUDE.md の説明にも反映してください」と案内していたが、
+          // 内訳を散文に持つ限り drift は必ず起きる (PR #43 がその修正に費やされた)。
+          // 散文側からは一覧と内訳を落とし、この失敗文言を正本にした
+          `**内訳の正本はこの文言**なので、${displayPath(DEPENDABOT_PATH)} と CLAUDE.md §3 ` +
+          `には一覧を写さないでください(どちらも「内訳はここを見る」と書いてあります)。` +
+          `${GUARDED_DEPENDENCY} の留め置き中の major そのものを変える場合だけ、` +
+          `散文側の数字も同じ変更に含めてください。`,
       ).toEqual(expected);
     },
   );
@@ -607,9 +738,20 @@ describe("dependabot.yml の ESLint major 保留", () => {
             .join(", ")})。` +
           `peer 依存を宣言していないプラグイン(@next/eslint-plugin-next 等)は` +
           `この判定に含まれていないので、削除前に別途確認してください。` +
-          `${displayPath(DEPENDABOT_PATH)} の ignore とこのテストを削除し、` +
-          `${GUARDED_DEPENDENCY} の major 更新を` +
-          `取り込んでください。`,
+          // **「ignore を消せ」と言い切らない (issue #44 A.2)。** この ignore は
+          // **すべての** major 更新を止めているので、外してよいのは「これ以上の major が
+          // 無い」ときだけ。そろって許している上限を出して、2 通りの直し方を人に選ばせる
+          `**監視対象がそろって許しているのは major ` +
+          `${commonlyAllowedIsUnbounded ? `${HELD_MAJOR + 1} 以上(上限なし)` : commonlyAllowedMajor}` +
+          ` までです。** やることは 2 通りで、どちらかは ` +
+          `「${commonlyAllowedIsUnbounded ? "" : `major ${commonlyAllowedMajor} より上の `}` +
+          `${GUARDED_DEPENDENCY} の major が既に出ているか」で決まります` +
+          `(\`npm view ${GUARDED_DEPENDENCY} versions\` 等で確認)。` +
+          `(1) 出ていない → ${displayPath(DEPENDABOT_PATH)} の ignore とこのテストを削除し、` +
+          `${GUARDED_DEPENDENCY} の major 更新を取り込む。` +
+          `(2) 出ている → ignore は残したまま HELD_MAJOR を ` +
+          `${commonlyAllowedIsUnbounded ? "その major" : commonlyAllowedMajor} へ更新する` +
+          `(消すと Dependabot がさらに上の major を提案し、peer が許さないので lint が壊れます)。`,
       ).not.toHaveLength(0);
     },
   );
@@ -633,21 +775,67 @@ describe("dependabot.yml の ESLint major 保留", () => {
           `§3「テスト」節の eslint 留め置きの項を参照 (消すと lint が ` +
           `contextOrFilename.getFilename is not a function で落ちます)。`,
       ).toHaveLength(1);
-      // 名前が eslint そのものであること。`*` へ**書き換えられた**場合、
-      // 件数も update-types もキー集合も想定どおりのまま素通りしてしまうが、
-      // 実際には npm の全パッケージの major 更新が止まる (next / prisma / react …)
-      expect(ignoreEntries[0]?.["dependency-name"]).toBe(GUARDED_DEPENDENCY);
-      // 止める対象は major だけ。update-types ごと消えると Dependabot は
-      // 「全バージョンを無視」と解釈し、9 系の修正まで届かなくなる
-      expect(ignoreEntries[0]?.["update-types"]).toEqual([MAJOR_UPDATE_TYPE]);
-      // 書かれているキーがちょうど想定どおりであること。`versions` のような
-      // 別の絞り込みが足されると、update-types が正しくても効き方が変わってしまう
-      // 直前の件数検査が通っていれば [0] は必ずあるが、上の 2 行と同じく
-      // 添字アクセスを無防備に置かない (検査の順序を入れ替えたときに
-      // Object.keys(undefined) の TypeError で日本語文言が消えるのを防ぐ)。
-      // sortedKeysOf 側が保証しているのは「要素がオブジェクトであること」だけで、
-      // 「要素が存在すること」はここで埋める必要がある (同関数の docstring 参照)
-      expect(sortedKeysOf(ignoreEntries[0] ?? {})).toEqual([...ALLOWED_IGNORE_KEYS].sort());
+    },
+  );
+
+  // **形の検査は `allowedMajor` から切り離す (issue #44 A.3)。**
+  // 以前はこの 3 つが上の件数検査と同じ `it` に入っており、`package.json` の eslint 範囲が
+  // `>=9` のように解釈できない書き方になると `allowedMajor` が null になって
+  // `skipIf(allowedMajor !== HELD_MAJOR)` が成立し、**`*` への書き換え・`update-types` の
+  // 消失・`versions` の追加を見張る網まで丸ごと skip** されていた。
+  // 形の正しさは「いまどの major に居るか」とは独立なので、**ignore が 1 件以上あるなら
+  // 常に見る**。入力そのものが読めないときだけ対象外にする (原因は入力ファイルの検査が報告)。
+  //
+  // **1 件ずつ expect せず、問題を全部集めて 1 回で比較する。** 2 件目以降に別の壊れ方が
+  // あっても最初の 1 件で例外が飛ぶと残りが出力に現れず、直して再実行の往復になる
+  it.skipIf(dependabotRead.error !== null || ignoreEntries.length === 0)(
+    `${GUARDED_DEPENDENCY} の ignore エントリが、どれも想定どおりの形をしている`,
+    () => {
+      // 見つかった問題を「何件目の・何が」の形で集める
+      const problems: string[] = [];
+      // 集めたエントリを 1 つずつ確かめる
+      ignoreEntries.forEach((entry, index) => {
+        // 名前が eslint そのものであること。`*` へ**書き換えられた**場合、
+        // 件数も update-types もキー集合も想定どおりのまま素通りしてしまうが、
+        // 実際には npm の全パッケージの major 更新が止まる (next / prisma / react …)
+        if (entry["dependency-name"] !== GUARDED_DEPENDENCY) {
+          problems.push(
+            `${index + 1} 件目: dependency-name が ${JSON.stringify(entry["dependency-name"])}` +
+              ` (想定: ${JSON.stringify(GUARDED_DEPENDENCY)})`,
+          );
+        }
+        // 止める対象は major だけ。update-types ごと消えると Dependabot は
+        // 「全バージョンを無視」と解釈し、留め置き中の major の修正まで届かなくなる
+        if (
+          !Array.isArray(entry["update-types"]) ||
+          entry["update-types"].length !== 1 ||
+          entry["update-types"][0] !== MAJOR_UPDATE_TYPE
+        ) {
+          problems.push(
+            `${index + 1} 件目: update-types が ${JSON.stringify(entry["update-types"])}` +
+              ` (想定: [${JSON.stringify(MAJOR_UPDATE_TYPE)}])`,
+          );
+        }
+        // 書かれているキーがちょうど想定どおりであること。`versions` のような
+        // 別の絞り込みが足されると、update-types が正しくても効き方が変わってしまう
+        const keys = sortedKeysOf(entry);
+        const allowed = [...ALLOWED_IGNORE_KEYS].sort();
+        if (keys.join(",") !== allowed.join(",")) {
+          problems.push(
+            `${index + 1} 件目: キー集合が [${keys.join(", ")}] (想定: [${allowed.join(", ")}])`,
+          );
+        }
+      });
+      // 問題が 1 つも無いことを 1 回で比較する (全件が一度に出る)
+      expect(
+        problems,
+        `${GUARDED_ECOSYSTEM} / ${GUARDED_DIRECTORY} の ignore に書かれた ` +
+          `${GUARDED_DEPENDENCY} のエントリの形が想定と違います: ${problems.join(" / ")}。` +
+          `dependency-name を \`*\` へ書き換えると npm の全パッケージの major が止まり、` +
+          `update-types が消えると Dependabot は「全バージョンを無視」と解釈して` +
+          `留め置き中の major の修正まで届かなくなります。` +
+          `\`versions\` のような別の絞り込みを足した場合も効き方が変わります。`,
+      ).toEqual([]);
     },
   );
 

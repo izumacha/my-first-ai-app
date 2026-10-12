@@ -157,6 +157,25 @@ export function coversDirectory(entry: DependabotUpdateEntry, directory: string)
  * Dependabot の `directories` は完全一致のほか `*` / `**` の glob を受け付ける。
  * ここで扱うのは自分たちが書いた設定の 1 要素だけなので、`*` を「`/` を含まない任意」、
  * `**` を「任意」として素直に展開すれば足りる。
+ *
+ * **ただし「区切りのあいだを丸ごと占める `*`」は 1 文字以上を要求する。**
+ * 素直に `[^/]*` へ展開すると `/*` の正規表現が `^/[^/]*$` になり、空文字にも一致するので
+ * **`/*` が root(`/`) を覆っていると判定される**（実測）。`directories: ["/*"]` は
+ * 1 階層下のマニフェストを指す綴りで root の `package.json` は含まないので、
+ * モノレポ化で npm ブロックをそう変えたときに「root へ効かなくなった `ignore`」を
+ * 「効いている」と読み違え、「ちょうど 1 件」の検査が緑のまま素通りする
+ * （その後 Dependabot が eslint の major PR を出し lint が壊れる）。
+ * 区切りのあいだが空のパス要素は存在しないので、丸ごと占める `*` は `[^/]+` にする。
+ *
+ * **区切りの一部を占める `*` は `[^/]*` のまま**にする（`/app*` は shell の glob と同じく
+ * `/app` にも一致する）。ここを一律 `[^/]+` にすると、そちらが逆向きの誤判定になる。
+ * `**` は「0 個以上のパス要素」なので `.*` のまま（`/**` は root も覆う）。
+ *
+ * **この環境から Dependabot の公式ドキュメントへ到達できない**ため、glob の意味論は
+ * 上の推論と実測に基づく近似。**誤る向きは意図して fail-closed 側**に寄せてある
+ * （覆っていないと判定されれば `ignore` が 0 件になり検査が落ちるだけで、
+ *   保留が消えたことを見逃す向きには倒れない）。境界は
+ * `tests/dependabot-eslint-guard.test.ts` の「ディレクトリの glob 判定」が固定する。
  */
 export function directoryPatternCovers(pattern: string, directory: string): boolean {
   // `**` は「任意」、`*` は「/ を含まない任意」に相当する。先に `**` を目印へ退避し、
@@ -165,7 +184,16 @@ export function directoryPatternCovers(pattern: string, directory: string): bool
   const escaped = pattern
     .replace(/\*\*/g, doubleStarMark)
     .replace(/[.+?^${}()|[\]\\]/g, "\\$&")
-    .replace(/\*/g, "[^/]*")
+    // 置換関数で「その `*` が区切りのあいだを丸ごと占めるか」を見る。
+    // 第 2・第 3 引数は `String.prototype.replace` が渡す出現位置と走査中の文字列
+    .replace(/\*/g, (_asterisk: string, at: number, whole: string) => {
+      // 直前が無い（先頭）か区切りなら、左側は要素の先頭
+      const startsSegment = at === 0 || whole[at - 1] === "/";
+      // 直後が無い（末尾）か区切りなら、右側は要素の終わり
+      const endsSegment = at + 1 === whole.length || whole[at + 1] === "/";
+      // 両方なら要素を丸ごと占めるので、空のパス要素を作らないよう 1 文字以上を要求する
+      return startsSegment && endsSegment ? "[^/]+" : "[^/]*";
+    })
     .split(doubleStarMark)
     .join(".*");
   // 前後を固定して全体一致で判定する
