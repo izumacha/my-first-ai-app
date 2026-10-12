@@ -117,13 +117,13 @@ const UPSTREAM_CONFIG_PACKAGE = "eslint-config-next";
 //   `eslint-config-next` の直接依存のうち、**eslint に peer 依存を宣言しているもの全部**。
 //   eslint.config.mjs は core-web-vitals と typescript の両方を読み込むので、
 //   同 config の直接依存はすべて同じ lint 実行に載る。
-//   2026-08 時点の該当は以下 6 つ(範囲は package-lock.json の解決済み値):
-//     eslint-plugin-react               ^9.7 まで   ← 保留を塞いでいる
-//     eslint-plugin-import              ^9   まで   ← 保留を塞いでいる
-//     eslint-plugin-jsx-a11y            ^9   まで   ← 保留を塞いでいる
-//     eslint-plugin-react-hooks         ^10 を許す
-//     typescript-eslint                 ^10 を許す
-//     eslint-import-resolver-typescript `*`(常に充足)
+//   **各々がどこまで許しているかはここに書かない (issue #44 C.9)。** 上流の更新で動く値を
+//   散文に写すと必ず古くなる(この一覧も以前は 6 行の表として範囲を併記しており、
+//   その表こそ PR #43 が直した drift の出どころだった)。現在値を知りたいときは
+//   package-lock.json の `peerDependencies.eslint` を見るか、下の期限判定を
+//   わざと落とす(その失敗文言がその時点の内訳をまとめて出す)。
+//   **一覧そのものは下の規則照合テストがロックファイルから導いて機械照合する**ので、
+//   名前の増減だけは散文の助けなしに検出できる。
 //
 // **peer 依存を宣言していないものはここへ入れられない。**
 //   @next/eslint-plugin-next / eslint-import-resolver-node / globals は同じ lint 実行に
@@ -740,18 +740,31 @@ describe("dependabot.yml の ESLint major 保留", () => {
           `この判定に含まれていないので、削除前に別途確認してください。` +
           // **「ignore を消せ」と言い切らない (issue #44 A.2)。** この ignore は
           // **すべての** major 更新を止めているので、外してよいのは「これ以上の major が
-          // 無い」ときだけ。そろって許している上限を出して、2 通りの直し方を人に選ばせる
-          `**監視対象がそろって許しているのは major ` +
-          `${commonlyAllowedIsUnbounded ? `${HELD_MAJOR + 1} 以上(上限なし)` : commonlyAllowedMajor}` +
-          ` までです。** やることは 2 通りで、どちらかは ` +
-          `「${commonlyAllowedIsUnbounded ? "" : `major ${commonlyAllowedMajor} より上の `}` +
-          `${GUARDED_DEPENDENCY} の major が既に出ているか」で決まります` +
-          `(\`npm view ${GUARDED_DEPENDENCY} versions\` 等で確認)。` +
-          `(1) 出ていない → ${displayPath(DEPENDABOT_PATH)} の ignore とこのテストを削除し、` +
-          `${GUARDED_DEPENDENCY} の major 更新を取り込む。` +
-          `(2) 出ている → ignore は残したまま HELD_MAJOR を ` +
-          `${commonlyAllowedIsUnbounded ? "その major" : commonlyAllowedMajor} へ更新する` +
-          `(消すと Dependabot がさらに上の major を提案し、peer が許さないので lint が壊れます)。`,
+          // 無い」ときだけ。そろって許している上限を出して、直し方を人に選ばせる。
+          // **上限なしのときは枝ごと分ける** — 「上限より上の major が出ているか」という
+          // 問いは常に真になって選択の役に立たず、「その major へ更新」の指す先も無い
+          // (レビューで実測。読み手を値の無い選択肢へ押し出していた)
+          (commonlyAllowedIsUnbounded
+            ? `**監視対象はもう ${GUARDED_DEPENDENCY} の major を 1 つも制限していません` +
+              `(全員が常に充足する範囲)。** 留め置き直す先が無いので、` +
+              `${displayPath(DEPENDABOT_PATH)} の ignore とこのテストを削除し、` +
+              `${GUARDED_DEPENDENCY} の major 更新を取り込んでください。`
+            : `**監視対象がそろって許しているのは major ${commonlyAllowedMajor} までです。** ` +
+              `やることは 2 通りで、どちらかは「major ${commonlyAllowedMajor} より上の ` +
+              `${GUARDED_DEPENDENCY} の major が既に出ているか」で決まります` +
+              `(\`npm view ${GUARDED_DEPENDENCY} versions\` 等で確認)。` +
+              `(1) 出ていない → ${displayPath(DEPENDABOT_PATH)} の ignore とこのテストを削除し、` +
+              `${GUARDED_DEPENDENCY} の major 更新を取り込む。` +
+              `(2) 出ている → ignore は残したまま、**HELD_MAJOR と ` +
+              `${displayPath(PACKAGE_JSON_PATH)} の devDependencies.${GUARDED_DEPENDENCY} の` +
+              `両方を major ${commonlyAllowedMajor} へ同じ変更でそろえる**` +
+              `(消すと Dependabot がさらに上の major を提案し、peer が許さないので lint が壊れます。` +
+              // **両方そろえることを明示する (レビューで実測)。** HELD_MAJOR だけ動かすと
+              // allowedMajor !== HELD_MAJOR になり、件数の検査が skip されて
+              // ignore の削除・重複を見張る網が黙って止まる。しかも唯一赤くなるのは
+              // 下の「下へは戻っていない」検査で、そこには日本語の案内が無かった
+              ` HELD_MAJOR だけ動かすと、件数の検査が skip されて ignore の削除・重複を` +
+              `見張る網が止まります)。`),
       ).not.toHaveLength(0);
     },
   );
@@ -770,7 +783,14 @@ describe("dependabot.yml の ESLint major 保留", () => {
         `${GUARDED_ECOSYSTEM} / ${GUARDED_DIRECTORY} のブロックに ` +
           `${GUARDED_DEPENDENCY} の ignore がちょうど 1 件ある状態を保ってください。` +
           `0 件なら削除されたか、別エコシステム(docker 等)・別ディレクトリのブロックへ` +
-          `移されています。2 件以上なら Dependabot が両方を適用し、意図より広く止まります。` +
+          // **原因をもう 1 つ挙げる (レビューで実測)。** glob の判定を直した結果、
+          // `directories: ["/*"]` のように「ブロックは npm のままなのに、その綴りが
+          // 対象ディレクトリを覆わなくなった」状態でもここが 0 件になる。
+          // 「別のブロックへ移された」とだけ案内すると、起きていない移動を探させる
+          `移されています。**ブロックは npm のままでも、\`directories\` の綴りが ` +
+          `${GUARDED_DIRECTORY} を覆っていなければ 0 件になります**` +
+          `(\`/*\` は 1 階層下だけを指し root を含みません)。` +
+          `2 件以上なら Dependabot が両方を適用し、意図より広く止まります。` +
           `この保留が要る理由は ${displayPath(DEPENDABOT_PATH)} のコメントと CLAUDE.md ` +
           `§3「テスト」節の eslint 留め置きの項を参照 (消すと lint が ` +
           `contextOrFilename.getFilename is not a function で落ちます)。`,
@@ -865,7 +885,19 @@ describe("dependabot.yml の ESLint major 保留", () => {
   // 解釈できない範囲のときは対象外 (最初のテストが落とすので二重に赤くしない)
   it.skipIf(allowedMajor === null)("留め置いている major より下へは戻っていない", () => {
     // ダウングレードは想定していない。起きたなら HELD_MAJOR との対応が崩れているので、
-    // 保留の判定そのものを見直す合図として落とす
-    expect(allowedMajor).toBeGreaterThanOrEqual(HELD_MAJOR);
+    // 保留の判定そのものを見直す合図として落とす。
+    // **案内を付ける。** このファイルで唯一文言の無い expect だったが、期限判定の案内に
+    // 従って HELD_MAJOR だけを先に上げると最初に当たるのがここで、素の
+    // `expected 9 to be greater than or equal to 10` では何を直せばよいか分からない
+    // (レビューで実測)。同時に件数の検査が skip されることも伝える
+    expect(
+      allowedMajor,
+      `HELD_MAJOR (${HELD_MAJOR}) が ${displayPath(PACKAGE_JSON_PATH)} の ` +
+        `devDependencies.${GUARDED_DEPENDENCY} の major (${allowedMajor}) を追い越しています。` +
+        `留め置きを新しい major へ移したのなら、${displayPath(PACKAGE_JSON_PATH)} の範囲も` +
+        `同じ major へそろえてください(片方だけだと「留め置き中の major に居る」判定が` +
+        `成立せず、ignore の件数を見張る検査が skip されます)。` +
+        `${GUARDED_DEPENDENCY} を意図して下げたのなら、保留の前提ごと見直してください。`,
+    ).toBeGreaterThanOrEqual(HELD_MAJOR);
   });
 });
